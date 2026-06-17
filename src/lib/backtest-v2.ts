@@ -279,18 +279,20 @@ interface PricePoint {
 
 function reconstructPricesFromTrades(trades: HistoricalTrade[]): PricePoint[] {
   // Group trades by timestamp (rounded to 10s intervals)
-  const priceMap = new Map<number, { upTrades: number[]; downTrades: number[] }>();
+  const priceMap = new Map<number, { upBuys: number[]; upSells: number[]; downBuys: number[]; downSells: number[] }>();
 
   for (const t of trades) {
     const bucket = Math.floor(t.timestamp / 10) * 10;  // 10-second buckets
     if (!priceMap.has(bucket)) {
-      priceMap.set(bucket, { upTrades: [], downTrades: [] });
+      priceMap.set(bucket, { upBuys: [], upSells: [], downBuys: [], downSells: [] });
     }
     const entry = priceMap.get(bucket)!;
     if (t.outcome === "Up") {
-      entry.upTrades.push(t.price);
+      if (t.side === "BUY") entry.upBuys.push(t.price);
+      else entry.upSells.push(t.price);
     } else {
-      entry.downTrades.push(t.price);
+      if (t.side === "BUY") entry.downBuys.push(t.price);
+      else entry.downSells.push(t.price);
     }
   }
 
@@ -299,19 +301,26 @@ function reconstructPricesFromTrades(trades: HistoricalTrade[]): PricePoint[] {
 
   let lastUpMid = 0.5;
   let lastDownMid = 0.5;
+  let lastUpBestBid = 0.49;
+  let lastUpBestAsk = 0.51;
+  let lastDownBestBid = 0.49;
+  let lastDownBestAsk = 0.51;
 
   for (const bucket of sortedBuckets) {
     const entry = priceMap.get(bucket)!;
 
+    // ── Mid price: volume-weighted average of all trades in this bucket ──
+    const upAll = [...entry.upBuys, ...entry.upSells];
+    const downAll = [...entry.downBuys, ...entry.downSells];
+
     let upMid = lastUpMid;
     let downMid = lastDownMid;
-
-    if (entry.upTrades.length > 0) {
-      upMid = entry.upTrades.reduce((s, p) => s + p, 0) / entry.upTrades.length;
+    if (upAll.length > 0) {
+      upMid = upAll.reduce((s, p) => s + p, 0) / upAll.length;
       lastUpMid = upMid;
     }
-    if (entry.downTrades.length > 0) {
-      downMid = entry.downTrades.reduce((s, p) => s + p, 0) / entry.downTrades.length;
+    if (downAll.length > 0) {
+      downMid = downAll.reduce((s, p) => s + p, 0) / downAll.length;
       lastDownMid = downMid;
     }
 
@@ -319,14 +328,55 @@ function reconstructPricesFromTrades(trades: HistoricalTrade[]): PricePoint[] {
     const upAdj = tickRound(upMid);
     const downAdj = tickRound(1 - upAdj);
 
-    // Simulate bid/ask spread from trade prices
-    const upTrades = entry.upTrades.sort((a, b) => a - b);
-    const downTrades = entry.downTrades.sort((a, b) => a - b);
+    // ── Best bid/ask reconstruction from trade sides ──
+    // Key insight: a SELL trade executes at the best bid (someone sold into the book),
+    //              a BUY trade executes at the best ask (someone bought the book).
+    // So:
+    //   bestBid ≈ max(recent SELL prices)   — the highest price sellers were able to get
+    //   bestAsk ≈ min(recent BUY prices)    — the lowest price buyers were able to get
+    //
+    // If we have no trades on a side this bucket, carry forward the last known value.
 
-    const upBestBid = upTrades.length > 1 ? tickRound(upTrades[Math.floor(upTrades.length * 0.3)]) : tickRound(upAdj - 0.01);
-    const upBestAsk = upTrades.length > 1 ? tickRound(upTrades[Math.floor(upTrades.length * 0.7)]) : tickRound(upAdj + 0.01);
-    const downBestBid = downTrades.length > 1 ? tickRound(downTrades[Math.floor(downTrades.length * 0.3)]) : tickRound(downAdj - 0.01);
-    const downBestAsk = downTrades.length > 1 ? tickRound(downTrades[Math.floor(downTrades.length * 0.7)]) : tickRound(downAdj + 0.01);
+    let upBestBid = lastUpBestBid;
+    let upBestAsk = lastUpBestAsk;
+    let downBestBid = lastDownBestBid;
+    let downBestAsk = lastDownBestAsk;
+
+    if (entry.upSells.length > 0) {
+      // Max sell price = best bid (sellers hit the highest bid)
+      upBestBid = tickRound(Math.max(...entry.upSells));
+      lastUpBestBid = upBestBid;
+    }
+    if (entry.upBuys.length > 0) {
+      // Min buy price = best ask (buyers hit the lowest ask)
+      upBestAsk = tickRound(Math.min(...entry.upBuys));
+      lastUpBestAsk = upBestAsk;
+    }
+    if (entry.downSells.length > 0) {
+      downBestBid = tickRound(Math.max(...entry.downSells));
+      lastDownBestBid = downBestBid;
+    }
+    if (entry.downBuys.length > 0) {
+      downBestAsk = tickRound(Math.min(...entry.downBuys));
+      lastDownBestAsk = downBestAsk;
+    }
+
+    // Sanity: if we have both sides, ensure bid < ask (no crossed book)
+    // If crossed (rare), widen by 1 tick on the violated side
+    if (upBestBid >= upBestAsk) {
+      upBestBid = tickRound(upBestAsk - TICK_SIZE);
+      if (upBestBid < TICK_SIZE) upBestBid = TICK_SIZE;
+    }
+    if (downBestBid >= downBestAsk) {
+      downBestBid = tickRound(downBestAsk - TICK_SIZE);
+      if (downBestBid < TICK_SIZE) downBestBid = TICK_SIZE;
+    }
+
+    // Fallback: if no recent trades on a side, derive from mid ± 1 tick
+    if (upBestBid <= 0) upBestBid = tickRound(upAdj - TICK_SIZE);
+    if (upBestAsk <= 0 || upBestAsk <= upBestBid) upBestAsk = tickRound(upAdj + TICK_SIZE);
+    if (downBestBid <= 0) downBestBid = tickRound(downAdj - TICK_SIZE);
+    if (downBestAsk <= 0 || downBestAsk <= downBestBid) downBestAsk = tickRound(downAdj + TICK_SIZE);
 
     points.push({
       timestamp: bucket,
@@ -429,145 +479,142 @@ export function runBacktest(
     // Compute fee rates
     const takerBaseBPS = market.takerBaseFee || 1000;
     const feeRate = takerBaseBPS / 14000;
-
-    // ── Simulate trading within this market ──
-    const inv = inventory.get(market.conditionId) || 0;
-
-    // Get the mid-market price at the start of trading
-    const firstPrice = pricePoints[0];
-    const realUpMid = firstPrice.upPrice;
-    const realDownMid = firstPrice.downPrice;
-    const upBestBid = firstPrice.upBestBid > 0 ? firstPrice.upBestBid : Math.max(TICK_SIZE, realUpMid - 0.02);
-    const upBestAsk = firstPrice.upBestAsk > 0 ? firstPrice.upBestAsk : Math.min(1 - TICK_SIZE, realUpMid + 0.02);
-    const downBestBid = firstPrice.downBestBid > 0 ? firstPrice.downBestBid : Math.max(TICK_SIZE, realDownMid - 0.02);
-    const downBestAsk = firstPrice.downBestAsk > 0 ? firstPrice.downBestAsk : Math.min(1 - TICK_SIZE, realDownMid + 0.02);
-
-    // Our model probability (used for skew only — NOT for crossing the book).
-    // The previous code shifted pUp by (modelPUp - 0.5) * 0.3 (up to ±15¢),
-    // which made bid/ask cross the real book 99% of the time → 99% taker fills.
-    const modelPUp = calcUpProbability(strike, marketEndMs, marketStartTs * 1000, btc);
-    // Tiny ±1 tick skew from model (so we still tilt inventory gently).
-    const modelSignalSkew = Math.max(-TICK_SIZE, Math.min(TICK_SIZE, (modelPUp - realUpMid) * 0.1));
-
-    // Calculate spread (target capture)
-    const marketSpread = Math.max(firstPrice.upSpread, firstPrice.downSpread, 0.01);
-    const spread = calcSpread(
-      config.baseSpread, config.atrMultiplier,
-      btc.atr5m, btc.price, durationMinutes, inv, marketSpread,
-    );
-
-    const skewTicks = Math.round(inv * config.inventorySkewFactor / TICK_SIZE) * TICK_SIZE;
-    const upSkew = skewTicks + modelSignalSkew;
-    const downSkew = -skewTicks - modelSignalSkew;
-
-    // ── MM quotes: ALWAYS inside the real spread (never cross the book) ──
-    // UP side
-    let bidUp: number;
-    let askUp: number;
-    {
-      let b = tickRound(upBestBid + TICK_SIZE + upSkew);
-      let a = tickRound(upBestAsk - TICK_SIZE + upSkew);
-      const upMktSpread = upBestAsk - upBestBid;
-      if (upMktSpread >= spread + 2 * TICK_SIZE) {
-        const m = (upBestBid + upBestAsk) / 2;
-        b = tickRound(m - spread / 2 + upSkew);
-        a = tickRound(m + spread / 2 + upSkew);
-      }
-      // Hard clamps: never cross
-      b = Math.min(b, tickRound(upBestAsk - TICK_SIZE));
-      a = Math.max(a, tickRound(upBestBid + TICK_SIZE));
-      b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
-      a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
-      bidUp = b;
-      askUp = a;
-    }
-    // DOWN side
-    let bidDown: number;
-    let askDown: number;
-    {
-      let b = tickRound(downBestBid + TICK_SIZE + downSkew);
-      let a = tickRound(downBestAsk - TICK_SIZE + downSkew);
-      const dnMktSpread = downBestAsk - downBestBid;
-      if (dnMktSpread >= spread + 2 * TICK_SIZE) {
-        const m = (downBestBid + downBestAsk) / 2;
-        b = tickRound(m - spread / 2 + downSkew);
-        a = tickRound(m + spread / 2 + downSkew);
-      }
-      b = Math.min(b, tickRound(downBestAsk - TICK_SIZE));
-      a = Math.max(a, tickRound(downBestBid + TICK_SIZE));
-      b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
-      a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
-      bidDown = b;
-      askDown = a;
-    }
-
-    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(realUpMid, TICK_SIZE)));
     const feeRateVal = feeRate;
 
-    // ── Try BID_UP (buy UP tokens) ──
+    // ── Time-stepped trading simulation ──
+    // Walk through the market in 10-second cycles (matching live bot's cycleIntervalMs).
+    // At each cycle:
+    //   1. Look up the current bestBid/bestAsk from reconstructed pricePoints
+    //   2. Compute our inside-spread quotes (never cross the book)
+    //   3. Check for maker fills (trades at our price) + probabilistic fills
+    //   4. Taker fills only if our bid crosses bestAsk (shouldn't happen with clamps)
+    //
+    // This replaces the old single-shot fill logic that produced 96.9% taker fills.
+    const CYCLE_SECONDS = 10;
+    const tradingStartTs = marketStartTs + config.latencySeconds;
+    const tradingEndTs = marketEndTs - config.autoExitMinutes * 60;
+
     const upPosKey = `${market.conditionId}_UP`;
-    const upPos = positions.get(upPosKey);
+    const downPosKey = `${market.conditionId}_DOWN`;
 
-    // Check if our bid would be filled by a market sell (taker fill)
-    // This happens when a trade occurs at or below our bid price
-    const upTradesBelowOurBid = marketTrades.filter(
-      t => t.outcome === "Up" && t.side === "SELL" && t.price <= bidUp &&
-      t.timestamp >= marketStartTs && t.timestamp < marketEndTs - config.autoExitMinutes * 60,
-    );
+    // Index price points by 10-sec bucket for O(1) lookup
+    const priceByBucket = new Map<number, PricePoint>();
+    for (const p of pricePoints) priceByBucket.set(p.timestamp, p);
 
-    // Maker fill: check if any trade crossed through our bid level
-    const upTradesNearOurBid = marketTrades.filter(
-      t => t.outcome === "Up" && t.timestamp >= marketStartTs &&
-      t.timestamp < marketEndTs - config.autoExitMinutes * 60 &&
-      Math.abs(t.price - bidUp) <= 0.03,
-    );
+    // Index trades by 10-sec bucket
+    const tradesByBucket = new Map<number, HistoricalTrade[]>();
+    for (const t of marketTrades) {
+      const bucket = Math.floor(t.timestamp / 10) * 10;
+      if (bucket < tradingStartTs || bucket >= tradingEndTs) continue;
+      if (!tradesByBucket.has(bucket)) tradesByBucket.set(bucket, []);
+      tradesByBucket.get(bucket)!.push(t);
+    }
 
-    if (cash.balance > bidUp * qty + calcTakerFee(qty, bidUp, feeRateVal)) {
-      if (upTradesBelowOurBid.length > 0) {
-        // Taker fill — we crossed the book
-        const fillTrade = upTradesBelowOurBid[0];
-        const fillPrice = tickRound(fillTrade.price);
-        const fillQty = Math.min(qty, config.maxPositionSize);
-        const fee = calcTakerFee(fillQty, fillPrice, feeRateVal);
-        totalFees += fee;
-        takerTrades++;
+    let lastPricePoint: PricePoint | null = pricePoints[0];
+    let cycleCount = 0;
 
-        cash.balance -= fillPrice * fillQty + fee;
-        const existing = positions.get(upPosKey);
-        if (existing) {
-          existing.quantity += fillQty;
-          existing.costBasis += fillPrice * fillQty + fee;
-          existing.entryPrice = existing.costBasis / existing.quantity;
-        } else {
-          positions.set(upPosKey, {
-            side: "UP", entryPrice: fillPrice, quantity: fillQty,
-            costBasis: fillPrice * fillQty + fee,
-            openedAt: fillTrade.timestamp, marketSlug: market.slug,
-          });
+    for (let cycleTs = tradingStartTs; cycleTs < tradingEndTs; cycleTs += CYCLE_SECONDS) {
+      cycleCount++;
+      const bucketTs = Math.floor(cycleTs / 10) * 10;
+
+      // ── Get current market state (carry forward if no trades this bucket) ──
+      const pp = priceByBucket.get(bucketTs) || lastPricePoint;
+      if (!pp) continue;
+      lastPricePoint = pp;
+
+      const upBestBid = pp.upBestBid > 0 ? pp.upBestBid : TICK_SIZE;
+      const upBestAsk = pp.upBestAsk > 0 ? pp.upBestAsk : 1 - TICK_SIZE;
+      const downBestBid = pp.downBestBid > 0 ? pp.downBestBid : TICK_SIZE;
+      const downBestAsk = pp.downBestAsk > 0 ? pp.downBestAsk : 1 - TICK_SIZE;
+      const upRealMid = pp.upPrice;
+      const downRealMid = pp.downPrice;
+
+      // ── BTC context at this cycle (for ATR / momentum) ──
+      const btcNow = computeBtcContext(klines, cycleTs);
+      if (btcNow.price <= 0) continue;
+
+      // ── Model probability + skew (tiny, ±1 tick, never crosses book) ──
+      const modelPUp = calcUpProbability(strike, marketEndMs, cycleTs * 1000, btcNow);
+      const modelSignalSkew = Math.max(-TICK_SIZE, Math.min(TICK_SIZE, (modelPUp - upRealMid) * 0.1));
+
+      const inv = inventory.get(market.conditionId) || 0;
+      const skewTicks = Math.round(inv * config.inventorySkewFactor / TICK_SIZE) * TICK_SIZE;
+      const upSkew = skewTicks + modelSignalSkew;
+      const downSkew = -skewTicks - modelSignalSkew;
+
+      // ── Target spread ──
+      const marketSpread = Math.max(pp.upSpread, pp.downSpread, 0.01);
+      const minutesLeft = (marketEndTs - cycleTs) / 60;
+      const targetSpread = calcSpread(
+        config.baseSpread, config.atrMultiplier,
+        btcNow.atr5m, btcNow.price, minutesLeft, inv, marketSpread,
+      );
+
+      // ── Build inside-spread quotes (NEVER cross the book) ──
+      let bidUp: number, askUp: number;
+      {
+        let b = tickRound(upBestBid + TICK_SIZE + upSkew);
+        let a = tickRound(upBestAsk - TICK_SIZE + upSkew);
+        const ms = upBestAsk - upBestBid;
+        if (ms >= targetSpread + 2 * TICK_SIZE) {
+          const m = (upBestBid + upBestAsk) / 2;
+          b = tickRound(m - targetSpread / 2 + upSkew);
+          a = tickRound(m + targetSpread / 2 + upSkew);
         }
-        inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + fillQty);
-        marketsTradedSet.add(market.conditionId);
+        b = Math.min(b, tickRound(upBestAsk - TICK_SIZE));
+        a = Math.max(a, tickRound(upBestBid + TICK_SIZE));
+        b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
+        a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
+        bidUp = b; askUp = a;
+      }
+      let bidDown: number, askDown: number;
+      {
+        let b = tickRound(downBestBid + TICK_SIZE + downSkew);
+        let a = tickRound(downBestAsk - TICK_SIZE + downSkew);
+        const ms = downBestAsk - downBestBid;
+        if (ms >= targetSpread + 2 * TICK_SIZE) {
+          const m = (downBestBid + downBestAsk) / 2;
+          b = tickRound(m - targetSpread / 2 + downSkew);
+          a = tickRound(m + targetSpread / 2 + downSkew);
+        }
+        b = Math.min(b, tickRound(downBestAsk - TICK_SIZE));
+        a = Math.max(a, tickRound(downBestBid + TICK_SIZE));
+        b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
+        a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
+        bidDown = b; askDown = a;
+      }
 
-        btTrades.push({
-          timestamp: fillTrade.timestamp, marketSlug: market.slug,
-          side: "BID_UP", price: fillPrice, quantity: fillQty,
-          fee, rebate: 0, pnl: 0, reason: "taker_fill", cashAfter: cash.balance,
-        });
-      } else if (upTradesNearOurBid.length > 0) {
-        // Probabilistic maker fill
-        const fillProb = config.makerFillRate * Math.min(upTradesNearOurBid.length / 10, 1);
-        // Deterministic "randomness" based on market data
-        const hash = (market.slotTs * 7 + Math.floor(bidUp * 1000)) % 100;
-        if (hash < fillProb * 100) {
+      const qty = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
+
+      // ── Rebalance mode: skip BID on the long side ──
+      const rebalanceOnly = Math.abs(inv) > 12;
+      const allowBidUp = !(rebalanceOnly && inv > 0);
+      const allowBidDown = !(rebalanceOnly && inv < 0);
+
+      // ── Inventory-aware bid sizing ──
+      const remainingCapUp = Math.max(0, config.maxInventory - Math.max(0, inv));
+      const remainingCapDn = Math.max(0, config.maxInventory - Math.max(0, -inv));
+      const qtyBidUp = Math.min(qty, Math.max(1, remainingCapUp));
+      const qtyBidDown = Math.min(qty, Math.max(1, remainingCapDn));
+
+      const bucketTrades = tradesByBucket.get(bucketTs) || [];
+
+      // ═══ BID_UP (buy UP tokens) ═══
+      if (allowBidUp && cash.balance > bidUp * qtyBidUp + calcTakerFee(qtyBidUp, bidUp, feeRateVal)) {
+        // Maker fill: SELL trade at our bid price (someone sold into our bid)
+        const sellsAtOurBid = bucketTrades.filter(t =>
+          t.outcome === "Up" && t.side === "SELL" && Math.abs(t.price - bidUp) <= TICK_SIZE
+        );
+        let filled = false;
+        if (sellsAtOurBid.length > 0) {
+          // Direct maker fill — our bid was hit
           const fillPrice = bidUp;
-          const fillQty = Math.min(qty, config.maxPositionSize);
+          const fillQty = Math.min(qtyBidUp, config.maxPositionSize);
           const rebate = calcMakerRebate(fillQty, fillPrice, feeRateVal);
           totalRebates += rebate;
           makerTrades++;
-
           cash.balance -= fillPrice * fillQty;
           cash.balance += rebate;
-
           const existing = positions.get(upPosKey);
           if (existing) {
             existing.quantity += fillQty;
@@ -577,79 +624,71 @@ export function runBacktest(
             positions.set(upPosKey, {
               side: "UP", entryPrice: fillPrice, quantity: fillQty,
               costBasis: fillPrice * fillQty,
-              openedAt: marketStartTs + config.latencySeconds,
-              marketSlug: market.slug,
+              openedAt: cycleTs, marketSlug: market.slug,
             });
           }
           inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + fillQty);
           marketsTradedSet.add(market.conditionId);
-
           btTrades.push({
-            timestamp: marketStartTs + config.latencySeconds,
-            marketSlug: market.slug, side: "BID_UP",
-            price: fillPrice, quantity: fillQty,
+            timestamp: cycleTs, marketSlug: market.slug,
+            side: "BID_UP", price: fillPrice, quantity: fillQty,
             fee: 0, rebate, pnl: 0, reason: "maker_fill", cashAfter: cash.balance,
           });
+          filled = true;
+        }
+        if (!filled) {
+          // Probabilistic maker fill (queue-based, like live bot)
+          const sellsNearOurBid = bucketTrades.filter(t =>
+            t.outcome === "Up" && t.side === "SELL" && Math.abs(t.price - bidUp) <= 0.03
+          );
+          const queueAge = Math.min(cycleCount * CYCLE_SECONDS / 8, 1.0); // ramp up over 8s
+          const fillProb = config.makerFillRate * Math.min(sellsNearOurBid.length / 10, 1) * queueAge;
+          const roll = (cycleTs * 137 + Math.floor(bidUp * 1000)) % 1000;
+          if (roll < fillProb * 1000) {
+            const fillPrice = bidUp;
+            const fillQty = Math.min(qtyBidUp, config.maxPositionSize);
+            const rebate = calcMakerRebate(fillQty, fillPrice, feeRateVal);
+            totalRebates += rebate;
+            makerTrades++;
+            cash.balance -= fillPrice * fillQty;
+            cash.balance += rebate;
+            const existing = positions.get(upPosKey);
+            if (existing) {
+              existing.quantity += fillQty;
+              existing.costBasis += fillPrice * fillQty;
+              existing.entryPrice = existing.costBasis / existing.quantity;
+            } else {
+              positions.set(upPosKey, {
+                side: "UP", entryPrice: fillPrice, quantity: fillQty,
+                costBasis: fillPrice * fillQty,
+                openedAt: cycleTs, marketSlug: market.slug,
+              });
+            }
+            inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + fillQty);
+            marketsTradedSet.add(market.conditionId);
+            btTrades.push({
+              timestamp: cycleTs, marketSlug: market.slug,
+              side: "BID_UP", price: fillPrice, quantity: fillQty,
+              fee: 0, rebate, pnl: 0, reason: "maker_fill", cashAfter: cash.balance,
+            });
+          }
         }
       }
-    }
 
-    // ── Try BID_DOWN (buy DOWN tokens) ──
-    const downPosKey = `${market.conditionId}_DOWN`;
-    const downTradesBelowOurBid = marketTrades.filter(
-      t => t.outcome === "Down" && t.side === "SELL" && t.price <= bidDown &&
-      t.timestamp >= marketStartTs && t.timestamp < marketEndTs - config.autoExitMinutes * 60,
-    );
-
-    if (cash.balance > bidDown * qty + calcTakerFee(qty, bidDown, feeRateVal)) {
-      if (downTradesBelowOurBid.length > 0) {
-        const fillTrade = downTradesBelowOurBid[0];
-        const fillPrice = tickRound(fillTrade.price);
-        const fillQty = Math.min(qty, config.maxPositionSize);
-        const fee = calcTakerFee(fillQty, fillPrice, feeRateVal);
-        totalFees += fee;
-        takerTrades++;
-
-        cash.balance -= fillPrice * fillQty + fee;
-        const existing = positions.get(downPosKey);
-        if (existing) {
-          existing.quantity += fillQty;
-          existing.costBasis += fillPrice * fillQty + fee;
-          existing.entryPrice = existing.costBasis / existing.quantity;
-        } else {
-          positions.set(downPosKey, {
-            side: "DOWN", entryPrice: fillPrice, quantity: fillQty,
-            costBasis: fillPrice * fillQty + fee,
-            openedAt: fillTrade.timestamp, marketSlug: market.slug,
-          });
-        }
-        inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - fillQty);
-        marketsTradedSet.add(market.conditionId);
-
-        btTrades.push({
-          timestamp: fillTrade.timestamp, marketSlug: market.slug,
-          side: "BID_DOWN", price: fillPrice, quantity: fillQty,
-          fee, rebate: 0, pnl: 0, reason: "taker_fill", cashAfter: cash.balance,
-        });
-      } else {
-        // Probabilistic maker fill for DOWN
-        const downTradesNearOurBid = marketTrades.filter(
-          t => t.outcome === "Down" && t.timestamp >= marketStartTs &&
-          t.timestamp < marketEndTs - config.autoExitMinutes * 60 &&
-          Math.abs(t.price - bidDown) <= 0.03,
+      // ═══ BID_DOWN (buy DOWN tokens) ═══
+      if (allowBidDown && cash.balance > bidDown * qtyBidDown + calcTakerFee(qtyBidDown, bidDown, feeRateVal)) {
+        const sellsAtOurBid = bucketTrades.filter(t =>
+          t.outcome === "Down" && t.side === "SELL" && Math.abs(t.price - bidDown) <= TICK_SIZE
         );
-        const fillProb = config.makerFillRate * Math.min(downTradesNearOurBid.length / 10, 1);
-        const hash = (market.slotTs * 11 + Math.floor(bidDown * 1000)) % 100;
-        if (hash < fillProb * 100) {
+        let filled = false;
+        if (sellsAtOurBid.length > 0) {
           const fillPrice = bidDown;
-          const fillQty = Math.min(qty, config.maxPositionSize);
+          const fillQty = Math.min(qtyBidDown, config.maxPositionSize);
           const rebate = calcMakerRebate(fillQty, fillPrice, feeRateVal);
           totalRebates += rebate;
           makerTrades++;
-
           cash.balance -= fillPrice * fillQty;
           cash.balance += rebate;
-
           const existing = positions.get(downPosKey);
           if (existing) {
             existing.quantity += fillQty;
@@ -659,110 +698,242 @@ export function runBacktest(
             positions.set(downPosKey, {
               side: "DOWN", entryPrice: fillPrice, quantity: fillQty,
               costBasis: fillPrice * fillQty,
-              openedAt: marketStartTs + config.latencySeconds,
-              marketSlug: market.slug,
+              openedAt: cycleTs, marketSlug: market.slug,
             });
           }
           inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - fillQty);
           marketsTradedSet.add(market.conditionId);
-
           btTrades.push({
-            timestamp: marketStartTs + config.latencySeconds,
-            marketSlug: market.slug, side: "BID_DOWN",
-            price: fillPrice, quantity: fillQty,
+            timestamp: cycleTs, marketSlug: market.slug,
+            side: "BID_DOWN", price: fillPrice, quantity: fillQty,
             fee: 0, rebate, pnl: 0, reason: "maker_fill", cashAfter: cash.balance,
           });
+          filled = true;
+        }
+        if (!filled) {
+          const sellsNearOurBid = bucketTrades.filter(t =>
+            t.outcome === "Down" && t.side === "SELL" && Math.abs(t.price - bidDown) <= 0.03
+          );
+          const queueAge = Math.min(cycleCount * CYCLE_SECONDS / 8, 1.0);
+          const fillProb = config.makerFillRate * Math.min(sellsNearOurBid.length / 10, 1) * queueAge;
+          const roll = (cycleTs * 149 + Math.floor(bidDown * 1000)) % 1000;
+          if (roll < fillProb * 1000) {
+            const fillPrice = bidDown;
+            const fillQty = Math.min(qtyBidDown, config.maxPositionSize);
+            const rebate = calcMakerRebate(fillQty, fillPrice, feeRateVal);
+            totalRebates += rebate;
+            makerTrades++;
+            cash.balance -= fillPrice * fillQty;
+            cash.balance += rebate;
+            const existing = positions.get(downPosKey);
+            if (existing) {
+              existing.quantity += fillQty;
+              existing.costBasis += fillPrice * fillQty;
+              existing.entryPrice = existing.costBasis / existing.quantity;
+            } else {
+              positions.set(downPosKey, {
+                side: "DOWN", entryPrice: fillPrice, quantity: fillQty,
+                costBasis: fillPrice * fillQty,
+                openedAt: cycleTs, marketSlug: market.slug,
+              });
+            }
+            inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - fillQty);
+            marketsTradedSet.add(market.conditionId);
+            btTrades.push({
+              timestamp: cycleTs, marketSlug: market.slug,
+              side: "BID_DOWN", price: fillPrice, quantity: fillQty,
+              fee: 0, rebate, pnl: 0, reason: "maker_fill", cashAfter: cash.balance,
+            });
+          }
         }
       }
-    }
 
-    // ── Try ASK_UP (sell UP tokens if we own them) ──
-    const upPosForSell = positions.get(upPosKey);
-    if (upPosForSell && upPosForSell.quantity > 0 && askUp > 0) {
-      const upBuyTradesAtOurAsk = marketTrades.filter(
-        t => t.outcome === "Up" && t.side === "BUY" && t.price >= askUp &&
-        t.timestamp >= marketStartTs && t.timestamp < marketEndTs - config.autoExitMinutes * 60,
-      );
-      if (upBuyTradesAtOurAsk.length > 0) {
-        const fillTrade = upBuyTradesAtOurAsk[0];
-        const fillPrice = tickRound(fillTrade.price);
-        const sellQty = Math.min(upPosForSell.quantity, qty, config.maxPositionSize);
-        const fee = calcTakerFee(sellQty, fillPrice, feeRateVal);
-        totalFees += fee;
-        takerTrades++;
+      // ═══ ASK_UP (sell UP tokens if we own them) ═══
+      const upPosForSell = positions.get(upPosKey);
+      if (upPosForSell && upPosForSell.quantity > 0 && askUp > 0) {
+        const sellsAtOurAsk = bucketTrades.filter(t =>
+          t.outcome === "Up" && t.side === "BUY" && Math.abs(t.price - askUp) <= TICK_SIZE
+        );
+        let filled = false;
+        if (sellsAtOurAsk.length > 0) {
+          const fillPrice = askUp;
+          const sellQty = Math.min(upPosForSell.quantity, qty, config.maxPositionSize);
+          const rebate = calcMakerRebate(sellQty, fillPrice, feeRateVal);
+          totalRebates += rebate;
+          makerTrades++;
+          const closeValue = fillPrice * sellQty;
+          const entryCost = upPosForSell.entryPrice * sellQty;
+          const tradePnl = closeValue + rebate - entryCost;
+          cash.balance += closeValue + rebate;
+          realizedPnl += tradePnl;
+          upPosForSell.quantity -= sellQty;
+          upPosForSell.costBasis -= entryCost;
+          if (upPosForSell.quantity <= 0) {
+            totalHoldingTime += cycleTs - upPosForSell.openedAt;
+            settledPositions++;
+            positions.delete(upPosKey);
+          } else {
+            upPosForSell.entryPrice = upPosForSell.costBasis / upPosForSell.quantity;
+          }
+          inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - sellQty);
+          if (tradePnl > 0) winningTrades++;
+          else if (tradePnl < 0) losingTrades++;
+          btTrades.push({
+            timestamp: cycleTs, marketSlug: market.slug,
+            side: "ASK_UP", price: fillPrice, quantity: sellQty,
+            fee: 0, rebate, pnl: tradePnl, reason: "maker_fill", cashAfter: cash.balance,
+          });
+          filled = true;
+        }
+        if (!filled) {
+          const buysNearOurAsk = bucketTrades.filter(t =>
+            t.outcome === "Up" && t.side === "BUY" && Math.abs(t.price - askUp) <= 0.03
+          );
+          const queueAge = Math.min(cycleCount * CYCLE_SECONDS / 8, 1.0);
+          const fillProb = config.makerFillRate * Math.min(buysNearOurAsk.length / 10, 1) * queueAge;
+          const roll = (cycleTs * 163 + Math.floor(askUp * 1000)) % 1000;
+          if (roll < fillProb * 1000) {
+            const fillPrice = askUp;
+            const sellQty = Math.min(upPosForSell.quantity, qty, config.maxPositionSize);
+            const rebate = calcMakerRebate(sellQty, fillPrice, feeRateVal);
+            totalRebates += rebate;
+            makerTrades++;
+            const closeValue = fillPrice * sellQty;
+            const entryCost = upPosForSell.entryPrice * sellQty;
+            const tradePnl = closeValue + rebate - entryCost;
+            cash.balance += closeValue + rebate;
+            realizedPnl += tradePnl;
+            upPosForSell.quantity -= sellQty;
+            upPosForSell.costBasis -= entryCost;
+            if (upPosForSell.quantity <= 0) {
+              totalHoldingTime += cycleTs - upPosForSell.openedAt;
+              settledPositions++;
+              positions.delete(upPosKey);
+            } else {
+              upPosForSell.entryPrice = upPosForSell.costBasis / upPosForSell.quantity;
+            }
+            inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - sellQty);
+            if (tradePnl > 0) winningTrades++;
+            else if (tradePnl < 0) losingTrades++;
+            btTrades.push({
+              timestamp: cycleTs, marketSlug: market.slug,
+              side: "ASK_UP", price: fillPrice, quantity: sellQty,
+              fee: 0, rebate, pnl: tradePnl, reason: "maker_fill", cashAfter: cash.balance,
+            });
+          }
+        }
+      }
 
-        const closeValue = fillPrice * sellQty - fee;
-        const entryCost = upPosForSell.entryPrice * sellQty;
-        const tradePnl = closeValue - entryCost;
+      // ═══ ASK_DOWN (sell DOWN tokens if we own them) ═══
+      const downPosForSell = positions.get(downPosKey);
+      if (downPosForSell && downPosForSell.quantity > 0 && askDown > 0) {
+        const buysAtOurAsk = bucketTrades.filter(t =>
+          t.outcome === "Down" && t.side === "BUY" && Math.abs(t.price - askDown) <= TICK_SIZE
+        );
+        let filled = false;
+        if (buysAtOurAsk.length > 0) {
+          const fillPrice = askDown;
+          const sellQty = Math.min(downPosForSell.quantity, qty, config.maxPositionSize);
+          const rebate = calcMakerRebate(sellQty, fillPrice, feeRateVal);
+          totalRebates += rebate;
+          makerTrades++;
+          const closeValue = fillPrice * sellQty;
+          const entryCost = downPosForSell.entryPrice * sellQty;
+          const tradePnl = closeValue + rebate - entryCost;
+          cash.balance += closeValue + rebate;
+          realizedPnl += tradePnl;
+          downPosForSell.quantity -= sellQty;
+          downPosForSell.costBasis -= entryCost;
+          if (downPosForSell.quantity <= 0) {
+            totalHoldingTime += cycleTs - downPosForSell.openedAt;
+            settledPositions++;
+            positions.delete(downPosKey);
+          } else {
+            downPosForSell.entryPrice = downPosForSell.costBasis / downPosForSell.quantity;
+          }
+          inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + sellQty);
+          if (tradePnl > 0) winningTrades++;
+          else if (tradePnl < 0) losingTrades++;
+          btTrades.push({
+            timestamp: cycleTs, marketSlug: market.slug,
+            side: "ASK_DOWN", price: fillPrice, quantity: sellQty,
+            fee: 0, rebate, pnl: tradePnl, reason: "maker_fill", cashAfter: cash.balance,
+          });
+          filled = true;
+        }
+        if (!filled) {
+          const buysNearOurAsk = bucketTrades.filter(t =>
+            t.outcome === "Down" && t.side === "BUY" && Math.abs(t.price - askDown) <= 0.03
+          );
+          const queueAge = Math.min(cycleCount * CYCLE_SECONDS / 8, 1.0);
+          const fillProb = config.makerFillRate * Math.min(buysNearOurAsk.length / 10, 1) * queueAge;
+          const roll = (cycleTs * 179 + Math.floor(askDown * 1000)) % 1000;
+          if (roll < fillProb * 1000) {
+            const fillPrice = askDown;
+            const sellQty = Math.min(downPosForSell.quantity, qty, config.maxPositionSize);
+            const rebate = calcMakerRebate(sellQty, fillPrice, feeRateVal);
+            totalRebates += rebate;
+            makerTrades++;
+            const closeValue = fillPrice * sellQty;
+            const entryCost = downPosForSell.entryPrice * sellQty;
+            const tradePnl = closeValue + rebate - entryCost;
+            cash.balance += closeValue + rebate;
+            realizedPnl += tradePnl;
+            downPosForSell.quantity -= sellQty;
+            downPosForSell.costBasis -= entryCost;
+            if (downPosForSell.quantity <= 0) {
+              totalHoldingTime += cycleTs - downPosForSell.openedAt;
+              settledPositions++;
+              positions.delete(downPosKey);
+            } else {
+              downPosForSell.entryPrice = downPosForSell.costBasis / downPosForSell.quantity;
+            }
+            inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + sellQty);
+            if (tradePnl > 0) winningTrades++;
+            else if (tradePnl < 0) losingTrades++;
+            btTrades.push({
+              timestamp: cycleTs, marketSlug: market.slug,
+              side: "ASK_DOWN", price: fillPrice, quantity: sellQty,
+              fee: 0, rebate, pnl: tradePnl, reason: "maker_fill", cashAfter: cash.balance,
+            });
+          }
+        }
+      }
 
-        cash.balance += closeValue;
-        realizedPnl += tradePnl;
-
-        upPosForSell.quantity -= sellQty;
-        upPosForSell.costBasis -= entryCost;
-        if (upPosForSell.quantity <= 0) {
-          totalHoldingTime += fillTrade.timestamp - upPosForSell.openedAt;
+      // ── Auto-exit: close positions near expiry ──
+      const minutesToExpiry = (marketEndTs - cycleTs) / 60;
+      if (minutesToExpiry <= config.autoExitMinutes) {
+        // Force-close at current bid (taker)
+        for (const [posKey, pos] of positions) {
+          if (!posKey.startsWith(market.conditionId)) continue;
+          const realBid = pos.side === "UP" ? upBestBid : downBestBid;
+          const closePrice = tickRound(realBid);
+          if (closePrice <= 0) continue;
+          const sellQty = pos.quantity;
+          const fee = calcTakerFee(sellQty, closePrice, feeRateVal);
+          totalFees += fee;
+          takerTrades++;
+          const closeValue = closePrice * sellQty - fee;
+          const entryCost = pos.costBasis;
+          const tradePnl = closeValue - entryCost;
+          cash.balance += closeValue;
+          realizedPnl += tradePnl;
+          totalHoldingTime += cycleTs - pos.openedAt;
           settledPositions++;
-          positions.delete(upPosKey);
-        } else {
-          upPosForSell.entryPrice = upPosForSell.costBasis / upPosForSell.quantity;
+          if (tradePnl > 0) winningTrades++;
+          else if (tradePnl < 0) losingTrades++;
+          btTrades.push({
+            timestamp: cycleTs, marketSlug: market.slug,
+            side: `SELL_${pos.side}`, price: closePrice, quantity: sellQty,
+            fee, rebate: 0, pnl: tradePnl, reason: "auto_exit", cashAfter: cash.balance,
+          });
+          positions.delete(posKey);
         }
-        inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - sellQty);
-
-        if (tradePnl > 0) winningTrades++;
-        else if (tradePnl < 0) losingTrades++;
-
-        btTrades.push({
-          timestamp: fillTrade.timestamp, marketSlug: market.slug,
-          side: "ASK_UP", price: fillPrice, quantity: sellQty,
-          fee, rebate: 0, pnl: tradePnl, reason: "taker_fill", cashAfter: cash.balance,
-        });
+        inventory.set(market.conditionId, 0);
+        break; // Trading done for this market
       }
     }
 
-    // ── Try ASK_DOWN (sell DOWN tokens if we own them) ──
-    const downPosForSell = positions.get(downPosKey);
-    if (downPosForSell && downPosForSell.quantity > 0 && askDown > 0) {
-      const downBuyTradesAtOurAsk = marketTrades.filter(
-        t => t.outcome === "Down" && t.side === "BUY" && t.price >= askDown &&
-        t.timestamp >= marketStartTs && t.timestamp < marketEndTs - config.autoExitMinutes * 60,
-      );
-      if (downBuyTradesAtOurAsk.length > 0) {
-        const fillTrade = downBuyTradesAtOurAsk[0];
-        const fillPrice = tickRound(fillTrade.price);
-        const sellQty = Math.min(downPosForSell.quantity, qty, config.maxPositionSize);
-        const fee = calcTakerFee(sellQty, fillPrice, feeRateVal);
-        totalFees += fee;
-        takerTrades++;
-
-        const closeValue = fillPrice * sellQty - fee;
-        const entryCost = downPosForSell.entryPrice * sellQty;
-        const tradePnl = closeValue - entryCost;
-
-        cash.balance += closeValue;
-        realizedPnl += tradePnl;
-
-        downPosForSell.quantity -= sellQty;
-        downPosForSell.costBasis -= entryCost;
-        if (downPosForSell.quantity <= 0) {
-          totalHoldingTime += fillTrade.timestamp - downPosForSell.openedAt;
-          settledPositions++;
-          positions.delete(downPosKey);
-        } else {
-          downPosForSell.entryPrice = downPosForSell.costBasis / downPosForSell.quantity;
-        }
-        inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + sellQty);
-
-        if (tradePnl > 0) winningTrades++;
-        else if (tradePnl < 0) losingTrades++;
-
-        btTrades.push({
-          timestamp: fillTrade.timestamp, marketSlug: market.slug,
-          side: "ASK_DOWN", price: fillPrice, quantity: sellQty,
-          fee, rebate: 0, pnl: tradePnl, reason: "taker_fill", cashAfter: cash.balance,
-        });
-      }
-    }
 
     // ── Settlement: close any remaining positions at expiry ──
     const upWins = market.outcome === "Up";
