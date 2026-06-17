@@ -144,8 +144,8 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   edgeSizeMultiplier: 2.0,    // double size when we have edge
   // Strategy C: settlement arbitrage
   settlementArbMinutes: 2,      // last 2 minutes before expiry
-  settlementArbZThreshold: 3.0, // |z| > 3 → 99.7% confidence
-  settlementArbMaxSize: 20,     // $20 max per settlement arb trade
+  settlementArbZThreshold: 7.0, // |z| > 3 → 99.7% confidence
+  settlementArbMaxSize: 10,     // $20 max per settlement arb trade
 };
 
 // ─── ATR Calculator from Klines ───────────────────────────────
@@ -501,8 +501,17 @@ export function runBacktest(
     const btc = computeBtcContext(klines, marketStartTs);
     if (btc.price <= 0) continue;
 
-    // Parse strike price
-    const strike = parseStrikePrice(market.question);
+    // ── Determine strike price ──
+    // For Polymarket BTC Up/Down 15-min markets, the question doesn't contain
+    // a strike price (e.g. "Bitcoin Up or Down - June 16, 7:30AM-7:45AM ET").
+    // The strike is the BTC price at the START of the 15-min slot: if BTC is
+    // higher at expiry → UP wins, lower → DOWN wins.
+    // So strike = BTC price at marketStartTs (from klines).
+    let strike = parseStrikePrice(market.question);
+    if (strike <= 0) {
+      // BTC Up/Down market: strike = opening BTC price at slot start
+      strike = btc.price;
+    }
 
     // Get market trades and reconstruct price series
     const marketTrades = (tradesByMarket.get(market.conditionId) || [])
@@ -528,7 +537,9 @@ export function runBacktest(
     // This replaces the old single-shot fill logic that produced 96.9% taker fills.
     const CYCLE_SECONDS = 10;
     const tradingStartTs = marketStartTs + config.latencySeconds;
-    const tradingEndTs = marketEndTs - config.autoExitMinutes * 60;
+    // Trade all the way to expiry — auto-exit and settlement arb are handled
+    // inside the cycle loop based on minutesToExpiry, not by truncating the loop.
+    const tradingEndTs = marketEndTs;
 
     const upPosKey = `${market.conditionId}_UP`;
     const downPosKey = `${market.conditionId}_DOWN`;
@@ -548,6 +559,7 @@ export function runBacktest(
 
     let lastPricePoint: PricePoint | null = pricePoints[0];
     let cycleCount = 0;
+    let marketSettlementArbDone = false;  // one settlement arb per market
 
     for (let cycleTs = tradingStartTs; cycleTs < tradingEndTs; cycleTs += CYCLE_SECONDS) {
       cycleCount++;
@@ -625,10 +637,10 @@ export function runBacktest(
       // ═══ Strategy C: Settlement arbitrage (last N minutes) ═══
       // If BTC is far from strike (|z| > threshold) in the last N minutes,
       // the outcome is almost certain. Buy the winning side at market (taker).
-      // This has ~95%+ win rate but small edge per trade (5-10¢).
+      // ONE trade per market (marketSettlementArbDone flag) — no accumulation.
       const minutesToExpiry = (marketEndTs - cycleTs) / 60;
       let settlementArbTriggered = false;
-      if (minutesToExpiry <= config.settlementArbMinutes && strike > 0 && btcNow.atr5m > 0) {
+      if (!marketSettlementArbDone && minutesToExpiry <= config.settlementArbMinutes && strike > 0 && btcNow.atr5m > 0) {
         const distPct = (btcNow.price - strike) / btcNow.price;
         const atrPct = btcNow.atr5m / btcNow.price;
         const expectedMove = atrPct * Math.sqrt(Math.max(minutesToExpiry, 0.05) / 5);
@@ -683,6 +695,7 @@ export function runBacktest(
             });
 
             settlementArbTriggered = true;
+            marketSettlementArbDone = true;
           }
         }
       }
@@ -1031,11 +1044,17 @@ export function runBacktest(
         }
       }
 
-      // ── Auto-exit: close positions near expiry (reuses minutesToExpiry from settlement arb block above) ──
-      if (minutesToExpiry <= config.autoExitMinutes) {
-        // Force-close at current bid (taker)
+      // ── Auto-exit: close MM positions near expiry ──
+      // Only close MM (market-making) positions via auto-exit. Edge and
+      // settlement_arb positions should ride to settlement for full $1/$0
+      // payout (that's where their edge comes from).
+      // Window: between settlementArbMinutes and autoExitMinutes (e.g. 2-3 min).
+      const shouldAutoExit = minutesToExpiry <= config.autoExitMinutes
+        && minutesToExpiry > config.settlementArbMinutes;
+      if (shouldAutoExit) {
         for (const [posKey, pos] of positions) {
           if (!posKey.startsWith(market.conditionId)) continue;
+          if (pos.strategy !== "mm") continue;  // only close MM positions
           const realBid = pos.side === "UP" ? upBestBid : downBestBid;
           const closePrice = tickRound(realBid);
           if (closePrice <= 0) continue;
@@ -1059,8 +1078,13 @@ export function runBacktest(
           });
           positions.delete(posKey);
         }
-        inventory.set(market.conditionId, 0);
-        break; // Trading done for this market
+        // Don't break — continue cycling to allow settlement arb entries
+        // in the last settlementArbMinutes. Only recompute inventory after
+        // closing MM positions.
+        const remainingInv = Array.from(positions.values())
+          .filter(p => p.marketSlug === market.slug)
+          .reduce((s, p) => s + (p.side === "UP" ? p.quantity : -p.quantity), 0);
+        inventory.set(market.conditionId, remainingInv);
       }
     }
 
