@@ -66,6 +66,18 @@ export interface BacktestConfig {
   makerFillRate: number;     // Probability of maker fill per 10s cycle (0-1)
   latencySeconds: number;    // Simulated order-to-fill latency
   tickIntervalSeconds: number; // Simulation tick interval (default 10s)
+  // ── Strategy B: Directional edge filter ──
+  // When |modelProb - marketPrice| > edgeThreshold, we have a directional edge.
+  // In edge mode we only place BIDs on the side the model favors (never both).
+  // When |edge| < edgeThreshold, we fall back to symmetric MM mode.
+  edgeThreshold: number;        // in probability units (0.04 = 4¢)
+  edgeSizeMultiplier: number;   // size multiplier when in edge mode (e.g. 2.0 = double size)
+  // ── Strategy C: Settlement arbitrage ──
+  // In the last N minutes, if |z-score| > threshold (BTC far from strike),
+  // we buy the side that's almost certain to win at market price (taker).
+  settlementArbMinutes: number;   // window before expiry (e.g. 2 = last 2 min)
+  settlementArbZThreshold: number; // |z-score| required to trigger (e.g. 3.0)
+  settlementArbMaxSize: number;    // max USDC per settlement arb trade
 }
 
 export interface BacktestResult {
@@ -86,6 +98,15 @@ export interface BacktestResult {
   winningTrades: number;
   losingTrades: number;
   avgHoldingTimeMinutes: number;
+  // Per-strategy breakdown
+  edgeTrades: number;
+  edgeWins: number;
+  edgeLosses: number;
+  edgeWinRate: number;
+  settlementArbTrades: number;
+  settlementArbWins: number;
+  settlementArbLosses: number;
+  settlementArbWinRate: number;
   equityCurve: Array<{ timestamp: number; equity: number; cash: number }>;
   tradeLog: BacktestTrade[];
   dailyPnl: Array<{ date: string; pnl: number; trades: number }>;
@@ -118,6 +139,13 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   makerFillRate: 0.10,
   latencySeconds: 2,
   tickIntervalSeconds: 10,
+  // Strategy B: edge filter
+  edgeThreshold: 0.04,        // 4¢ edge required to enter directional mode
+  edgeSizeMultiplier: 2.0,    // double size when we have edge
+  // Strategy C: settlement arbitrage
+  settlementArbMinutes: 2,      // last 2 minutes before expiry
+  settlementArbZThreshold: 3.0, // |z| > 3 → 99.7% confidence
+  settlementArbMaxSize: 20,     // $20 max per settlement arb trade
 };
 
 // ─── ATR Calculator from Klines ───────────────────────────────
@@ -415,6 +443,7 @@ export function runBacktest(
     costBasis: number;
     openedAt: number;  // Unix seconds
     marketSlug: string;
+    strategy: "mm" | "edge" | "settlement_arb";  // which strategy opened this position
   }
   const positions = new Map<string, Position>();  // key: marketId_SIDE
   const inventory = new Map<string, number>();
@@ -431,6 +460,13 @@ export function runBacktest(
   let losingTrades = 0;
   let totalHoldingTime = 0;
   let settledPositions = 0;
+  // Strategy tracking
+  let edgeTrades = 0;          // B: directional edge entries
+  let edgeWins = 0;
+  let edgeLosses = 0;
+  let settlementArbTrades = 0; // C: settlement arbitrage entries
+  let settlementArbWins = 0;
+  let settlementArbLosses = 0;
   const marketsTradedSet = new Set<string>();
 
   // Sort markets by start time
@@ -586,16 +622,111 @@ export function runBacktest(
 
       const qty = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
 
+      // ═══ Strategy C: Settlement arbitrage (last N minutes) ═══
+      // If BTC is far from strike (|z| > threshold) in the last N minutes,
+      // the outcome is almost certain. Buy the winning side at market (taker).
+      // This has ~95%+ win rate but small edge per trade (5-10¢).
+      const minutesToExpiry = (marketEndTs - cycleTs) / 60;
+      let settlementArbTriggered = false;
+      if (minutesToExpiry <= config.settlementArbMinutes && strike > 0 && btcNow.atr5m > 0) {
+        const distPct = (btcNow.price - strike) / btcNow.price;
+        const atrPct = btcNow.atr5m / btcNow.price;
+        const expectedMove = atrPct * Math.sqrt(Math.max(minutesToExpiry, 0.05) / 5);
+        const zScore = expectedMove > 0 ? distPct / expectedMove : (distPct > 0 ? 5 : -5);
+
+        if (Math.abs(zScore) >= config.settlementArbZThreshold) {
+          // Settlement arb: BTC far from strike, outcome nearly certain
+          const winningSide: "UP" | "DOWN" = btcNow.price > strike ? "UP" : "DOWN";
+          const tokenId = winningSide === "UP" ? "up" : "down";
+          const bestAsk = winningSide === "UP" ? upBestAsk : downBestAsk;
+          const arbQty = Math.min(
+            Math.floor(config.settlementArbMaxSize / Math.max(bestAsk, TICK_SIZE)),
+            config.maxPositionSize,
+          );
+
+          if (arbQty > 0 && cash.balance > bestAsk * arbQty + calcTakerFee(arbQty, bestAsk, feeRateVal)) {
+            // Execute as taker (we pay the ask to get immediate fill)
+            const fillPrice = bestAsk;
+            const fee = calcTakerFee(arbQty, fillPrice, feeRateVal);
+            totalFees += fee;
+            takerTrades++;
+            settlementArbTrades++;
+
+            cash.balance -= fillPrice * arbQty + fee;
+
+            const arbPosKey = `${market.conditionId}_${winningSide}`;
+            const existing = positions.get(arbPosKey);
+            if (existing) {
+              existing.quantity += arbQty;
+              existing.costBasis += fillPrice * arbQty + fee;
+              existing.entryPrice = existing.costBasis / existing.quantity;
+            } else {
+              positions.set(arbPosKey, {
+                side: winningSide, entryPrice: fillPrice, quantity: arbQty,
+                costBasis: fillPrice * arbQty + fee,
+                openedAt: cycleTs, marketSlug: market.slug,
+                strategy: "settlement_arb",
+              });
+            }
+            if (winningSide === "UP") {
+              inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + arbQty);
+            } else {
+              inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - arbQty);
+            }
+            marketsTradedSet.add(market.conditionId);
+
+            btTrades.push({
+              timestamp: cycleTs, marketSlug: market.slug,
+              side: `ARB_${winningSide}`, price: fillPrice, quantity: arbQty,
+              fee, rebate: 0, pnl: 0, reason: `settlement_arb_z${zScore.toFixed(1)}`,
+              cashAfter: cash.balance,
+            });
+
+            settlementArbTriggered = true;
+          }
+        }
+      }
+
+      // ═══ Strategy B: Directional edge filter ═══
+      // Compute edge = modelProb - marketPrice. If |edge| > threshold, we have
+      // a directional view: only place BIDs on the side the model favors.
+      //   edge > 0  → model says UP is underpriced → only BID_UP (skip BID_DOWN)
+      //   edge < 0  → model says DOWN is underpriced → only BID_DOWN (skip BID_UP)
+      //   |edge| < threshold → no edge, symmetric MM mode (place both BIDs)
+      const edge = modelPUp - upRealMid;
+      const hasEdgeUp = edge > config.edgeThreshold;     // model says UP underpriced
+      const hasEdgeDown = -edge > config.edgeThreshold;  // model says DOWN underpriced
+      const inEdgeMode = hasEdgeUp || hasEdgeDown;
+
       // ── Rebalance mode: skip BID on the long side ──
       const rebalanceOnly = Math.abs(inv) > 12;
-      const allowBidUp = !(rebalanceOnly && inv > 0);
-      const allowBidDown = !(rebalanceOnly && inv < 0);
+      let allowBidUp = !(rebalanceOnly && inv > 0);
+      let allowBidDown = !(rebalanceOnly && inv < 0);
+
+      // In edge mode, only place BID on the favored side
+      if (inEdgeMode) {
+        if (hasEdgeUp) {
+          allowBidDown = false;  // only bid UP
+        } else {
+          allowBidUp = false;    // only bid DOWN
+        }
+      }
 
       // ── Inventory-aware bid sizing ──
       const remainingCapUp = Math.max(0, config.maxInventory - Math.max(0, inv));
       const remainingCapDn = Math.max(0, config.maxInventory - Math.max(0, -inv));
-      const qtyBidUp = Math.min(qty, Math.max(1, remainingCapUp));
-      const qtyBidDown = Math.min(qty, Math.max(1, remainingCapDn));
+      // In edge mode, use larger size (we have conviction)
+      const sizeMult = inEdgeMode ? config.edgeSizeMultiplier : 1;
+      const qtyBidUp = Math.min(
+        Math.max(1, Math.round(qty * sizeMult)),
+        Math.max(1, remainingCapUp),
+        config.maxPositionSize,
+      );
+      const qtyBidDown = Math.min(
+        Math.max(1, Math.round(qty * sizeMult)),
+        Math.max(1, remainingCapDn),
+        config.maxPositionSize,
+      );
 
       const bucketTrades = tradesByBucket.get(bucketTs) || [];
 
@@ -624,7 +755,7 @@ export function runBacktest(
             positions.set(upPosKey, {
               side: "UP", entryPrice: fillPrice, quantity: fillQty,
               costBasis: fillPrice * fillQty,
-              openedAt: cycleTs, marketSlug: market.slug,
+              openedAt: cycleTs, marketSlug: market.slug, strategy: hasEdgeUp ? "edge" : "mm",
             });
           }
           inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + fillQty);
@@ -661,7 +792,7 @@ export function runBacktest(
               positions.set(upPosKey, {
                 side: "UP", entryPrice: fillPrice, quantity: fillQty,
                 costBasis: fillPrice * fillQty,
-                openedAt: cycleTs, marketSlug: market.slug,
+                openedAt: cycleTs, marketSlug: market.slug, strategy: hasEdgeUp ? "edge" : "mm",
               });
             }
             inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) + fillQty);
@@ -698,7 +829,7 @@ export function runBacktest(
             positions.set(downPosKey, {
               side: "DOWN", entryPrice: fillPrice, quantity: fillQty,
               costBasis: fillPrice * fillQty,
-              openedAt: cycleTs, marketSlug: market.slug,
+              openedAt: cycleTs, marketSlug: market.slug, strategy: hasEdgeDown ? "edge" : "mm",
             });
           }
           inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - fillQty);
@@ -734,7 +865,7 @@ export function runBacktest(
               positions.set(downPosKey, {
                 side: "DOWN", entryPrice: fillPrice, quantity: fillQty,
                 costBasis: fillPrice * fillQty,
-                openedAt: cycleTs, marketSlug: market.slug,
+                openedAt: cycleTs, marketSlug: market.slug, strategy: hasEdgeDown ? "edge" : "mm",
               });
             }
             inventory.set(market.conditionId, (inventory.get(market.conditionId) || 0) - fillQty);
@@ -900,8 +1031,7 @@ export function runBacktest(
         }
       }
 
-      // ── Auto-exit: close positions near expiry ──
-      const minutesToExpiry = (marketEndTs - cycleTs) / 60;
+      // ── Auto-exit: close positions near expiry (reuses minutesToExpiry from settlement arb block above) ──
       if (minutesToExpiry <= config.autoExitMinutes) {
         // Force-close at current bid (taker)
         for (const [posKey, pos] of positions) {
@@ -954,11 +1084,22 @@ export function runBacktest(
       if (tradePnl > 0) winningTrades++;
       else if (tradePnl < 0) losingTrades++;
 
+      // Track per-strategy win/loss
+      if (pos.strategy === "edge") {
+        edgeTrades++;
+        if (tradePnl > 0) edgeWins++;
+        else if (tradePnl < 0) edgeLosses++;
+      } else if (pos.strategy === "settlement_arb") {
+        settlementArbTrades++;
+        if (tradePnl > 0) settlementArbWins++;
+        else if (tradePnl < 0) settlementArbLosses++;
+      }
+
       btTrades.push({
         timestamp: marketEndTs, marketSlug: market.slug,
         side: `SETTLE_${pos.side}`, price: resolvedPrice,
         quantity: pos.quantity, fee: 0, rebate: 0,
-        pnl: tradePnl, reason: upWins ? "settle_up_wins" : "settle_down_wins",
+        pnl: tradePnl, reason: `${pos.strategy}_${upWins ? "up_wins" : "down_wins"}`,
         cashAfter: cash.balance,
       });
 
@@ -1038,6 +1179,15 @@ export function runBacktest(
     winningTrades,
     losingTrades,
     avgHoldingTimeMinutes,
+    // ── Per-strategy breakdown ──
+    edgeTrades,
+    edgeWins,
+    edgeLosses,
+    edgeWinRate: edgeTrades > 0 ? edgeWins / edgeTrades : 0,
+    settlementArbTrades,
+    settlementArbWins,
+    settlementArbLosses,
+    settlementArbWinRate: settlementArbTrades > 0 ? settlementArbWins / settlementArbTrades : 0,
     equityCurve,
     tradeLog: btTrades,
     dailyPnl,

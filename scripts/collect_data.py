@@ -559,7 +559,8 @@ def show_stats(conn: sqlite3.Connection) -> None:
 # ─── Main Collection Flow ──────────────────────────────────────
 def run_collection(days_back: int = 7, from_date: Optional[str] = None,
                    to_date: Optional[str] = None,
-                   skip_klines: bool = False, skip_trades: bool = False) -> None:
+                   skip_klines: bool = False, skip_trades: bool = False,
+                   skip_markets: bool = False) -> None:
     """Main collection pipeline."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -598,15 +599,20 @@ def run_collection(days_back: int = 7, from_date: Optional[str] = None,
 
     try:
         # Step 1: Enumerate slots and fetch markets
-        print("\n" + "-" * 60)
-        print("  STEP 1: Enumerating 15-min slots for BTC markets")
-        print("-" * 60)
-        markets = fetch_markets_by_slots(start_ts, end_ts, conn)
-        markets_found = len(markets)
+        if skip_markets:
+            print("\n  STEP 1: SKIPPED (--skip-markets flag)")
+            markets = []
+            markets_found = 0
+        else:
+            print("\n" + "-" * 60)
+            print("  STEP 1: Enumerating 15-min slots for BTC markets")
+            print("-" * 60)
+            markets = fetch_markets_by_slots(start_ts, end_ts, conn)
+            markets_found = len(markets)
 
-        if markets:
-            markets_new = insert_markets(conn, markets)
-            print(f"\n[DB] Inserted {markets_new} new markets (total found: {markets_found})")
+            if markets:
+                markets_new = insert_markets(conn, markets)
+                print(f"\n[DB] Inserted {markets_new} new markets (total found: {markets_found})")
 
         # Step 2: Fetch trades
         if not skip_trades:
@@ -699,6 +705,7 @@ if __name__ == "__main__":
     parser.add_argument("--stats", action="store_true", help="Show DB statistics only")
     parser.add_argument("--skip-klines", action="store_true", help="Skip Binance kline collection")
     parser.add_argument("--skip-trades", action="store_true", help="Skip Data API trade collection")
+    parser.add_argument("--skip-markets", action="store_true", help="Skip Step 1 (market enumeration) — use when markets already collected")
     args = parser.parse_args()
 
     if args.stats:
@@ -715,4 +722,5 @@ if __name__ == "__main__":
             to_date=args.to_date,
             skip_klines=args.skip_klines,
             skip_trades=args.skip_trades,
+            skip_markets=args.skip_markets,
         )
