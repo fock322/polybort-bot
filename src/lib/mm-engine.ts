@@ -108,6 +108,9 @@ export interface Position {
   openedAt: number;
   marketQuestion: string;
   isRealPosition: boolean;  // true = from CLOB fill, false = paper
+  // ── Inventory management v2 ──
+  entryMid: number;  // market mid price at position open (for adverse selection detection)
+  peakValue: number; // peak currentValue (for trailing stop in future)
 }
 
 export interface Trade {
@@ -159,6 +162,10 @@ export interface BotConfig {
   quoteSize: number;
   inventorySkewFactor: number;
   cycleIntervalMs: number;
+  // ── Inventory management (v2 — anti adverse selection) ──
+  rebalanceThreshold: number;    // |inv| above this → enter rebalance-only mode
+  adverseSelectionFactor: number; // multiplier on skew when price moves against us
+  stopLossPct: number;           // close position if unrealizedPnl < -stopLossPct * costBasis
   // Live trading config
   liveMode: boolean;
   clobPrivateKey?: string;    // Hex private key for signing (or from env)
@@ -229,10 +236,14 @@ const config: BotConfig = {
   atrMultiplier: 10,
   autoExitMinutes: 3,
   circuitBreakerPct: 0.25,
-  maxInventory: 50,
+  maxInventory: 30,           // was 50 — tighter limit, fewer cycles to accumulate
   quoteSize: 10,
-  inventorySkewFactor: 0.005,
+  inventorySkewFactor: 0.008, // was 0.005 — stronger skew to push rebalancing
   cycleIntervalMs: 10000,
+  // ── Inventory management v2 ──
+  rebalanceThreshold: 12,     // |inv| > 12 → rebalance-only mode (sell long side, buy opposite)
+  adverseSelectionFactor: 3,  // skew ×3 when realMid moves against our position
+  stopLossPct: 0.15,          // close position if unrealized loss > 15% of cost basis
   liveMode: false,
 };
 
@@ -722,10 +733,24 @@ function generateQuotes(btc: BtcPriceData): void {
   // New behaviour: keep active quotes for up to QUOTE_LIFETIME_MS (60s, = 6
   // cycles). After that they're considered stale and cancelled so we can
   // refresh prices. This gives each quote ~6 chances to be maker-filled.
+  //
+  // Additionally, cancel any quote that has drifted too far from the current
+  // mid (> 4 ticks). When the market moves suddenly (e.g. BTC crash), our
+  // old maker bids/asks become toxic — they'd be adverse-selected.
   const QUOTE_LIFETIME_MS = 60_000;
+  const PRICE_MOVE_CANCEL_TICKS = 4;
   const nowMs = Date.now();
   for (const [, q] of quotes) {
-    if (q.status === "active" && nowMs - q.createdAt > QUOTE_LIFETIME_MS) {
+    if (q.status !== "active") continue;
+    if (nowMs - q.createdAt > QUOTE_LIFETIME_MS) {
+      q.status = "cancelled";
+      continue;
+    }
+    // Price-move cancel: if a quote is now far from the current mid, cancel it.
+    const market = markets.get(q.marketId);
+    if (!market) continue;
+    const currentMid = q.side.includes("UP") ? market.realUpMid : market.realDownMid;
+    if (Math.abs(q.price - currentMid) > PRICE_MOVE_CANCEL_TICKS * TICK_SIZE) {
       q.status = "cancelled";
     }
   }
@@ -736,7 +761,21 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!market.active) continue;
 
     const inv = inventory.get(marketId) || 0;
-    if (Math.abs(inv) > config.maxInventory) continue;
+    // NOTE: do NOT skip when |inv| > maxInventory — that would freeze the bot
+    // and prevent rebalancing. Instead, in rebalance-only mode (below) we
+    // only place quotes that reduce the position.
+
+    // ── Cancel stale BIDs on the long side when in rebalance mode ──
+    // Old BID_UP quotes placed before we entered rebalance mode would keep
+    // filling and growing the position. Cancel them now.
+    const rebalanceOnlyEarly = Math.abs(inv) > config.rebalanceThreshold;
+    if (rebalanceOnlyEarly) {
+      for (const [, q] of quotes) {
+        if (q.status !== "active" || q.marketId !== marketId) continue;
+        if (inv > 0 && q.side === "BID_UP") q.status = "cancelled";
+        if (inv < 0 && q.side === "BID_DOWN") q.status = "cancelled";
+      }
+    }
 
     // ── Market state ──
     const upBestBid = market.realUpBestBid > 0 ? market.realUpBestBid : 0;
@@ -747,23 +786,52 @@ function generateQuotes(btc: BtcPriceData): void {
     const upRealMid = market.realUpMid > 0 ? market.realUpMid : (upBestBid + upBestAsk) / 2;
     const downRealMid = market.realDownMid > 0 ? market.realDownMid : (downBestBid + downBestAsk) / 2;
 
+    // ── Adverse selection detection ──
+    // For each side we hold, measure how far the current mid has moved from
+    // the entry mid. If the price moved against us, we apply an extra skew
+    // to attract counter-trades (sell the long side faster).
+    const upPos = positions.get(`${marketId}_UP`);
+    const downPos = positions.get(`${marketId}_DOWN`);
+    let adverseUpSkew = 0;
+    let adverseDownSkew = 0;
+    if (upPos && upPos.entryMid > 0) {
+      // long UP — if realMid dropped below entry, we're underwater
+      const movedAgainst = upPos.entryMid - upRealMid; // positive = price fell
+      if (movedAgainst > 0) {
+        // Push UP prices DOWN harder so we sell UP faster and stop buying
+        adverseUpSkew = -movedAgainst * config.adverseSelectionFactor;
+      }
+    }
+    if (downPos && downPos.entryMid > 0) {
+      const movedAgainst = downPos.entryMid - downRealMid;
+      if (movedAgainst > 0) {
+        adverseDownSkew = -movedAgainst * config.adverseSelectionFactor;
+      }
+    }
+
     // ── Model signal (for sizing / skew only, NOT for crossing price) ──
-    // We don't shift our price away from the market mid based on the model,
-    // because that's what caused 99% taker fills. The model is still useful:
-    // it informs our inventory skew (which side we prefer to accumulate).
     const modelPUp = calcUpProbability(market, btc);
-    // modelSignalSkew: positive = bullish UP → tilt inventory toward UP
-    //   (lower UP bid a touch so we don't accumulate too fast,
-    //    lower UP ask so we sell faster if we hold UP)
-    // We keep this tiny (max ±1 tick) so it never crosses the book.
     const modelSignalSkew = clamp((modelPUp - upRealMid) * 0.1, -TICK_SIZE, TICK_SIZE);
 
     // ── Inventory skew (in ticks) ──
-    // Positive inventory (long UP) → lower both UP prices to attract sellers,
-    // raise DOWN prices to avoid accumulating DOWN.
+    // Positive inventory (long UP) → lower UP prices (sell faster), raise DOWN prices (don't accumulate)
     const skewTicks = Math.round(inv * config.inventorySkewFactor / TICK_SIZE) * TICK_SIZE;
-    const upSkew = skewTicks + modelSignalSkew;
-    const downSkew = -skewTicks - modelSignalSkew;
+    const upSkew = skewTicks + modelSignalSkew + adverseUpSkew;
+    const downSkew = -skewTicks - modelSignalSkew + adverseDownSkew;
+
+    // ── Rebalance-only mode ──
+    // When |inv| exceeds the rebalance threshold, we only place quotes that
+    // REDUCE the position:
+    //   - If long UP (inv > 0): only ASK_UP (sell UP) + BID_DOWN (buy DOWN = sell UP synthetically)
+    //   - If long DOWN (inv < 0): only ASK_DOWN + BID_UP
+    // Bids on the long side are suppressed to stop digging a deeper hole.
+    const rebalanceOnly = Math.abs(inv) > config.rebalanceThreshold;
+    const longUp = inv > 0;
+    const longDown = inv < 0;
+    // In rebalance mode we skip the BID on the side we're long.
+    const allowBidUp = !(rebalanceOnly && longUp);
+    const allowBidDown = !(rebalanceOnly && longDown);
+    // We always allow ASK on sides we own (that's how we reduce).
 
     // ── Target spread (what we want to capture) ──
     const targetSpread = calcSpread(market, inv, btc);
@@ -773,28 +841,19 @@ function generateQuotes(btc: BtcPriceData): void {
     let bidUp: number;
     let askUp: number;
     {
-      // Ideal bid = upBestBid + 1 tick (we sit on top of the queue)
-      // Ideal ask = upBestAsk - 1 tick
-      // But also respect our target spread: bid/ask should be ~targetSpread apart.
       let b = tickFloor(upBestBid + TICK_SIZE + upSkew);
       let a = tickCeil(upBestAsk - TICK_SIZE + upSkew);
 
-      // If market spread is wide enough that our target fits inside, use mid ± target/2
       const marketSpread = upBestAsk - upBestBid;
       if (marketSpread >= targetSpread + 2 * TICK_SIZE) {
-        // Wide market: quote tighter inside the spread
         const mid = (upBestBid + upBestAsk) / 2;
         b = tickFloor(mid - targetSpread / 2 + upSkew);
         a = tickCeil(mid + targetSpread / 2 + upSkew);
       }
 
-      // Hard safety clamps: NEVER cross the book
-      // bid < bestAsk - TICK  (so we never take the ask)
-      // ask > bestBid + TICK  (so we never sell into the bid)
       b = Math.min(b, tickFloor(upBestAsk - TICK_SIZE));
       a = Math.max(a, tickCeil(upBestBid + TICK_SIZE));
 
-      // If after clamps bid >= ask, market is locked → skip
       b = clamp(b, TICK_SIZE, 1 - TICK_SIZE);
       a = clamp(a, TICK_SIZE, 1 - TICK_SIZE);
       bidUp = b;
@@ -824,25 +883,47 @@ function generateQuotes(btc: BtcPriceData): void {
       askDown = a;
     }
 
-    // ── Sizes ──
-    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
+    // ── Sizes (inventory-aware) ──
+    // Base quote size scaled to the side's mid price.
+    const baseQtyUp = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
+    const baseQtyDown = Math.max(1, Math.round(config.quoteSize / Math.max(downRealMid, TICK_SIZE)));
+
+    // In rebalance mode, bid smaller (don't dig deeper) and ask bigger (reduce faster).
+    const invRatio = config.maxInventory > 0 ? Math.min(Math.abs(inv) / config.maxInventory, 1) : 0;
+    const bidSizeMult = rebalanceOnly ? Math.max(0.3, 1 - invRatio * 0.7) : 1;     // 1.0 → 0.3 as inv grows
+    const askSizeMult = rebalanceOnly ? Math.min(2.0, 1 + invRatio * 1.0) : 1;      // 1.0 → 2.0 as inv grows
+
+    // ── Inventory-aware bid sizing: never place a BID that would push |inv| over maxInventory ──
+    // remainingCapacity = maxInventory - |current long side| (how much room we have on that side)
+    // If we're long UP (inv > 0), a BID_UP adds +qty to inv → cap qty to remainingCapacity.
+    // If we're short (inv < 0), a BID_UP reduces |inv| (rebalancing) → no cap.
+    const remainingCapUp = Math.max(0, config.maxInventory - Math.max(0, inv));
+    const remainingCapDn = Math.max(0, config.maxInventory - Math.max(0, -inv));
+    const qtyBidUp = Math.min(
+      Math.max(1, Math.round(baseQtyUp * bidSizeMult)),
+      Math.max(1, remainingCapUp)
+    );
+    const qtyBidDown = Math.min(
+      Math.max(1, Math.round(baseQtyDown * bidSizeMult)),
+      Math.max(1, remainingCapDn)
+    );
+    const qtyAskUp = Math.max(1, Math.round(baseQtyUp * askSizeMult));
+    const qtyAskDown = Math.max(1, Math.round(baseQtyDown * askSizeMult));
+
     const question = market.question.substring(0, 60);
 
     // ── Live mode safety: limit position size to % of balance ──
-    const maxQty = config.liveMode
-      ? Math.min(qty, Math.floor((cashBalance * LIVE_MAX_POSITION_PCT) / Math.max(upRealMid, TICK_SIZE)))
-      : qty;
-    const finalQty = Math.max(1, maxQty);
+    const capByBalance = (q: number, price: number) => config.liveMode
+      ? Math.min(q, Math.floor((cashBalance * LIVE_MAX_POSITION_PCT) / Math.max(price, TICK_SIZE)))
+      : q;
 
     // ── ASK requires owning tokens (paper mode honesty) ──
-    const upPosition = positions.get(`${marketId}_UP`);
-    const downPosition = positions.get(`${marketId}_DOWN`);
-    const upQtyOwned = upPosition?.quantity ?? 0;
-    const downQtyOwned = downPosition?.quantity ?? 0;
+    const upQtyOwned = upPos?.quantity ?? 0;
+    const downQtyOwned = downPos?.quantity ?? 0;
 
     // ── Place quotes only if there's room (bid < ask) ──
     // Skip creating a new quote if an active one already exists for this
-    // market+side at a similar price (within 1 tick). This prevents quote
+    // market+side at a similar price (within 2 ticks). This prevents quote
     // spam when the market is calm and lets existing quotes age toward
     // maker-fill eligibility.
     const findActive = (side: Quote["side"]) =>
@@ -851,38 +932,59 @@ function generateQuotes(btc: BtcPriceData): void {
       );
     const REFRESH_TICK_THRESHOLD = 2; // refresh if price drifted >= 2 ticks
 
+    // UP side
     if (askUp > bidUp && askUp - bidUp >= TICK_SIZE) {
-      const existingBid = findActive("BID_UP");
-      if (!existingBid || Math.abs(existingBid.price - bidUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+      // BID_UP — skip in rebalance mode if we're long UP
+      if (allowBidUp) {
+        const bidQty = capByBalance(qtyBidUp, upRealMid);
+        const existingBid = findActive("BID_UP");
+        if (!existingBid || Math.abs(existingBid.price - bidUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+          if (existingBid) existingBid.status = "cancelled";
+          const id1 = uid();
+          quotes.set(id1, { id: id1, marketId, side: "BID_UP", price: bidUp, quantity: bidQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        }
+      } else {
+        // Cancel any stale BID_UP from before we entered rebalance mode
+        const existingBid = findActive("BID_UP");
         if (existingBid) existingBid.status = "cancelled";
-        const id1 = uid();
-        quotes.set(id1, { id: id1, marketId, side: "BID_UP", price: bidUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
       }
 
-      if (upQtyOwned >= finalQty) {
+      // ASK_UP — only if we own UP tokens (paper honesty + rebalance lever)
+      if (upQtyOwned >= qtyAskUp) {
+        const askQty = Math.min(qtyAskUp, upQtyOwned);
         const existingAsk = findActive("ASK_UP");
         if (!existingAsk || Math.abs(existingAsk.price - askUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
           if (existingAsk) existingAsk.status = "cancelled";
           const id2 = uid();
-          quotes.set(id2, { id: id2, marketId, side: "ASK_UP", price: askUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+          quotes.set(id2, { id: id2, marketId, side: "ASK_UP", price: askUp, quantity: askQty, status: "active", createdAt: Date.now(), marketQuestion: question });
         }
       }
     }
 
+    // DOWN side
     if (askDown > bidDown && askDown - bidDown >= TICK_SIZE) {
-      const existingBid = findActive("BID_DOWN");
-      if (!existingBid || Math.abs(existingBid.price - bidDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+      // BID_DOWN — skip in rebalance mode if we're long DOWN
+      if (allowBidDown) {
+        const bidQty = capByBalance(qtyBidDown, downRealMid);
+        const existingBid = findActive("BID_DOWN");
+        if (!existingBid || Math.abs(existingBid.price - bidDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+          if (existingBid) existingBid.status = "cancelled";
+          const id3 = uid();
+          quotes.set(id3, { id: id3, marketId, side: "BID_DOWN", price: bidDown, quantity: bidQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        }
+      } else {
+        const existingBid = findActive("BID_DOWN");
         if (existingBid) existingBid.status = "cancelled";
-        const id3 = uid();
-        quotes.set(id3, { id: id3, marketId, side: "BID_DOWN", price: bidDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
       }
 
-      if (downQtyOwned >= finalQty) {
+      // ASK_DOWN — only if we own DOWN tokens
+      if (downQtyOwned >= qtyAskDown) {
+        const askQty = Math.min(qtyAskDown, downQtyOwned);
         const existingAsk = findActive("ASK_DOWN");
         if (!existingAsk || Math.abs(existingAsk.price - askDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
           if (existingAsk) existingAsk.status = "cancelled";
           const id4 = uid();
-          quotes.set(id4, { id: id4, marketId, side: "ASK_DOWN", price: askDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+          quotes.set(id4, { id: id4, marketId, side: "ASK_DOWN", price: askDown, quantity: askQty, status: "active", createdAt: Date.now(), marketQuestion: question });
         }
       }
     }
@@ -1122,11 +1224,14 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
   if (side.startsWith("BID")) {
     const posSide = side.includes("UP") ? "UP" : "DOWN";
     const posId = `${quote.marketId}_${posSide}`;
+    const entryMid = posSide === "UP" ? market.realUpMid : market.realDownMid;
     const existing = positions.get(posId);
     if (existing) {
       existing.quantity += fillQty;
       existing.costBasis += totalCost + fee;
       existing.entryPrice = existing.costBasis / existing.quantity;
+      // Keep the earlier entryMid (so adverse selection is measured from first entry)
+      if (existing.entryMid <= 0) existing.entryMid = entryMid;
     } else {
       positions.set(posId, {
         id: posId, marketId: quote.marketId,
@@ -1137,6 +1242,8 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
         openedAt: Date.now(),
         marketQuestion: market.question.substring(0, 60),
         isRealPosition: false,
+        entryMid,
+        peakValue: totalCost,
       });
     }
   }
@@ -1156,7 +1263,9 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 // ─── Mark to Market ───────────────────────────────────────
 function markToMarket(_btc: BtcPriceData): void {
   let totalUnrealized = 0;
-  for (const [, pos] of positions) {
+  const stopLossTriggers: Array<{ posId: string; marketId: string; reason: string }> = [];
+
+  for (const [posId, pos] of positions) {
     const market = markets.get(pos.marketId);
     if (!market) continue;
 
@@ -1165,7 +1274,31 @@ function markToMarket(_btc: BtcPriceData): void {
 
     pos.currentValue = pos.quantity * pToken;
     pos.unrealizedPnl = pos.currentValue - pos.costBasis;
+    if (pos.currentValue > pos.peakValue) pos.peakValue = pos.currentValue;
     totalUnrealized += pos.unrealizedPnl;
+
+    // ── Stop-loss: close position if unrealized loss exceeds threshold ──
+    // We measure loss as a fraction of cost basis (not current value), so a
+    // position bought for $10 that's now worth $8.50 has a 15% loss.
+    if (pos.costBasis > 0 && pos.unrealizedPnl < 0) {
+      const lossPct = -pos.unrealizedPnl / pos.costBasis;
+      if (lossPct >= config.stopLossPct) {
+        stopLossTriggers.push({
+          posId,
+          marketId: pos.marketId,
+          reason: `stop_loss_${(lossPct * 100).toFixed(0)}pct`,
+        });
+      }
+    }
+  }
+
+  // Execute stop-loss closures (after MtM loop, so we don't mutate positions mid-iteration)
+  for (const t of stopLossTriggers) {
+    console.warn(
+      `[MM] STOP-LOSS triggered on ${t.posId}: ${t.reason}. ` +
+      `Closing at market bid.`
+    );
+    closePositionById(t.posId, t.reason);
   }
 
   const totalPnl = (cashBalance - config.startingBalance) + totalUnrealized;
@@ -1181,6 +1314,53 @@ function markToMarket(_btc: BtcPriceData): void {
     if (dailyStartBalance > 0 && -dailyPnl / dailyStartBalance > LIVE_MAX_DAILY_LOSS_PCT) {
       circuitBreaker = true;
       console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: dailyPnl=${dailyPnl.toFixed(2)}, maxLoss=${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}%`);
+    }
+  }
+}
+
+// ─── Close a single position by ID (used by stop-loss) ────
+function closePositionById(posId: string, reason: string): void {
+  const pos = positions.get(posId);
+  if (!pos) return;
+  const market = markets.get(pos.marketId);
+  if (!market) return;
+
+  const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
+  const closePrice = clamp(
+    realBid > 0 ? tickFloor(realBid) : 0,
+    TICK_SIZE, 1 - TICK_SIZE
+  );
+  if (closePrice <= 0) return;
+
+  const closeValue = pos.quantity * closePrice;
+  const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+  const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
+
+  cashBalance += closeValue - fee;
+  realizedPnl += (closeValue - fee) - pos.costBasis;
+
+  trades.push({
+    id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+    price: closePrice, quantity: pos.quantity, totalCost: closeValue,
+    fee, slippage: 0, reason, executedAt: Date.now(),
+    isPaperTrade: !config.liveMode,
+  });
+
+  // Update inventory (selling reduces net position)
+  const inv = inventory.get(pos.marketId) || 0;
+  if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
+  else inventory.set(pos.marketId, inv + pos.quantity);
+
+  positions.delete(posId);
+
+  // Cancel any quotes for this market side
+  for (const [, q] of quotes) {
+    if (q.marketId === pos.marketId && q.status === "active") {
+      // Only cancel quotes on the same side as the closed position
+      const qSide = q.side.includes("UP") ? "UP" : "DOWN";
+      if (qSide === pos.side && (q.side.startsWith("ASK") || q.side.startsWith("BID"))) {
+        q.status = "cancelled";
+      }
     }
   }
 }
@@ -1357,12 +1537,14 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
         // Update position
         const posSide = filled.side.includes("UP") ? "UP" : "DOWN";
         const posId = `${filled.marketId}_${posSide}`;
+        const entryMid = posSide === "UP" ? market.realUpMid : market.realDownMid;
         const existing = positions.get(posId);
         if (existing) {
           existing.quantity += filled.filledSize;
           existing.costBasis += totalCost + fee;
           existing.entryPrice = existing.costBasis / existing.quantity;
           existing.isRealPosition = true;
+          if (existing.entryMid <= 0) existing.entryMid = entryMid;
         } else {
           positions.set(posId, {
             id: posId, marketId: filled.marketId,
@@ -1373,6 +1555,8 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
             openedAt: Date.now(),
             marketQuestion: market.question.substring(0, 60),
             isRealPosition: true,
+            entryMid,
+            peakValue: totalCost,
           });
         }
       } else {
