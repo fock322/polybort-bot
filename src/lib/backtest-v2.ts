@@ -396,9 +396,17 @@ export function runBacktest(
   for (const market of sortedMarkets) {
     if (circuitBreaker) break;
 
-    const marketStartTs = new Date(market.startDate).getTime() / 1000;
+    // ── Use slotTs for the actual trading window ──
+    // Gamma API's startDate is when the market was CREATED (often 24h before
+    // the actual 15-min slot). endDate is when it expires. The real trading
+    // window is the 15 minutes before endDate (= slotTs to slotTs + 15min).
+    // We use slotTs if available, otherwise derive from endDate - 15 min.
     const marketEndTs = new Date(market.endDate).getTime() / 1000;
     const marketEndMs = marketEndTs * 1000;
+    const slotTs = market.slotTs && market.slotTs > 0
+      ? market.slotTs
+      : marketEndTs - 15 * 60; // fallback: 15 min before end
+    const marketStartTs = slotTs;
     const durationMinutes = (marketEndTs - marketStartTs) / 60;
 
     if (durationMinutes < 10 || durationMinutes > 20) continue; // Skip weird markets
@@ -411,7 +419,8 @@ export function runBacktest(
     const strike = parseStrikePrice(market.question);
 
     // Get market trades and reconstruct price series
-    const marketTrades = tradesByMarket.get(market.conditionId) || [];
+    const marketTrades = (tradesByMarket.get(market.conditionId) || [])
+      .filter(t => t.timestamp >= marketStartTs && t.timestamp <= marketEndTs);
     if (marketTrades.length === 0) continue;
 
     const pricePoints = reconstructPricesFromTrades(marketTrades);
