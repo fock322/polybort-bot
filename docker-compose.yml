@@ -1,0 +1,39 @@
+# ─── Polymarket MM Bot - Docker Compose ───────────────
+# Usage:
+#   docker compose up -d        # Start
+#   docker compose logs -f      # View logs
+#   docker compose restart      # Restart
+#   docker compose down         # Stop
+
+services:
+  polybort:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polybort-mm
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+    # Resource limits for 2GB VPS
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1500M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/data?type=status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,9 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -13,25 +7,128 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// 15-minute BTC market on Polymarket
+model Market {
+  id              String   @id @default(cuid())
+  conditionId     String   @unique          // Polymarket condition ID
+  question        String                    // "Will BTC be above $105,000 at 15:30 UTC?"
+  strikePrice     Float                     // The strike price (e.g., 105000)
+  expiresAt       DateTime                  // When the 15-min window ends
+  yesTokenId      String                    // Token ID for YES
+  noTokenId       String                    // Token ID for NO
+  slug            String?                   // Polymarket market slug
+  active          Boolean  @default(true)   // Is this market still tradeable
+  volume          Float    @default(0)      // 24h volume
+  liquidity       Float    @default(0)      // Current liquidity
+  lastYesPrice    Float    @default(0.5)    // Last known YES price
+  lastNoPrice     Float    @default(0.5)    // Last known NO price
+  spread          Float    @default(0)      // Current spread in cents
+  discoveredAt    DateTime @default(now())  // When we first found this market
+  updatedAt       DateTime @updatedAt
+  positions       Position[]
+  trades          Trade[]
+  quotes          Quote[]
+
+  @@index([active, expiresAt])
+  @@index([strikePrice])
 }
 
-model Post {
-  id        String   @id @default(cuid())
-  title     String
-  content   String?
-  published Boolean  @default(false)
-  authorId  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+// Current open position in a market
+model Position {
+  id              String   @id @default(cuid())
+  marketId        String
+  market          Market   @relation(fields: [marketId], references: [id])
+  side            String                    // "YES" or "NO"
+  entryPrice      Float                     // Average entry price (0-1)
+  quantity         Float                     // Number of tokens
+  costBasis       Float                     // Total USDC spent
+  currentValue    Float    @default(0)      // Current mark-to-market value
+  unrealizedPnl   Float    @default(0)      // Unrealized P&L
+  openedAt        DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  trades          Trade[]
+
+  @@index([marketId])
 }
 
-/// A Polymarket prediction market we are tracking for backtesting.
+// Completed trade (buy/sell)
+model Trade {
+  id              String   @id @default(cuid())
+  marketId        String
+  market          Market   @relation(fields: [marketId], references: [id])
+  positionId      String?
+  position        Position? @relation(fields: [positionId], references: [id])
+  side            String                    // "BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"
+  price           Float                     // Execution price (0-1)
+  quantity         Float                     // Number of tokens
+  totalCost       Float                     // Total USDC
+  fee             Float    @default(0)      // Simulated fee
+  slippage        Float    @default(0)      // Simulated slippage
+  isPaperTrade    Boolean  @default(true)   // Paper vs real
+  reason          String?                   // "entry", "exit_edge_reversal", "exit_time", "exit_circuit_breaker"
+  executedAt      DateTime @default(now())
+
+  @@index([marketId])
+  @@index([executedAt])
+}
+
+// Active quote placed by the bot
+model Quote {
+  id              String   @id @default(cuid())
+  marketId        String
+  market          Market   @relation(fields: [marketId], references: [id])
+  side            String                    // "BID_YES", "ASK_YES", "BID_NO", "ASK_NO"
+  price           Float                     // Quote price (0-1)
+  quantity         Float                     // Number of tokens
+  originalPrice   Float                     // Price when quote was placed (for drift tracking)
+  status          String   @default("active") // "active", "filled", "cancelled", "expired"
+  filledAt        DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([marketId, status])
+  @@index([status])
+}
+
+// Bot configuration
+model BotConfig {
+  id                  String   @id @default(cuid())
+  key                 String   @unique
+  value               String
+  description         String?
+  updatedAt           DateTime @updatedAt
+}
+
+// PnL snapshot for charting
+model PnLSnapshot {
+  id              String   @id @default(cuid())
+  timestamp       DateTime @default(now())
+  totalPnl        Float                     // Cumulative P&L
+  realizedPnl     Float                     // Realized P&L
+  unrealizedPnl   Float                     // Unrealized P&L
+  portfolioValue  Float                     // Total portfolio value
+  cashBalance     Float                     // Cash on hand
+  positionCount   Int      @default(0)     // Number of open positions
+  activeMarkets   Int      @default(0)     // Number of active markets
+
+  @@index([timestamp])
+}
+
+// BTC price data cache
+model BtcPriceData {
+  id              String   @id @default(cuid())
+  price           Float                     // Current BTC price
+  atr1m           Float    @default(0)      // 1-minute ATR
+  atr5m           Float    @default(0)      // 5-minute ATR
+  atr15m          Float    @default(0)      // 15-minute ATR
+  volatilityPct   Float    @default(0)      // Annualized volatility %
+  change1m        Float    @default(0)      // 1-minute price change %
+  change5m        Float    @default(0)      // 5-minute price change %
+  trend           String   @default("neutral") // "up", "down", "neutral"
+  updatedAt       DateTime @updatedAt
+}
+
+/// A Polymarket prediction market we collected historical price data for (for backtesting).
 model HistoricalMarket {
   id            String   @id
   question      String

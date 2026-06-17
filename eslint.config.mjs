@@ -44,7 +44,14 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "no-useless-escape": "off",
   },
 }, {
-  ignores: ["node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts", "examples/**", "skills"]
+  ignores: [
+    "node_modules/**", ".next/**", "out/**", "build/**", "next-env.d.ts",
+    "examples/**", "skills",
+    // Standalone CommonJS backtest scripts (run via `node scripts/run_backtest.js`, not part of Next.js build)
+    "scripts/run_backtest.js", "scripts/run_backtest_v3.js", "scripts/run_backtest_v4.js",
+    // Legacy Python MM bot (Sprint 1, kept for reference)
+    "legacy-python-mm/**",
+  ]
 }];
 
 export default eslintConfig;

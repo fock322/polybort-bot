@@ -1,5 +1,3 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
 # dependencies
 node_modules
 /.pnp
@@ -9,9 +7,6 @@ node_modules
 !.yarn/plugins
 !.yarn/releases
 !.yarn/versions
-
-# testing
-/coverage
 
 # next.js
 /.next/
@@ -24,18 +19,21 @@ node_modules
 .DS_Store
 *.pem
 
+# database (too large for GitHub, stored on Google Drive)
+*.db
+*.db-journal
+
 # debug
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (can opt-in for committing if needed)
+# env files
 .env*
 
 # vercel
 .vercel
-
 
 # typescript
 *.tsbuildinfo
@@ -43,12 +41,23 @@ next-env.d.ts
 local-*
 .claude
 .z-ai-config
+
+# logs
 *.log
 dev.log
 dev.out.log
+server.log
+
+# ─── Bot-unrelated: dev environment junk ──────────────
+skills/
+mini-services/
+examples/
+download/
+agent-ctx/
+tool-results/
+.zscripts/
+Caddyfile
+start-services.sh
+worklog.md
 test
 prompt
-
-server.log
-# Skills directory
-/skills/

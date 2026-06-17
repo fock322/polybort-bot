@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+*.md
+dev.log
+server.log
+scripts/
+mini-services/
+skills/
+examples/
+tool-results/
+worklog.md
+*.tsbuildinfo
+.env*.local
