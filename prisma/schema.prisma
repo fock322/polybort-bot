@@ -30,3 +30,43 @@ model Post {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/// A Polymarket prediction market we are tracking for backtesting.
+model HistoricalMarket {
+  id            String   @id
+  question      String
+  slug          String   @unique
+  conditionId   String
+  yesTokenId    String
+  noTokenId     String
+  endDate       DateTime
+  intervalMin   Int      @default(15)
+  rangeStart    DateTime
+  rangeEnd      DateTime
+  points        Int
+  yesMin        Float
+  yesMax        Float
+  yesLast       Float
+  avgSpread     Float
+  collectedAt   DateTime @default(now())
+
+  candles       HistoricalCandle[]
+
+  @@index([slug])
+}
+
+/// A single 15-min price candle for a market (YES/NO prices).
+model HistoricalCandle {
+  id        String   @id @default(cuid())
+  marketId  String
+  ts        DateTime
+  unix      Int
+  yesPrice  Float
+  noPrice   Float
+  spread    Float
+
+  market    HistoricalMarket @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@unique([marketId, ts])
+  @@index([marketId, ts])
+}

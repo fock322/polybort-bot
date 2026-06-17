@@ -1,0 +1,67 @@
+{
+  "generatedAt": "2026-06-17T06:19:11.504Z",
+  "source": "Polymarket CLOB API (prices-history)",
+  "interval": "15 minutes",
+  "markets": [
+    {
+      "marketId": "btc-150k-2026",
+      "question": "Will Bitcoin reach $150,000 by December 31, 2026?",
+      "slug": "will-bitcoin-reach-150000-by-december-31-2026-557-246-971",
+      "yesTokenId": "9408196828451163378822245032645030045707991112669125056198742225498158094445",
+      "noTokenId": "51483905306465811734319720696244063650497726569976526242005911027664652328096",
+      "rangeStart": "2026-05-18T06:19:01.000Z",
+      "rangeEnd": "2026-06-17T06:19:01.000Z",
+      "points": 2868,
+      "files": {
+        "csv": "btc-150k-2026-15m.csv",
+        "json": "btc-150k-2026-15m.json"
+      },
+      "stats": {
+        "yesMin": 0.0315,
+        "yesMax": 0.09,
+        "yesLast": 0.044,
+        "avgSpread": 0
+      }
+    },
+    {
+      "marketId": "btc-dip-47500-june",
+      "question": "Will Bitcoin dip to $47,500 in June?",
+      "slug": "will-bitcoin-dip-to-47pt5k-in-june-2026-352-889",
+      "yesTokenId": "66688570202680980348054371425878724386180439159820402142886790910165609540845",
+      "noTokenId": "38888545447178587736651600562005787233364986863136821825137462499182092188458",
+      "rangeStart": "2026-05-18T06:19:04.000Z",
+      "rangeEnd": "2026-06-17T06:19:04.000Z",
+      "points": 1498,
+      "files": {
+        "csv": "btc-dip-47500-june-15m.csv",
+        "json": "btc-dip-47500-june-15m.json"
+      },
+      "stats": {
+        "yesMin": 0.007,
+        "yesMax": 0.16,
+        "yesLast": 0.0115,
+        "avgSpread": 0.0000013351134846462702
+      }
+    },
+    {
+      "marketId": "china-unban-btc-2027",
+      "question": "Will China unban Bitcoin by 2027?",
+      "slug": "will-china-unban-bitcoin-by-2027",
+      "yesTokenId": "91810646921497227084241579668235102205462718984593674693010693975258849328842",
+      "noTokenId": "51080463689161030375818291005097816690283354390568417705958874093502264623871",
+      "rangeStart": "2026-05-18T06:19:08.000Z",
+      "rangeEnd": "2026-06-17T06:19:08.000Z",
+      "points": 2869,
+      "files": {
+        "csv": "china-unban-btc-2027-15m.csv",
+        "json": "china-unban-btc-2027-15m.json"
+      },
+      "stats": {
+        "yesMin": 0.026,
+        "yesMax": 0.035,
+        "yesLast": 0.033,
+        "avgSpread": 0
+      }
+    }
+  ]
+}
