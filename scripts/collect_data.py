@@ -279,15 +279,19 @@ def insert_markets(conn: sqlite3.Connection, markets: list[dict]) -> int:
 
 
 # ─── Enumerate Slots and Fetch Markets ─────────────────────────
-def fetch_markets_by_slots(start_ts: int, end_ts: int) -> list[dict]:
+def fetch_markets_by_slots(start_ts: int, end_ts: int, conn: sqlite3.Connection = None) -> list[dict]:
     """
     Enumerate all 15-min slots between start_ts and end_ts,
     try both slug patterns, and collect all found markets.
+
+    If conn is provided, saves markets to DB incrementally (every 100 slots)
+    so progress isn't lost if the process is interrupted.
     """
     all_markets: list[dict] = []
     total_slots = (end_ts - start_ts) // 900 + 1
     checked = 0
     found = 0
+    saved = 0
 
     current_ts = start_ts
     while current_ts <= end_ts:
@@ -301,14 +305,28 @@ def fetch_markets_by_slots(start_ts: int, end_ts: int) -> list[dict]:
                 break  # Found with this pattern, no need to try the other
             time.sleep(GAMMA_DELAY)
 
-        # Progress reporting every 100 slots
+        # Progress reporting + incremental save every 100 slots
         if checked % 100 == 0:
             dt = datetime.fromtimestamp(current_ts, tz=timezone.utc)
             pct = checked / total_slots * 100
             print(f"  [{checked}/{total_slots}] {dt.strftime('%Y-%m-%d %H:%M')} UTC — "
-                  f"found {found} markets ({pct:.1f}%)")
+                  f"found {found} markets ({pct:.1f}%)", flush=True)
+
+            # Incremental save: write accumulated markets to DB so progress
+            # isn't lost if the process is killed mid-run.
+            if conn is not None and all_markets[saved:]:
+                new = insert_markets(conn, all_markets[saved:])
+                saved = len(all_markets)
+                conn.commit()
+                if new > 0:
+                    print(f"  [DB] Incremental save: +{new} markets (total saved: {saved})", flush=True)
 
         current_ts += 900  # 15 minutes
+
+    # Final save of any remaining markets
+    if conn is not None and all_markets[saved:]:
+        insert_markets(conn, all_markets[saved:])
+        conn.commit()
 
     print(f"[Gamma] Checked {checked} slots, found {found} BTC 15M markets")
     return all_markets
@@ -583,7 +601,7 @@ def run_collection(days_back: int = 7, from_date: Optional[str] = None,
         print("\n" + "-" * 60)
         print("  STEP 1: Enumerating 15-min slots for BTC markets")
         print("-" * 60)
-        markets = fetch_markets_by_slots(start_ts, end_ts)
+        markets = fetch_markets_by_slots(start_ts, end_ts, conn)
         markets_found = len(markets)
 
         if markets:
