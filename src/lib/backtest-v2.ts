@@ -115,7 +115,7 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   maxInventory: 50,
   inventorySkewFactor: 0.005,
   circuitBreakerPct: 0.25,
-  makerFillRate: 0.02,
+  makerFillRate: 0.10,
   latencySeconds: 2,
   tickIntervalSeconds: 10,
 };
@@ -428,28 +428,71 @@ export function runBacktest(
     const firstPrice = pricePoints[0];
     const realUpMid = firstPrice.upPrice;
     const realDownMid = firstPrice.downPrice;
+    const upBestBid = firstPrice.upBestBid > 0 ? firstPrice.upBestBid : Math.max(TICK_SIZE, realUpMid - 0.02);
+    const upBestAsk = firstPrice.upBestAsk > 0 ? firstPrice.upBestAsk : Math.min(1 - TICK_SIZE, realUpMid + 0.02);
+    const downBestBid = firstPrice.downBestBid > 0 ? firstPrice.downBestBid : Math.max(TICK_SIZE, realDownMid - 0.02);
+    const downBestAsk = firstPrice.downBestAsk > 0 ? firstPrice.downBestAsk : Math.min(1 - TICK_SIZE, realDownMid + 0.02);
 
-    // Our model probability
+    // Our model probability (used for skew only — NOT for crossing the book).
+    // The previous code shifted pUp by (modelPUp - 0.5) * 0.3 (up to ±15¢),
+    // which made bid/ask cross the real book 99% of the time → 99% taker fills.
     const modelPUp = calcUpProbability(strike, marketEndMs, marketStartTs * 1000, btc);
-    const modelSignal = (modelPUp - 0.5) * 0.3;
-    const pUp = tickRound(Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, realUpMid + modelSignal)));
+    // Tiny ±1 tick skew from model (so we still tilt inventory gently).
+    const modelSignalSkew = Math.max(-TICK_SIZE, Math.min(TICK_SIZE, (modelPUp - realUpMid) * 0.1));
 
-    // Calculate spread
+    // Calculate spread (target capture)
     const marketSpread = Math.max(firstPrice.upSpread, firstPrice.downSpread, 0.01);
     const spread = calcSpread(
       config.baseSpread, config.atrMultiplier,
       btc.atr5m, btc.price, durationMinutes, inv, marketSpread,
     );
 
-    const skew = tickRound(inv * config.inventorySkewFactor);
+    const skewTicks = Math.round(inv * config.inventorySkewFactor / TICK_SIZE) * TICK_SIZE;
+    const upSkew = skewTicks + modelSignalSkew;
+    const downSkew = -skewTicks - modelSignalSkew;
 
-    // Generate quotes
-    const bidUp = Math.max(TICK_SIZE, tickRound(pUp - spread / 2 - skew));
-    const askUp = Math.min(1 - TICK_SIZE, tickRound(pUp + spread / 2 - skew));
-    const bidDown = Math.max(TICK_SIZE, tickRound((1 - pUp) - spread / 2 + skew));
-    const askDown = Math.min(1 - TICK_SIZE, tickRound((1 - pUp) + spread / 2 + skew));
+    // ── MM quotes: ALWAYS inside the real spread (never cross the book) ──
+    // UP side
+    let bidUp: number;
+    let askUp: number;
+    {
+      let b = tickRound(upBestBid + TICK_SIZE + upSkew);
+      let a = tickRound(upBestAsk - TICK_SIZE + upSkew);
+      const upMktSpread = upBestAsk - upBestBid;
+      if (upMktSpread >= spread + 2 * TICK_SIZE) {
+        const m = (upBestBid + upBestAsk) / 2;
+        b = tickRound(m - spread / 2 + upSkew);
+        a = tickRound(m + spread / 2 + upSkew);
+      }
+      // Hard clamps: never cross
+      b = Math.min(b, tickRound(upBestAsk - TICK_SIZE));
+      a = Math.max(a, tickRound(upBestBid + TICK_SIZE));
+      b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
+      a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
+      bidUp = b;
+      askUp = a;
+    }
+    // DOWN side
+    let bidDown: number;
+    let askDown: number;
+    {
+      let b = tickRound(downBestBid + TICK_SIZE + downSkew);
+      let a = tickRound(downBestAsk - TICK_SIZE + downSkew);
+      const dnMktSpread = downBestAsk - downBestBid;
+      if (dnMktSpread >= spread + 2 * TICK_SIZE) {
+        const m = (downBestBid + downBestAsk) / 2;
+        b = tickRound(m - spread / 2 + downSkew);
+        a = tickRound(m + spread / 2 + downSkew);
+      }
+      b = Math.min(b, tickRound(downBestAsk - TICK_SIZE));
+      a = Math.max(a, tickRound(downBestBid + TICK_SIZE));
+      b = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, b));
+      a = Math.max(TICK_SIZE, Math.min(1 - TICK_SIZE, a));
+      bidDown = b;
+      askDown = a;
+    }
 
-    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(pUp, TICK_SIZE)));
+    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(realUpMid, TICK_SIZE)));
     const feeRateVal = feeRate;
 
     // ── Try BID_UP (buy UP tokens) ──

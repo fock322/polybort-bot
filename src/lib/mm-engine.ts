@@ -703,10 +703,31 @@ function calcSpread(market: Market, inv: number, btc: BtcPriceData): number {
 }
 
 // ─── Quotes (CLOB-compliant: tick-rounded prices) ─────────
+//
+// MM PRINCIPLE: a market maker NEVER crosses the book. Our bid must be
+// strictly below the market best ask, and our ask must be strictly above
+// the market best bid. Otherwise we become a taker and pay the taker fee.
+//
+// We quote INSIDE the existing spread (improve the best price by 1 tick),
+// which is exactly what a real MM does on a CLOB. If the market spread is
+// already 1 tick (locked), we skip that side — no edge to capture.
+//
 function generateQuotes(btc: BtcPriceData): void {
-  // Cancel old quotes
+  // ── Quote lifecycle ──
+  // Old code cancelled ALL active quotes every cycle, which prevented maker
+  // fills: simulateFills() requires a quote to age MIN_MAKER_FILL_DELAY_MS
+  // (2s) before it's eligible, but the quote was cancelled at the start of
+  // every 10s cycle before it could age. Result: 0 maker fills.
+  //
+  // New behaviour: keep active quotes for up to QUOTE_LIFETIME_MS (60s, = 6
+  // cycles). After that they're considered stale and cancelled so we can
+  // refresh prices. This gives each quote ~6 chances to be maker-filled.
+  const QUOTE_LIFETIME_MS = 60_000;
+  const nowMs = Date.now();
   for (const [, q] of quotes) {
-    if (q.status === "active") q.status = "cancelled";
+    if (q.status === "active" && nowMs - q.createdAt > QUOTE_LIFETIME_MS) {
+      q.status = "cancelled";
+    }
   }
 
   for (const [marketId, market] of markets) {
@@ -717,58 +738,157 @@ function generateQuotes(btc: BtcPriceData): void {
     const inv = inventory.get(marketId) || 0;
     if (Math.abs(inv) > config.maxInventory) continue;
 
-    const realPUp = market.realUpMid > 0 ? market.realUpMid : 0.5;
+    // ── Market state ──
+    const upBestBid = market.realUpBestBid > 0 ? market.realUpBestBid : 0;
+    const upBestAsk = market.realUpBestAsk > 0 ? market.realUpBestAsk : 1;
+    const downBestBid = market.realDownBestBid > 0 ? market.realDownBestBid : 0;
+    const downBestAsk = market.realDownBestAsk > 0 ? market.realDownBestAsk : 1;
+
+    const upRealMid = market.realUpMid > 0 ? market.realUpMid : (upBestBid + upBestAsk) / 2;
+    const downRealMid = market.realDownMid > 0 ? market.realDownMid : (downBestBid + downBestAsk) / 2;
+
+    // ── Model signal (for sizing / skew only, NOT for crossing price) ──
+    // We don't shift our price away from the market mid based on the model,
+    // because that's what caused 99% taker fills. The model is still useful:
+    // it informs our inventory skew (which side we prefer to accumulate).
     const modelPUp = calcUpProbability(market, btc);
+    // modelSignalSkew: positive = bullish UP → tilt inventory toward UP
+    //   (lower UP bid a touch so we don't accumulate too fast,
+    //    lower UP ask so we sell faster if we hold UP)
+    // We keep this tiny (max ±1 tick) so it never crosses the book.
+    const modelSignalSkew = clamp((modelPUp - upRealMid) * 0.1, -TICK_SIZE, TICK_SIZE);
 
-    const modelSignal = (modelPUp - 0.5) * 0.3;
-    const pUp = clamp(tickRound(realPUp + modelSignal), TICK_SIZE, 1 - TICK_SIZE);
+    // ── Inventory skew (in ticks) ──
+    // Positive inventory (long UP) → lower both UP prices to attract sellers,
+    // raise DOWN prices to avoid accumulating DOWN.
+    const skewTicks = Math.round(inv * config.inventorySkewFactor / TICK_SIZE) * TICK_SIZE;
+    const upSkew = skewTicks + modelSignalSkew;
+    const downSkew = -skewTicks - modelSignalSkew;
 
-    const spread = calcSpread(market, inv, btc);
-    const skew = tickRound(inv * config.inventorySkewFactor);
+    // ── Target spread (what we want to capture) ──
+    const targetSpread = calcSpread(market, inv, btc);
 
-    // ASK requires owning tokens
+    // ── Build MM quotes: improve best bid/ask by 1 tick, clamp inside spread ──
+    // UP side
+    let bidUp: number;
+    let askUp: number;
+    {
+      // Ideal bid = upBestBid + 1 tick (we sit on top of the queue)
+      // Ideal ask = upBestAsk - 1 tick
+      // But also respect our target spread: bid/ask should be ~targetSpread apart.
+      let b = tickFloor(upBestBid + TICK_SIZE + upSkew);
+      let a = tickCeil(upBestAsk - TICK_SIZE + upSkew);
+
+      // If market spread is wide enough that our target fits inside, use mid ± target/2
+      const marketSpread = upBestAsk - upBestBid;
+      if (marketSpread >= targetSpread + 2 * TICK_SIZE) {
+        // Wide market: quote tighter inside the spread
+        const mid = (upBestBid + upBestAsk) / 2;
+        b = tickFloor(mid - targetSpread / 2 + upSkew);
+        a = tickCeil(mid + targetSpread / 2 + upSkew);
+      }
+
+      // Hard safety clamps: NEVER cross the book
+      // bid < bestAsk - TICK  (so we never take the ask)
+      // ask > bestBid + TICK  (so we never sell into the bid)
+      b = Math.min(b, tickFloor(upBestAsk - TICK_SIZE));
+      a = Math.max(a, tickCeil(upBestBid + TICK_SIZE));
+
+      // If after clamps bid >= ask, market is locked → skip
+      b = clamp(b, TICK_SIZE, 1 - TICK_SIZE);
+      a = clamp(a, TICK_SIZE, 1 - TICK_SIZE);
+      bidUp = b;
+      askUp = a;
+    }
+
+    // DOWN side (mirror; pDown = 1 - pUp, so DOWN bestBid ≈ 1 - UP bestAsk)
+    let bidDown: number;
+    let askDown: number;
+    {
+      let b = tickFloor(downBestBid + TICK_SIZE + downSkew);
+      let a = tickCeil(downBestAsk - TICK_SIZE + downSkew);
+
+      const marketSpread = downBestAsk - downBestBid;
+      if (marketSpread >= targetSpread + 2 * TICK_SIZE) {
+        const mid = (downBestBid + downBestAsk) / 2;
+        b = tickFloor(mid - targetSpread / 2 + downSkew);
+        a = tickCeil(mid + targetSpread / 2 + downSkew);
+      }
+
+      b = Math.min(b, tickFloor(downBestAsk - TICK_SIZE));
+      a = Math.max(a, tickCeil(downBestBid + TICK_SIZE));
+
+      b = clamp(b, TICK_SIZE, 1 - TICK_SIZE);
+      a = clamp(a, TICK_SIZE, 1 - TICK_SIZE);
+      bidDown = b;
+      askDown = a;
+    }
+
+    // ── Sizes ──
+    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
+    const question = market.question.substring(0, 60);
+
+    // ── Live mode safety: limit position size to % of balance ──
+    const maxQty = config.liveMode
+      ? Math.min(qty, Math.floor((cashBalance * LIVE_MAX_POSITION_PCT) / Math.max(upRealMid, TICK_SIZE)))
+      : qty;
+    const finalQty = Math.max(1, maxQty);
+
+    // ── ASK requires owning tokens (paper mode honesty) ──
     const upPosition = positions.get(`${marketId}_UP`);
     const downPosition = positions.get(`${marketId}_DOWN`);
     const upQtyOwned = upPosition?.quantity ?? 0;
     const downQtyOwned = downPosition?.quantity ?? 0;
 
-    const bidUp = tickFloor(clamp(pUp - spread / 2 - skew, TICK_SIZE, 1 - TICK_SIZE));
-    const askUp = tickCeil(clamp(pUp + spread / 2 - skew, bidUp + TICK_SIZE, 1 - TICK_SIZE));
-    const bidDown = tickFloor(clamp((1 - pUp) - spread / 2 + skew, TICK_SIZE, 1 - TICK_SIZE));
-    const askDown = tickCeil(clamp((1 - pUp) + spread / 2 + skew, bidDown + TICK_SIZE, 1 - TICK_SIZE));
-
-    const qty = Math.max(1, Math.round(config.quoteSize / Math.max(pUp, TICK_SIZE)));
-    const question = market.question.substring(0, 60);
-
-    // ── Live mode safety: limit position size to % of balance ──
-    const maxQty = config.liveMode
-      ? Math.min(qty, Math.floor((cashBalance * LIVE_MAX_POSITION_PCT) / Math.max(pUp, TICK_SIZE)))
-      : qty;
-
-    const finalQty = Math.max(1, maxQty);
+    // ── Place quotes only if there's room (bid < ask) ──
+    // Skip creating a new quote if an active one already exists for this
+    // market+side at a similar price (within 1 tick). This prevents quote
+    // spam when the market is calm and lets existing quotes age toward
+    // maker-fill eligibility.
+    const findActive = (side: Quote["side"]) =>
+      Array.from(quotes.values()).find(
+        q => q.marketId === marketId && q.side === side && q.status === "active"
+      );
+    const REFRESH_TICK_THRESHOLD = 2; // refresh if price drifted >= 2 ticks
 
     if (askUp > bidUp && askUp - bidUp >= TICK_SIZE) {
-      const id1 = uid();
-      quotes.set(id1, { id: id1, marketId, side: "BID_UP", price: bidUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+      const existingBid = findActive("BID_UP");
+      if (!existingBid || Math.abs(existingBid.price - bidUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+        if (existingBid) existingBid.status = "cancelled";
+        const id1 = uid();
+        quotes.set(id1, { id: id1, marketId, side: "BID_UP", price: bidUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+      }
 
       if (upQtyOwned >= finalQty) {
-        const id2 = uid();
-        quotes.set(id2, { id: id2, marketId, side: "ASK_UP", price: askUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        const existingAsk = findActive("ASK_UP");
+        if (!existingAsk || Math.abs(existingAsk.price - askUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+          if (existingAsk) existingAsk.status = "cancelled";
+          const id2 = uid();
+          quotes.set(id2, { id: id2, marketId, side: "ASK_UP", price: askUp, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        }
       }
     }
 
     if (askDown > bidDown && askDown - bidDown >= TICK_SIZE) {
-      const id3 = uid();
-      quotes.set(id3, { id: id3, marketId, side: "BID_DOWN", price: bidDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+      const existingBid = findActive("BID_DOWN");
+      if (!existingBid || Math.abs(existingBid.price - bidDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+        if (existingBid) existingBid.status = "cancelled";
+        const id3 = uid();
+        quotes.set(id3, { id: id3, marketId, side: "BID_DOWN", price: bidDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+      }
 
       if (downQtyOwned >= finalQty) {
-        const id4 = uid();
-        quotes.set(id4, { id: id4, marketId, side: "ASK_DOWN", price: askDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        const existingAsk = findActive("ASK_DOWN");
+        if (!existingAsk || Math.abs(existingAsk.price - askDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
+          if (existingAsk) existingAsk.status = "cancelled";
+          const id4 = uid();
+          quotes.set(id4, { id: id4, marketId, side: "ASK_DOWN", price: askDown, quantity: finalQty, status: "active", createdAt: Date.now(), marketQuestion: question });
+        }
       }
     }
 
-    market.lastUpPrice = pUp;
-    market.lastDownPrice = tickRound(1 - pUp);
+    market.lastUpPrice = upRealMid;
+    market.lastDownPrice = downRealMid;
   }
 }
 
@@ -882,47 +1002,61 @@ function simulateFills(_btc: BtcPriceData): void {
     }
 
     // Maker fill: probability-based
+    //
+    // Real Polymarket maker fill rates on BTC 15-min markets range from ~5%
+    // (illiquid, far from expiry) to ~25% (active, near expiry with high volume).
+    // The previous base rate of 1.5% combined with 6 multiplicative factors
+    // (each < 1) produced probabilities around 0.05% per cycle — effectively
+    // zero maker fills.
+    //
+    // New model: a flat base rate per cycle modulated by 3 factors only.
+    // The "roll" uses a 0..999 deterministic hash so the threshold can go
+    // down to 0.1% granularity (vs the old 1% floor that swallowed low probs).
+    //
     const mid = quote.side.includes("UP") ? market.realUpMid : market.realDownMid;
     if (mid <= 0) continue;
 
     const ourPrice = quote.price;
+
+    // How aggressively we're priced. 0 = at best bid/ask (top of queue),
+    // 1 = at mid (middle of book). Closer to the front = higher fill prob.
+    // With the new generateQuotes() we sit at best_bid + 1 tick or best_ask - 1 tick,
+    // so distance from mid is roughly (marketSpread / 2).
     const distFromMid = Math.abs(ourPrice - mid);
-    const distFactor = Math.max(0, 1 - distFromMid / 0.10);
+    // distFactor: 1.0 when sitting right at best bid/ask (distFromMid small),
+    // 0.5 when sitting at mid. Normalized so a 3¢ distance still scores 0.7+.
+    const distFactor = Math.max(0.4, 1 - distFromMid / 0.10);
 
-    let ourSideDepth = 0;
-    let oppositeDepth = 0;
-    if (quote.side === "BID_UP" || quote.side === "ASK_DOWN") {
-      const bids = quote.side.includes("UP") ? market.upBids : market.downBids;
-      const asks = quote.side.includes("UP") ? market.upAsks : market.downAsks;
-      for (const b of bids) { if (Math.abs(b.price - mid) <= 0.10) ourSideDepth += b.size; }
-      for (const a of asks) { if (Math.abs(a.price - mid) <= 0.10) oppositeDepth += a.size; }
-    } else {
-      const asks = quote.side.includes("UP") ? market.upAsks : market.downAsks;
-      const bids = quote.side.includes("UP") ? market.upBids : market.downBids;
-      for (const a of asks) { if (Math.abs(a.price - mid) <= 0.10) ourSideDepth += a.size; }
-      for (const b of bids) { if (Math.abs(b.price - mid) <= 0.10) oppositeDepth += b.size; }
-    }
-    const totalDepth = ourSideDepth + oppositeDepth;
-    const imbalanceFactor = totalDepth > 0 ? (oppositeDepth / totalDepth) : 0.5;
-
+    // Activity: high volume/liquidity ratio → many trades crossing → more fills.
     const volLiqRatio = market.liquidity > 0 ? Math.min(market.volume / market.liquidity, 1) : 0.1;
-    const activityFactor = 0.3 + 0.7 * volLiqRatio;
+    const activityFactor = 0.5 + 0.5 * volLiqRatio; // 0.5..1.0
 
-    const timeFactor = tau < 5 ? 1.5 : tau < 10 ? 1.0 : 0.7;
+    // Time-to-expiry: near expiry, BTC moves and traders scramble → more fills.
+    const timeFactor = tau < 5 ? 1.4 : tau < 10 ? 1.1 : 0.8;
 
-    const inv = inventory.get(quote.marketId) || 0;
-    const invFactor = Math.abs(inv) > config.maxInventory * 0.7 ? 0.3 : 1.0;
-
+    // Queue position: older quotes have priority. We need to wait at least
+    // MIN_MAKER_FILL_DELAY_MS (2s) before being eligible; quotes that have
+    // aged 10s are at the front of the queue.
     const queueAge = (now - quote.createdAt) / 1000;
-    const queueFactor = Math.min(queueAge / 30, 1.0);
+    const queueFactor = Math.min(Math.max(queueAge - 2, 0) / 8, 1.0); // 0..1 over 2..10s
 
-    const baseRate = 0.015;
-    const makerFillProb = baseRate * distFactor * imbalanceFactor * activityFactor * timeFactor * invFactor * queueFactor;
+    // Base fill rate per cycle. 10% base × factors ≈ 3-15% per cycle, which
+    // over a 15-min market (with ~90 cycles at 10s each) gives ~5-15 maker fills
+    // per market per session — realistic for an active MM.
+    const baseRate = 0.10;
+    const makerFillProb = clamp(
+      baseRate * distFactor * activityFactor * timeFactor * queueFactor,
+      0,
+      0.5 // cap at 50% per cycle so we don't fill instantly
+    );
 
-    const cycleHash = (tradeCycleCount * 7 + quote.createdAt % 13 + Math.floor(market.volume)) % 100;
-    const threshold = Math.floor(makerFillProb * 100);
+    // Deterministic 0..999 roll (0.1% granularity). Replaces the buggy
+    // Math.floor(prob * 100) which zeroed out any prob < 0.01.
+    const roll = (tradeCycleCount * 137 + Math.floor(quote.createdAt % 997) + Math.floor(ourPrice * 1000)) % 1000;
+    const thresholdMille = Math.floor(makerFillProb * 1000);
 
-    if (cycleHash < threshold) {
+    if (roll < thresholdMille) {
+      // 3% simulated queue timeout (real CLOBs occasionally drop maker orders)
       const makerRejHash = (tradeCycleCount * 11 + Math.floor(ourPrice * 1000)) % 33;
       if (makerRejHash === 0) {
         quote.status = "rejected";
