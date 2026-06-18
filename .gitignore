@@ -19,12 +19,12 @@ node_modules
 .DS_Store
 *.pem
 
-# database (too large for GitHub, stored on Google Drive)
+# database (too large for GitHub — 188MB historical.db exceeds 100MB limit)
 *.db
 *.db-journal
-# BUT keep our historical and custom databases — they're needed for backtest
-!prisma/historical.db
+# custom.db is small (1.5MB) — keep it
 !db/custom.db
+
 
 # debug
 npm-debug.log*
