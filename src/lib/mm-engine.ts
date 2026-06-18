@@ -243,7 +243,7 @@ const config: BotConfig = {
   // ── Inventory management v2 ──
   rebalanceThreshold: 12,
   adverseSelectionFactor: 3,
-  stopLossPct: 0.15,
+  stopLossPct: 0.50,          // 50% — effectively disabled (was 15%). Hold to settlement instead.
   liveMode: false,
 };
 
@@ -949,8 +949,11 @@ function generateQuotes(btc: BtcPriceData): void {
         if (existingBid) existingBid.status = "cancelled";
       }
 
-      // ASK_UP — only if we own UP tokens (paper honesty + rebalance lever)
-      if (upQtyOwned >= qtyAskUp) {
+      // ASK_UP — TAKE PROFIT ONLY (ported from backtest-v2)
+      // Only place ASK when askUp > entryPrice × 1.005 (min 0.5% profit).
+      // If position is in loss, DON'T sell — hold to settlement (chance of $1).
+      const minProfitAskUp = upPos ? upPos.entryPrice * 1.005 : 0;
+      if (upQtyOwned >= qtyAskUp && askUp >= minProfitAskUp) {
         const askQty = Math.min(qtyAskUp, upQtyOwned);
         const existingAsk = findActive("ASK_UP");
         if (!existingAsk || Math.abs(existingAsk.price - askUp) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
@@ -977,8 +980,10 @@ function generateQuotes(btc: BtcPriceData): void {
         if (existingBid) existingBid.status = "cancelled";
       }
 
-      // ASK_DOWN — only if we own DOWN tokens
-      if (downQtyOwned >= qtyAskDown) {
+      // ASK_DOWN — TAKE PROFIT ONLY (ported from backtest-v2)
+      // Only place ASK when askDown > entryPrice × 1.005 (min 0.5% profit).
+      const minProfitAskDown = downPos ? downPos.entryPrice * 1.005 : 0;
+      if (downQtyOwned >= qtyAskDown && askDown >= minProfitAskDown) {
         const askQty = Math.min(qtyAskDown, downQtyOwned);
         const existingAsk = findActive("ASK_DOWN");
         if (!existingAsk || Math.abs(existingAsk.price - askDown) >= REFRESH_TICK_THRESHOLD * TICK_SIZE) {
@@ -1379,6 +1384,10 @@ function closePositionsForMarket(marketId: string, reason: string): void {
   const market = markets.get(marketId);
   if (!market) return;
 
+  // SMART SETTLEMENT (ported from backtest-v2):
+  // - If position is in profit (bid > entryPrice) → sell now, lock the gain
+  // - If position is in loss (bid < entryPrice) → HOLD to settlement
+  //   (chance of $1 > guaranteed loss at bid)
   for (const [posId, pos] of positions) {
     if (pos.marketId !== marketId) continue;
 
@@ -1390,6 +1399,13 @@ function closePositionsForMarket(marketId: string, reason: string): void {
 
     if (closePrice <= 0) continue;
 
+    // Smart exit: only sell if in profit
+    if (closePrice < pos.entryPrice) {
+      // In loss — hold to settlement, don't realize the loss
+      continue;
+    }
+
+    // In profit — sell now, lock the gain
     const closeValue = pos.quantity * closePrice;
     const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
     const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
@@ -1400,13 +1416,17 @@ function closePositionsForMarket(marketId: string, reason: string): void {
     trades.push({
       id: uid(), marketId, side: `SELL_${pos.side}`,
       price: closePrice, quantity: pos.quantity, totalCost: closeValue,
-      fee, slippage: 0, reason, executedAt: Date.now(),
+      fee, slippage: 0, reason: `${reason}_profit`, executedAt: Date.now(),
       isPaperTrade: !config.liveMode,
     });
 
     positions.delete(posId);
   }
-  inventory.delete(marketId);
+  // Recompute inventory (don't delete — remaining positions still hold inventory)
+  const remainingInv = Array.from(positions.values())
+    .filter(p => p.marketId === marketId)
+    .reduce((s, p) => s + (p.side === "UP" ? p.quantity : -p.quantity), 0);
+  inventory.set(marketId, remainingInv);
 
   for (const [, q] of quotes) {
     if (q.marketId === marketId && q.status === "active") q.status = "cancelled";
