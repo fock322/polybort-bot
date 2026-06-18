@@ -229,25 +229,25 @@ const g = globalThis as unknown as {
 
 // ─── State ─────────────────────────────────────────────────
 const config: BotConfig = {
-  startingBalance: 1000,
+  startingBalance: 100,       // $100 starting balance (matches backtest)
   maxPositionSize: 30,
   minPositionSize: 5,
   baseSpread: 0.03,
   atrMultiplier: 10,
   autoExitMinutes: 3,
-  circuitBreakerPct: 0.25,
-  maxInventory: 30,           // was 50 — tighter limit, fewer cycles to accumulate
+  circuitBreakerPct: 0.50,    // 50% — less aggressive for paper trading (was 25%)
+  maxInventory: 30,
   quoteSize: 10,
-  inventorySkewFactor: 0.008, // was 0.005 — stronger skew to push rebalancing
+  inventorySkewFactor: 0.008,
   cycleIntervalMs: 10000,
   // ── Inventory management v2 ──
-  rebalanceThreshold: 12,     // |inv| > 12 → rebalance-only mode (sell long side, buy opposite)
-  adverseSelectionFactor: 3,  // skew ×3 when realMid moves against our position
-  stopLossPct: 0.15,          // close position if unrealized loss > 15% of cost basis
+  rebalanceThreshold: 12,
+  adverseSelectionFactor: 3,
+  stopLossPct: 0.15,
   liveMode: false,
 };
 
-let cashBalance = g.__mm_cash ?? 1000;
+let cashBalance = g.__mm_cash ?? 100;
 let realizedPnl = g.__mm_realizedPnl ?? 0;
 let running = g.__mm_running ?? false;
 let startTime = g.__mm_startTime ?? 0;
