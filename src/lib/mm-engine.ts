@@ -760,6 +760,28 @@ function generateQuotes(btc: BtcPriceData): void {
     if (tau < config.autoExitMinutes) continue;
     if (!market.active) continue;
 
+    // ═══ Market quality filters (realistic trading conditions) ═══
+    // Skip markets that can't be traded realistically:
+    //   1. Crossed or empty order book (bestBid=0 or bestAsk=0 or bid >= ask)
+    //   2. Insufficient volume (no other traders to fill our quotes)
+    //   3. Insufficient liquidity (thin book, high slippage risk)
+
+    // Filter 1: Crossed/empty book — can't place valid quotes
+    const upBookValid = market.realUpBestBid > 0 && market.realUpBestAsk > 0
+      && market.realUpBestBid < market.realUpBestAsk;
+    const downBookValid = market.realDownBestBid > 0 && market.realDownBestAsk > 0
+      && market.realDownBestBid < market.realDownBestAsk;
+    if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
+
+    // Filter 2: Minimum volume — need real traders to fill our quotes
+    // BTC 15-min markets with < $1000 volume are too illiquid for MM
+    const MIN_VOLUME_USD = 1000;
+    if (market.volume < MIN_VOLUME_USD) continue;
+
+    // Filter 3: Minimum liquidity — thin books have high slippage
+    const MIN_LIQUIDITY_USD = 500;
+    if (market.liquidity < MIN_LIQUIDITY_USD) continue;
+
     const inv = inventory.get(marketId) || 0;
     // NOTE: do NOT skip when |inv| > maxInventory — that would freeze the bot
     // and prevent rebalancing. Instead, in rebalance-only mode (below) we
