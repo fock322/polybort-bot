@@ -937,13 +937,12 @@ export function runBacktest(
 
       // ═══ Adverse Selection Filter ═══
       // Skip placing new BIDs when conditions favour being "run over":
-      //   1. Very high volatility (ATR > 2× recent average) — price likely to jump through our bid
-      //   2. Extreme midPrice (< 0.10 or > 0.90) — little room for profit, high chance of resolution
-      //   3. Very narrow market spread (< 2 ticks) — no edge to capture
-      const atrAverage = btcNow.atr5m > 0 ? btcNow.atr5m : 1;
-      const highVolatility = btcNow.atr15m > 0 && btcNow.atr5m > atrAverage * 2;
-      const extremeProbability = upRealMid < 0.10 || upRealMid > 0.90;
-      const narrowSpread = (upBestAsk - upBestBid) < 2 * TICK_SIZE;
+      //   1. Very high volatility (ATR5m > 2× ATR15m) — price likely to jump through our bid
+      //   2. Extreme midPrice (< 0.05 or > 0.95) — almost resolved, no edge
+      //   3. Crossed or locked market (spread <= 0) — no room to quote
+      const highVolatility = btcNow.atr15m > 0 && btcNow.atr5m > btcNow.atr15m * 2;
+      const extremeProbability = upRealMid < 0.05 || upRealMid > 0.95;
+      const narrowSpread = (upBestAsk - upBestBid) <= 0;  // only skip if crossed/locked
       const skipBids = highVolatility || extremeProbability || narrowSpread;
 
       // ═══ BID_UP (buy UP tokens) ═══
@@ -1099,7 +1098,7 @@ export function runBacktest(
       // Only sell when askUp > entryPrice × 1.02 (min 2% profit).
       // If position is in loss, hold to settlement (chance of $1 > guaranteed loss).
       const upPosForSell = positions.get(upPosKey);
-      const minProfitAskUp = upPosForSell ? upPosForSell.entryPrice * 1.02 : 0;
+      const minProfitAskUp = upPosForSell ? upPosForSell.entryPrice * 1.005 : 0;
       if (upPosForSell && upPosForSell.quantity > 0 && askUp > 0 && askUp >= minProfitAskUp) {
         const sellsAtOurAsk = bucketTrades.filter(t =>
           t.outcome === "Up" && t.side === "BUY" && Math.abs(t.price - askUp) <= TICK_SIZE
@@ -1177,7 +1176,7 @@ export function runBacktest(
       // ═══ ASK_DOWN (sell DOWN tokens if we own them) — TAKE PROFIT ONLY ═══
       // Only sell when askDown > entryPrice × 1.02 (min 2% profit).
       const downPosForSell = positions.get(downPosKey);
-      const minProfitAskDown = downPosForSell ? downPosForSell.entryPrice * 1.02 : 0;
+      const minProfitAskDown = downPosForSell ? downPosForSell.entryPrice * 1.005 : 0;
       if (downPosForSell && downPosForSell.quantity > 0 && askDown > 0 && askDown >= minProfitAskDown) {
         const buysAtOurAsk = bucketTrades.filter(t =>
           t.outcome === "Down" && t.side === "BUY" && Math.abs(t.price - askDown) <= TICK_SIZE
