@@ -127,7 +127,7 @@ export interface BacktestTrade {
 
 // ─── Default Config ───────────────────────────────────────────
 export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
-  startingBalance: 1000,
+  startingBalance: 100,
   baseSpread: 0.03,
   atrMultiplier: 10,
   autoExitMinutes: 3,

@@ -22,6 +22,9 @@ node_modules
 # database (too large for GitHub, stored on Google Drive)
 *.db
 *.db-journal
+# BUT keep our historical and custom databases — they're needed for backtest
+!prisma/historical.db
+!db/custom.db
 
 # debug
 npm-debug.log*
