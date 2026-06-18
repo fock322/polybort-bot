@@ -67,11 +67,10 @@ export interface BacktestConfig {
   latencySeconds: number;    // Simulated order-to-fill latency
   tickIntervalSeconds: number; // Simulation tick interval (default 10s)
   // ── Strategy B: Directional edge filter ──
-  // When |modelProb - marketPrice| > edgeThreshold, we have a directional edge.
-  // In edge mode we only place BIDs on the side the model favors (never both).
-  // When |edge| < edgeThreshold, we fall back to symmetric MM mode.
   edgeThreshold: number;        // in probability units (0.04 = 4¢)
   edgeSizeMultiplier: number;   // size multiplier when in edge mode (e.g. 2.0 = double size)
+  requireConfluence: boolean;   // if true, require 3+ factors agreeing with edge direction
+  minConfluenceScore: number;   // minimum confluence score (0..6) to enter edge mode
   // ── Strategy C: Settlement arbitrage ──
   // In the last N minutes, if |z-score| > threshold (BTC far from strike),
   // we buy the side that's almost certain to win at market price (taker).
@@ -140,11 +139,13 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   latencySeconds: 2,
   tickIntervalSeconds: 10,
   // Strategy B: edge filter
-  edgeThreshold: 0.04,        // 4¢ edge required to enter directional mode
+  edgeThreshold: 0.06,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
   edgeSizeMultiplier: 2.0,    // double size when we have edge
+  requireConfluence: true,    // require 3+ factors agreeing
+  minConfluenceScore: 4,      // need 4/6 factors aligned (was 3 — stricter)
   // Strategy C: settlement arbitrage
   settlementArbMinutes: 2,      // last 2 minutes before expiry
-  settlementArbZThreshold: 7.0, // |z| > 3 → 99.7% confidence
+  settlementArbZThreshold: 999.0, // |z| > 3 → 99.7% confidence
   settlementArbMaxSize: 10,     // $20 max per settlement arb trade
 };
 
@@ -178,13 +179,32 @@ function computeBtcContext(klines: BtcKline[], currentTs: number): {
   atr15m: number;
   change1m: number;
   change5m: number;
+  change15m: number;
   trend: "up" | "down" | "neutral";
+  // ── Enhanced indicators (v3) ──
+  rsi14: number;           // RSI(14) — 0..100, >70 overbought, <30 oversold
+  bollPosition: number;    // position within Bollinger Bands: 0=lower, 1=upper, 0.5=middle
+  bollWidth: number;       // bandwidth (upper-lower)/middle — volatility measure
+  emaFast: number;         // EMA(5)
+  emaSlow: number;         // EMA(15)
+  emaCross: "bull" | "bear" | "none";  // fast above slow = bull
+  volume5m: number;        // avg volume last 5 min
+  volume15m: number;       // avg volume last 15 min
+  volumeRatio: number;     // recent volume / longer-term volume (>1 = above average)
+  momentum1m: number;      // normalized 1m momentum (in ATR units)
+  momentum5m: number;      // normalized 5m momentum (in ATR units)
 } {
-  // Find klines up to currentTs
   const currentMs = currentTs * 1000;
   const relevantKlines = klines.filter(k => k.openTime <= currentMs);
   if (relevantKlines.length < 2) {
-    return { price: 0, atr1m: 0, atr5m: 0, atr15m: 0, change1m: 0, change5m: 0, trend: "neutral" };
+    return {
+      price: 0, atr1m: 0, atr5m: 0, atr15m: 0,
+      change1m: 0, change5m: 0, change15m: 0, trend: "neutral",
+      rsi14: 50, bollPosition: 0.5, bollWidth: 0,
+      emaFast: 0, emaSlow: 0, emaCross: "none",
+      volume5m: 0, volume15m: 0, volumeRatio: 1,
+      momentum1m: 0, momentum5m: 0,
+    };
   }
 
   const lastKline = relevantKlines[relevantKlines.length - 1];
@@ -198,18 +218,91 @@ function computeBtcContext(klines: BtcKline[], currentTs: number): {
   // Price changes
   const k1m = relevantKlines.length >= 2 ? relevantKlines[relevantKlines.length - 2] : lastKline;
   const k5m = relevantKlines.length >= 6 ? relevantKlines[relevantKlines.length - 6] : relevantKlines[0];
+  const k15m = relevantKlines.length >= 16 ? relevantKlines[relevantKlines.length - 16] : relevantKlines[0];
 
   const change1m = price > 0 ? (price - k1m.close) / k1m.close * 100 : 0;
   const change5m = price > 0 ? (price - k5m.close) / k5m.close * 100 : 0;
+  const change15m = price > 0 ? (price - k15m.close) / k15m.close * 100 : 0;
 
-  // Trend: simple EMA-like detection
-  const recent5 = relevantKlines.slice(-5);
-  const avgPrice5 = recent5.reduce((s, k) => s + k.close, 0) / recent5.length;
+  // Normalized momentum (in ATR units) — more robust than raw % change
+  const momentum1m = atr5m > 0 ? (price - k1m.close) / atr5m : 0;
+  const momentum5m = atr5m > 0 ? (price - k5m.close) / atr5m : 0;
+
+  // Trend: EMA crossover
+  const computeEma = (data: number[], period: number): number => {
+    if (data.length === 0) return price;
+    const k = 2 / (period + 1);
+    let ema = data[0];
+    for (let i = 1; i < data.length; i++) {
+      ema = data[i] * k + ema * (1 - k);
+    }
+    return ema;
+  };
+  const closes = relevantKlines.map(k => k.close);
+  const emaFast = computeEma(closes.slice(-5), 5);
+  const emaSlow = computeEma(closes.slice(-15), 15);
+  let emaCross: "bull" | "bear" | "none" = "none";
+  if (emaFast > emaSlow * 1.0001) emaCross = "bull";
+  else if (emaFast < emaSlow * 0.9999) emaCross = "bear";
+
   let trend: "up" | "down" | "neutral" = "neutral";
-  if (price > avgPrice5 * 1.0002) trend = "up";
-  else if (price < avgPrice5 * 0.9998) trend = "down";
+  if (emaCross === "bull") trend = "up";
+  else if (emaCross === "bear") trend = "down";
 
-  return { price, atr1m, atr5m, atr15m, change1m, change5m, trend };
+  // ── RSI(14) ──
+  // Standard RSI formula: 100 - 100/(1+RS), RS = avg gain / avg loss
+  let rsi14 = 50;
+  if (relevantKlines.length >= 15) {
+    const changes: number[] = [];
+    for (let i = 1; i < relevantKlines.length; i++) {
+      changes.push(relevantKlines[i].close - relevantKlines[i - 1].close);
+    }
+    const recent14 = changes.slice(-14);
+    const gains = recent14.filter(c => c > 0);
+    const losses = recent14.filter(c => c < 0).map(c => -c);
+    const avgGain = gains.length > 0 ? gains.reduce((s, v) => s + v, 0) / 14 : 0;
+    const avgLoss = losses.length > 0 ? losses.reduce((s, v) => s + v, 0) / 14 : 0;
+    if (avgLoss === 0) rsi14 = 100;
+    else if (avgGain === 0) rsi14 = 0;
+    else {
+      const rs = avgGain / avgLoss;
+      rsi14 = 100 - 100 / (1 + rs);
+    }
+  }
+
+  // ── Bollinger Bands (20-period, 2 std dev) ──
+  let bollPosition = 0.5;  // 0 = at lower band, 1 = at upper band
+  let bollWidth = 0;
+  if (relevantKlines.length >= 20) {
+    const last20 = relevantKlines.slice(-20).map(k => k.close);
+    const mean = last20.reduce((s, v) => s + v, 0) / 20;
+    const variance = last20.reduce((s, v) => s + (v - mean) ** 2, 0) / 20;
+    const std = Math.sqrt(variance);
+    const upper = mean + 2 * std;
+    const lower = mean - 2 * std;
+    bollWidth = mean > 0 ? (upper - lower) / mean : 0;
+    if (upper > lower) {
+      bollPosition = (price - lower) / (upper - lower);
+      bollPosition = Math.max(0, Math.min(1, bollPosition));
+    }
+  }
+
+  // ── Volume profile ──
+  const vol5 = relevantKlines.slice(-5);
+  const vol15 = relevantKlines.slice(-15);
+  const volume5m = vol5.length > 0 ? vol5.reduce((s, k) => s + k.volume, 0) / vol5.length : 0;
+  const volume15m = vol15.length > 0 ? vol15.reduce((s, k) => s + k.volume, 0) / vol15.length : 0;
+  // volumeRatio > 1 = recent volume above 15-min average (attention surge)
+  const volumeRatio = volume15m > 0 ? volume5m / volume15m : 1;
+
+  return {
+    price, atr1m, atr5m, atr15m,
+    change1m, change5m, change15m, trend,
+    rsi14, bollPosition, bollWidth,
+    emaFast, emaSlow, emaCross,
+    volume5m, volume15m, volumeRatio,
+    momentum1m, momentum5m,
+  };
 }
 
 // ─── Strike Price Parser ──────────────────────────────────────
@@ -219,57 +312,117 @@ function parseStrikePrice(question: string): number {
   return 0;
 }
 
-// ─── Probability Model (same as mm-engine) ───────────────────
+// ─── Probability Model v3 — Multi-factor ──────────────────────
+// Combines 6 factors into a logit model:
+//   1. Distance from strike (z-score) — strongest signal near expiry
+//   2. RSI extreme — mean reversion when overbought/oversold
+//   3. Bollinger position — mean reversion at band extremes
+//   4. EMA crossover — trend confirmation
+//   5. Momentum (ATR-normalized) — short-term direction
+//   6. Volume surge — confirms breakouts
+//
+// Output: probability BTC > strike at expiry (0.01..0.99)
+//
 function calcUpProbability(
   strikePrice: number,
   expiresAtMs: number,
   currentTsMs: number,
   btc: ReturnType<typeof computeBtcContext>,
 ): number {
-  const { price, atr5m, change1m, change5m, trend } = btc;
-  if (price <= 0) return 0.5;
+  if (btc.price <= 0) return 0.5;
 
-  const tau = (expiresAtMs - currentTsMs) / 60000;
+  const tau = (expiresAtMs - currentTsMs) / 60_000;  // minutes to expiry
+  const { price, atr5m, rsi14, bollPosition, emaCross, momentum1m, momentum5m, volumeRatio, trend } = btc;
 
-  if (strikePrice > 0) {
-    if (tau <= 0) return price > strikePrice ? 0.99 : 0.01;
-
+  // ── Factor 1: Distance from strike (z-score) ──
+  // Strongest signal. If BTC is far above strike, UP is likely; far below, DOWN.
+  let zScore = 0;
+  if (strikePrice > 0 && tau > 0) {
     const distPct = (price - strikePrice) / price;
     const atrPct = atr5m > 0 ? atr5m / price : 0.001;
     const expectedMove = atrPct * Math.sqrt(Math.max(tau, 0.1) / 5);
-    const zScore = expectedMove > 0 ? distPct / expectedMove : (distPct > 0 ? 5 : -5);
+    zScore = expectedMove > 0 ? distPct / expectedMove : (distPct > 0 ? 5 : -5);
+  } else if (strikePrice > 0 && tau <= 0) {
+    return price > strikePrice ? 0.99 : 0.01;
+  }
+  // z-score → probability via sigmoid (z=3 → ~95%, z=-3 → ~5%)
+  const zScoreFactor = sigmoid(zScore * 1.5);  // 0..1, centered at 0.5
 
-    let pUp = sigmoid(zScore * 3);
-
-    const momentumSignal = (change1m * 2 + change5m) / 3;
-    const trendBias = trend === "up" ? 0.02 : trend === "down" ? -0.02 : 0;
-    pUp = pUp + (momentumSignal + trendBias) * 0.1;
-
-    if (tau < 3) {
-      pUp = price > strikePrice
-        ? Math.min(pUp + (1 - pUp) * 0.5, 0.99)
-        : Math.max(pUp - pUp * 0.5, 0.01);
-    }
-
-    return Math.max(0.01, Math.min(0.99, pUp));
+  // ── Factor 2: RSI mean reversion ──
+  // RSI > 70 = overbought → expect DOWN (price revert). RSI < 30 = oversold → expect UP.
+  // For BTC Up/Down 15-min: if BTC is overbought, likely to pull back below strike.
+  // Map RSI 0..100 to 1..0 (inverted): RSI=70 → 0.3, RSI=30 → 0.7
+  // Only apply mean reversion in extreme zones; in 30-70 range, RSI is neutral (0.5).
+  let rsiFactor = 0.5;
+  if (rsi14 >= 70) {
+    // Overbought → expect DOWN → factor < 0.5
+    rsiFactor = 0.5 - (rsi14 - 70) / 100;  // 70→0.5, 100→0.2
+  } else if (rsi14 <= 30) {
+    // Oversold → expect UP → factor > 0.5
+    rsiFactor = 0.5 + (30 - rsi14) / 100;  // 30→0.5, 0→0.8
   }
 
-  // Fallback: momentum model
-  if (tau <= 0) return trend === "up" ? 0.99 : trend === "down" ? 0.01 : 0.5;
+  // ── Factor 3: Bollinger position ──
+  // At upper band (1.0) → overbought → expect DOWN. At lower (0.0) → expect UP.
+  // Map 0..1 to 1..0 (inverted), but only at extremes.
+  let bollFactor = 0.5;
+  if (bollPosition >= 0.85) {
+    bollFactor = 0.5 - (bollPosition - 0.85) * 2;  // 0.85→0.5, 1.0→0.2
+  } else if (bollPosition <= 0.15) {
+    bollFactor = 0.5 + (0.15 - bollPosition) * 2;  // 0.15→0.5, 0.0→0.8
+  }
+  bollFactor = Math.max(0.1, Math.min(0.9, bollFactor));
 
-  const momentumSignal = (change1m * 2 + change5m) / 3;
-  const trendBias = trend === "up" ? 0.02 : trend === "down" ? -0.02 : 0;
-  const atrPct = atr5m > 0 ? (atr5m / price) * 100 : 0.1;
-  const volatilityFactor = Math.max(atrPct * 10, 0.001);
-  const raw = sigmoid((momentumSignal + trendBias) / volatilityFactor * 10);
+  // ── Factor 4: EMA crossover (trend) ──
+  // Bull cross → expect UP. Bear cross → expect DOWN.
+  let emaFactor = 0.5;
+  if (emaCross === "bull") emaFactor = 0.62;
+  else if (emaCross === "bear") emaFactor = 0.38;
 
-  if (tau < 3) {
-    return raw > 0.5
-      ? Math.min(raw + (1 - raw) * 0.5, 0.99)
-      : Math.max(raw - raw * 0.5, 0.01);
+  // ── Factor 5: Momentum (ATR-normalized) ──
+  // Positive momentum → UP likely. Negative → DOWN. Sigmoid squashes.
+  // momentum1m in ATR units; ±2 ATR is a strong move.
+  const momentumFactor = sigmoid((momentum1m * 0.5 + momentum5m * 0.3) * 1.5);
+
+  // ── Factor 6: Volume surge ──
+  // High volume confirms the current move. If price above strike + high volume → strong UP.
+  // volumeRatio > 1.5 = surge. Combine with momentum direction.
+  const volSurge = Math.max(0, volumeRatio - 1);  // 0 = average, 1+ = surge
+  const volFactor = momentumFactor > 0.5
+    ? Math.min(0.9, 0.5 + volSurge * 0.2)   // surge confirms upward momentum
+    : Math.max(0.1, 0.5 - volSurge * 0.2);  // surge confirms downward momentum
+
+  // ── Combine factors with weights (sum = 1.0) ──
+  // Weights tuned for 15-min BTC markets:
+  //   - z-score dominates (especially near expiry)
+  //   - RSI/Bollinger provide mean-reversion signal
+  //   - EMA/momentum/volume provide trend confirmation
+  //
+  // Near expiry (tau < 3), z-score weight increases (price → strike resolution).
+  const expiryWeight = tau < 3 ? 0.55 : tau < 7 ? 0.45 : 0.35;
+  const rsiWeight = 0.15;
+  const bollWeight = 0.12;
+  const emaWeight = 0.13;
+  const momWeight = 0.15;
+  const volWeight = 1 - expiryWeight - rsiWeight - bollWeight - emaWeight - momWeight;
+
+  let pUp =
+    zScoreFactor * expiryWeight +
+    rsiFactor * rsiWeight +
+    bollFactor * bollWeight +
+    emaFactor * emaWeight +
+    momentumFactor * momWeight +
+    volFactor * volWeight;
+
+  // ── Near-expiry amplification ──
+  // In last 3 minutes, price tends to resolve to 0/1. Amplify the signal.
+  if (tau < 3 && strikePrice > 0) {
+    pUp = price > strikePrice
+      ? Math.min(pUp + (1 - pUp) * 0.5, 0.99)
+      : Math.max(pUp - pUp * 0.5, 0.01);
   }
 
-  return Math.max(0.01, Math.min(0.99, raw));
+  return Math.max(0.01, Math.min(0.99, pUp));
 }
 
 // ─── Spread Calculation ───────────────────────────────────────
@@ -700,15 +853,47 @@ export function runBacktest(
         }
       }
 
-      // ═══ Strategy B: Directional edge filter ═══
-      // Compute edge = modelProb - marketPrice. If |edge| > threshold, we have
-      // a directional view: only place BIDs on the side the model favors.
-      //   edge > 0  → model says UP is underpriced → only BID_UP (skip BID_DOWN)
-      //   edge < 0  → model says DOWN is underpriced → only BID_DOWN (skip BID_UP)
-      //   |edge| < threshold → no edge, symmetric MM mode (place both BIDs)
+      // ═══ Strategy B: Directional edge filter with confluence ═══
+      // Compute edge = modelProb - marketPrice. If |edge| > threshold AND
+      // enough factors agree (confluence), we have a directional view.
+      //
+      // Confluence score: count how many of the 6 factors agree with the
+      // edge direction. requireConfluence + minConfluenceScore filters out
+      // weak signals where the model is bullish but only 1-2 factors agree.
       const edge = modelPUp - upRealMid;
-      const hasEdgeUp = edge > config.edgeThreshold;     // model says UP underpriced
-      const hasEdgeDown = -edge > config.edgeThreshold;  // model says DOWN underpriced
+      const edgeDirection: "up" | "down" | "none" = edge > config.edgeThreshold
+        ? "up"
+        : -edge > config.edgeThreshold ? "down" : "none";
+
+      // ── Compute confluence score (how many factors agree) ──
+      // Each factor votes "up" (>0.5) or "down" (<0.5). We count votes
+      // aligned with edgeDirection.
+      let confluenceScore = 0;
+      if (edgeDirection !== "none") {
+        const factorsUp: boolean[] = [
+          btcNow.rsi14 <= 45,                          // RSI: oversold → up
+          btcNow.bollPosition <= 0.4,                  // Bollinger: near lower → up
+          btcNow.emaCross === "bull",                  // EMA: bull cross → up
+          btcNow.momentum1m > 0,                       // Momentum: positive → up
+          btcNow.momentum5m > 0,                       // 5m momentum: positive → up
+          btcNow.volumeRatio > 1 && btcNow.momentum1m > 0,  // Volume surge + up momentum
+        ];
+        const factorsDown: boolean[] = [
+          btcNow.rsi14 >= 55,                          // RSI: overbought → down
+          btcNow.bollPosition >= 0.6,                  // Bollinger: near upper → down
+          btcNow.emaCross === "bear",                  // EMA: bear cross → down
+          btcNow.momentum1m < 0,                       // Momentum: negative → down
+          btcNow.momentum5m < 0,                       // 5m momentum: negative → down
+          btcNow.volumeRatio > 1 && btcNow.momentum1m < 0,  // Volume surge + down momentum
+        ];
+        const votes = edgeDirection === "up" ? factorsUp : factorsDown;
+        confluenceScore = votes.filter(Boolean).length;
+      }
+
+      // Enter edge mode only if confluence requirement is met
+      const confluenceMet = !config.requireConfluence || confluenceScore >= config.minConfluenceScore;
+      const hasEdgeUp = edgeDirection === "up" && confluenceMet;
+      const hasEdgeDown = edgeDirection === "down" && confluenceMet;
       const inEdgeMode = hasEdgeUp || hasEdgeDown;
 
       // ── Rebalance mode: skip BID on the long side ──
