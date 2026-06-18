@@ -30,6 +30,9 @@ export interface HistoricalMarket {
   makerBaseFee: number;
   negRisk: boolean;
   slotTs: number;
+  // ── Chainlink resolution prices (from Polymarket eventMetadata) ──
+  priceToBeat: number;  // BTC price at slot START (= strike, from Chainlink)
+  finalPrice: number;   // BTC price at slot END (from Chainlink)
 }
 
 export interface HistoricalTrade {
@@ -139,10 +142,10 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   latencySeconds: 2,
   tickIntervalSeconds: 10,
   // Strategy B: edge filter
-  edgeThreshold: 0.04,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
+  edgeThreshold: 0.06,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
   edgeSizeMultiplier: 2.0,    // double size when we have edge
   requireConfluence: true,    // require 3+ factors agreeing
-  minConfluenceScore: 3,      // need 4/6 factors aligned (was 3 — stricter)
+  minConfluenceScore: 4,      // need 4/6 factors aligned (was 3 — stricter)
   // Strategy C: settlement arbitrage
   settlementArbMinutes: 2,      // last 2 minutes before expiry
   settlementArbZThreshold: 999.0, // |z| > 3 → 99.7% confidence
@@ -653,14 +656,19 @@ export function runBacktest(
     if (btc.price <= 0) continue;
 
     // ── Determine strike price ──
-    // For Polymarket BTC Up/Down 15-min markets, the question doesn't contain
-    // a strike price (e.g. "Bitcoin Up or Down - June 16, 7:30AM-7:45AM ET").
-    // The strike is the BTC price at the START of the 15-min slot: if BTC is
-    // higher at expiry → UP wins, lower → DOWN wins.
-    // So strike = BTC price at marketStartTs (from klines).
-    let strike = parseStrikePrice(market.question);
+    // For Polymarket BTC Up/Down 15-min markets, the strike is the BTC price
+    // at the START of the 15-min slot. Polymarket uses Chainlink BTC/USD stream
+    // for resolution, and stores the exact strike in eventMetadata.priceToBeat.
+    //
+    // Priority:
+    //   1. market.priceToBeat (Chainlink — exact, 100% match with outcome)
+    //   2. parseStrikePrice(question) (for markets with $ in question)
+    //   3. btc.price (fallback: Binance price at slot start — ~82% match)
+    let strike = market.priceToBeat && market.priceToBeat > 0
+      ? market.priceToBeat      // Chainlink — exact
+      : parseStrikePrice(market.question);
     if (strike <= 0) {
-      // BTC Up/Down market: strike = opening BTC price at slot start
+      // Fallback: Binance price at slot start (less accurate, 82% match)
       strike = btc.price;
     }
 
@@ -851,22 +859,15 @@ export function runBacktest(
         }
       }
 
-      // ═══ Strategy B: Directional edge filter (CONTRARIAN) ═══
-      // Empirical finding: the model's predictions are contrarian on 15-min BTC.
-      // When model says UP with high confidence, BTC actually goes DOWN.
-      // This is a known phenomenon: indicators converge at exhaustion points.
-      //
-      // Strategy: trade AGAINST the model's edge direction.
-      //   model says UP (edge > threshold) → we actually BID DOWN
-      //   model says DOWN (-edge > threshold) → we actually BID UP
-      //
-      // Confluence filter still applies: only counter-trade when model is
-      // very confident (high confluence = exhaustion likely).
+      // ═══ Strategy B: Directional edge filter ═══
+      // With Chainlink priceToBeat as strike, the model should now predict
+      // correctly (was contrarian before due to 18% Binance/Chainlink mismatch).
+      // Trade in the direction the model predicts.
       const edge = modelPUp - upRealMid;
       const modelSaysUp = edge > config.edgeThreshold;
       const modelSaysDown = -edge > config.edgeThreshold;
 
-      // Compute confluence (how strongly model agrees with itself)
+      // Compute confluence (how many factors agree with model direction)
       let confluenceScore = 0;
       if (modelSaysUp || modelSaysDown) {
         const factorsUp: boolean[] = [
@@ -889,10 +890,10 @@ export function runBacktest(
         confluenceScore = votes.filter(Boolean).length;
       }
 
-      // Contrarian: model says UP (high confluence) → we BID DOWN
+      // Enter edge mode in the direction model predicts (with confluence)
       const confluenceMet = !config.requireConfluence || confluenceScore >= config.minConfluenceScore;
-      const hasEdgeUp = modelSaysDown && confluenceMet;    // model down → we buy UP
-      const hasEdgeDown = modelSaysUp && confluenceMet;    // model up → we buy DOWN
+      const hasEdgeUp = modelSaysUp && confluenceMet;
+      const hasEdgeDown = modelSaysDown && confluenceMet;
       const inEdgeMode = hasEdgeUp || hasEdgeDown;
 
       // ── Rebalance mode: skip BID on the long side ──

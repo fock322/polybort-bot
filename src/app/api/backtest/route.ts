@@ -30,7 +30,8 @@ function loadMarkets(db: Database.Database, daysBack?: number): HistoricalMarket
     query = `
       SELECT condition_id, slug, question, start_date, end_date,
              up_token_id, down_token_id, outcome, outcome_prices,
-             volume, liquidity, taker_base_fee, maker_base_fee, neg_risk, slot_ts
+             volume, liquidity, taker_base_fee, maker_base_fee, neg_risk, slot_ts,
+             price_to_beat, final_price
       FROM historical_markets
       WHERE outcome != 'Unknown'
         AND end_date >= datetime('now', '-${daysBack} days')
@@ -40,7 +41,8 @@ function loadMarkets(db: Database.Database, daysBack?: number): HistoricalMarket
     query = `
       SELECT condition_id, slug, question, start_date, end_date,
              up_token_id, down_token_id, outcome, outcome_prices,
-             volume, liquidity, taker_base_fee, maker_base_fee, neg_risk, slot_ts
+             volume, liquidity, taker_base_fee, maker_base_fee, neg_risk, slot_ts,
+             price_to_beat, final_price
       FROM historical_markets
       WHERE outcome != 'Unknown'
       ORDER BY end_date ASC
@@ -71,6 +73,8 @@ function loadMarkets(db: Database.Database, daysBack?: number): HistoricalMarket
       makerBaseFee: r.maker_base_fee as number,
       negRisk: Boolean(r.neg_risk),
       slotTs: r.slot_ts as number,
+      priceToBeat: (r.price_to_beat as number) || 0,
+      finalPrice: (r.final_price as number) || 0,
     };
   });
 }
