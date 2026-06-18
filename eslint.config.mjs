@@ -49,6 +49,8 @@ const eslintConfig = [...nextCoreWebVitals, ...nextTypescript, {
     "examples/**", "skills",
     // Standalone CommonJS backtest scripts (run via `node scripts/run_backtest.js`, not part of Next.js build)
     "scripts/run_backtest.js", "scripts/run_backtest_v3.js", "scripts/run_backtest_v4.js",
+    // Standalone optimization script (uses better-sqlite3 directly)
+    "scripts/walk-forward-optimize.ts",
     // Legacy Python MM bot (Sprint 1, kept for reference)
     "legacy-python-mm/**",
   ]

@@ -141,11 +141,11 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   makerFillRate: 0.10,
   latencySeconds: 2,
   tickIntervalSeconds: 10,
-  // Strategy B: edge filter
-  edgeThreshold: 0.06,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
+  // Strategy B: edge filter (optimized via walk-forward)
+  edgeThreshold: 0.02,        // 2¢ edge (was 6¢ — walk-forward found lower is better)
   edgeSizeMultiplier: 2.0,    // double size when we have edge
-  requireConfluence: true,    // require 3+ factors agreeing
-  minConfluenceScore: 4,      // need 4/6 factors aligned (was 3 — stricter)
+  requireConfluence: false,   // confluence filter doesn't help (walk-forward: conf=0 optimal)
+  minConfluenceScore: 0,      // disabled
   // Strategy C: settlement arbitrage
   settlementArbMinutes: 2,      // last 2 minutes before expiry
   settlementArbZThreshold: 999.0, // |z| > 3 → 99.7% confidence
