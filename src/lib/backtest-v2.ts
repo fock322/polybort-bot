@@ -651,6 +651,13 @@ export function runBacktest(
 
     if (durationMinutes < 10 || durationMinutes > 20) continue; // Skip weird markets
 
+    // ── Market quality filter ──
+    // Skip markets with poor conditions for MM:
+    //   - Low volume (< $5,000) — illiquid, hard to fill, adverse selection
+    //   - Extreme outcome prices — already resolved, no edge
+    const minVolume = 2000;
+    if (market.volume < minVolume) continue;
+
     // Get BTC context at market start
     const btc = computeBtcContext(klines, marketStartTs);
     if (btc.price <= 0) continue;
@@ -928,8 +935,19 @@ export function runBacktest(
 
       const bucketTrades = tradesByBucket.get(bucketTs) || [];
 
+      // ═══ Adverse Selection Filter ═══
+      // Skip placing new BIDs when conditions favour being "run over":
+      //   1. Very high volatility (ATR > 2× recent average) — price likely to jump through our bid
+      //   2. Extreme midPrice (< 0.10 or > 0.90) — little room for profit, high chance of resolution
+      //   3. Very narrow market spread (< 2 ticks) — no edge to capture
+      const atrAverage = btcNow.atr5m > 0 ? btcNow.atr5m : 1;
+      const highVolatility = btcNow.atr15m > 0 && btcNow.atr5m > atrAverage * 2;
+      const extremeProbability = upRealMid < 0.10 || upRealMid > 0.90;
+      const narrowSpread = (upBestAsk - upBestBid) < 2 * TICK_SIZE;
+      const skipBids = highVolatility || extremeProbability || narrowSpread;
+
       // ═══ BID_UP (buy UP tokens) ═══
-      if (allowBidUp && cash.balance > bidUp * qtyBidUp + calcTakerFee(qtyBidUp, bidUp, feeRateVal)) {
+      if (allowBidUp && !skipBids && cash.balance > bidUp * qtyBidUp + calcTakerFee(qtyBidUp, bidUp, feeRateVal)) {
         // Maker fill: SELL trade at our bid price (someone sold into our bid)
         const sellsAtOurBid = bucketTrades.filter(t =>
           t.outcome === "Up" && t.side === "SELL" && Math.abs(t.price - bidUp) <= TICK_SIZE
@@ -1005,7 +1023,7 @@ export function runBacktest(
       }
 
       // ═══ BID_DOWN (buy DOWN tokens) ═══
-      if (allowBidDown && cash.balance > bidDown * qtyBidDown + calcTakerFee(qtyBidDown, bidDown, feeRateVal)) {
+      if (allowBidDown && !skipBids && cash.balance > bidDown * qtyBidDown + calcTakerFee(qtyBidDown, bidDown, feeRateVal)) {
         const sellsAtOurBid = bucketTrades.filter(t =>
           t.outcome === "Down" && t.side === "SELL" && Math.abs(t.price - bidDown) <= TICK_SIZE
         );
@@ -1077,9 +1095,12 @@ export function runBacktest(
         }
       }
 
-      // ═══ ASK_UP (sell UP tokens if we own them) ═══
+      // ═══ ASK_UP (sell UP tokens if we own them) — TAKE PROFIT ONLY ═══
+      // Only sell when askUp > entryPrice × 1.02 (min 2% profit).
+      // If position is in loss, hold to settlement (chance of $1 > guaranteed loss).
       const upPosForSell = positions.get(upPosKey);
-      if (upPosForSell && upPosForSell.quantity > 0 && askUp > 0) {
+      const minProfitAskUp = upPosForSell ? upPosForSell.entryPrice * 1.02 : 0;
+      if (upPosForSell && upPosForSell.quantity > 0 && askUp > 0 && askUp >= minProfitAskUp) {
         const sellsAtOurAsk = bucketTrades.filter(t =>
           t.outcome === "Up" && t.side === "BUY" && Math.abs(t.price - askUp) <= TICK_SIZE
         );
@@ -1153,9 +1174,11 @@ export function runBacktest(
         }
       }
 
-      // ═══ ASK_DOWN (sell DOWN tokens if we own them) ═══
+      // ═══ ASK_DOWN (sell DOWN tokens if we own them) — TAKE PROFIT ONLY ═══
+      // Only sell when askDown > entryPrice × 1.02 (min 2% profit).
       const downPosForSell = positions.get(downPosKey);
-      if (downPosForSell && downPosForSell.quantity > 0 && askDown > 0) {
+      const minProfitAskDown = downPosForSell ? downPosForSell.entryPrice * 1.02 : 0;
+      if (downPosForSell && downPosForSell.quantity > 0 && askDown > 0 && askDown >= minProfitAskDown) {
         const buysAtOurAsk = bucketTrades.filter(t =>
           t.outcome === "Down" && t.side === "BUY" && Math.abs(t.price - askDown) <= TICK_SIZE
         );
@@ -1229,20 +1252,32 @@ export function runBacktest(
         }
       }
 
-      // ── Auto-exit: close MM positions near expiry ──
-      // Only close MM (market-making) positions via auto-exit. Edge and
-      // settlement_arb positions should ride to settlement for full $1/$0
-      // payout (that's where their edge comes from).
-      // Window: between settlementArbMinutes and autoExitMinutes (e.g. 2-3 min).
+      // ── Smart auto-exit: take profit OR hold to settlement ──
+      // In the last autoExitMinutes, for each MM position:
+      //   - If current bid > entryPrice (in profit) → sell now, lock the gain
+      //   - If current bid < entryPrice (in loss) → HOLD to settlement
+      //     (chance of $1 > guaranteed loss at bid)
+      // Edge/settlement_arb positions always ride to settlement.
       const shouldAutoExit = minutesToExpiry <= config.autoExitMinutes
         && minutesToExpiry > config.settlementArbMinutes;
       if (shouldAutoExit) {
         for (const [posKey, pos] of positions) {
           if (!posKey.startsWith(market.conditionId)) continue;
-          if (pos.strategy !== "mm") continue;  // only close MM positions
+          if (pos.strategy !== "mm") continue;  // only MM positions; edge/arb ride to settlement
+
           const realBid = pos.side === "UP" ? upBestBid : downBestBid;
           const closePrice = tickRound(realBid);
           if (closePrice <= 0) continue;
+
+          // ── Smart exit: only sell if in profit ──
+          // If selling at bid would lose money, hold to settlement instead.
+          // This converts guaranteed losses into binary settlement outcomes.
+          if (closePrice < pos.entryPrice) {
+            // In loss — hold to settlement, don't realize the loss
+            continue;
+          }
+
+          // In profit — sell now, lock the gain
           const sellQty = pos.quantity;
           const fee = calcTakerFee(sellQty, closePrice, feeRateVal);
           totalFees += fee;
@@ -1259,13 +1294,10 @@ export function runBacktest(
           btTrades.push({
             timestamp: cycleTs, marketSlug: market.slug,
             side: `SELL_${pos.side}`, price: closePrice, quantity: sellQty,
-            fee, rebate: 0, pnl: tradePnl, reason: "auto_exit", cashAfter: cash.balance,
+            fee, rebate: 0, pnl: tradePnl, reason: "smart_exit_profit", cashAfter: cash.balance,
           });
           positions.delete(posKey);
         }
-        // Don't break — continue cycling to allow settlement arb entries
-        // in the last settlementArbMinutes. Only recompute inventory after
-        // closing MM positions.
         const remainingInv = Array.from(positions.values())
           .filter(p => p.marketSlug === market.slug)
           .reduce((s, p) => s + (p.side === "UP" ? p.quantity : -p.quantity), 0);
