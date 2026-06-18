@@ -90,6 +90,11 @@ export interface BacktestResult {
   makerTrades: number;
   takerTrades: number;
   winRate: number;
+  exitWinRate: number;   // win rate excluding entries (pnl=0)
+  exitWins: number;
+  exitLosses: number;
+  avgWin: number;
+  avgLoss: number;
   avgTradePnl: number;
   maxDrawdown: number;
   sharpeRatio: number;
@@ -1381,6 +1386,16 @@ export function runBacktest(
   const totalTrades = btTrades.length;
   const profitableTrades = btTrades.filter(t => t.pnl > 0).length;
   const winRate = totalTrades > 0 ? profitableTrades / totalTrades : 0;
+
+  // Exit win rate: only count trades with non-zero pnl (excludes entries)
+  // This is the "true" win rate — how often our exits are profitable.
+  const exitTrades = btTrades.filter(t => t.pnl !== 0);
+  const exitWins = btTrades.filter(t => t.pnl > 0).length;
+  const exitLosses = btTrades.filter(t => t.pnl < 0).length;
+  const exitWinRate = exitTrades.length > 0 ? exitWins / exitTrades.length : 0;
+  const avgWin = exitWins > 0 ? btTrades.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0) / exitWins : 0;
+  const avgLoss = exitLosses > 0 ? Math.abs(btTrades.filter(t => t.pnl < 0).reduce((s, t) => s + t.pnl, 0) / exitLosses) : 0;
+
   const avgTradePnl = totalTrades > 0 ? totalPnl / totalTrades : 0;
   const avgHoldingTimeMinutes = settledPositions > 0 ? (totalHoldingTime / settledPositions / 60) : 0;
 
@@ -1409,6 +1424,11 @@ export function runBacktest(
     makerTrades,
     takerTrades,
     winRate,
+    exitWinRate,
+    exitWins,
+    exitLosses,
+    avgWin,
+    avgLoss,
     avgTradePnl,
     maxDrawdown,
     sharpeRatio,
