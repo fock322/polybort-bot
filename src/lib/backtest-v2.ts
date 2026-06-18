@@ -139,10 +139,10 @@ export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   latencySeconds: 2,
   tickIntervalSeconds: 10,
   // Strategy B: edge filter
-  edgeThreshold: 0.06,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
+  edgeThreshold: 0.04,        // 6¢ edge required (was 4¢ — stricter for higher win rate)
   edgeSizeMultiplier: 2.0,    // double size when we have edge
   requireConfluence: true,    // require 3+ factors agreeing
-  minConfluenceScore: 4,      // need 4/6 factors aligned (was 3 — stricter)
+  minConfluenceScore: 3,      // need 4/6 factors aligned (was 3 — stricter)
   // Strategy C: settlement arbitrage
   settlementArbMinutes: 2,      // last 2 minutes before expiry
   settlementArbZThreshold: 999.0, // |z| > 3 → 99.7% confidence
@@ -348,28 +348,26 @@ function calcUpProbability(
   // z-score → probability via sigmoid (z=3 → ~95%, z=-3 → ~5%)
   const zScoreFactor = sigmoid(zScore * 1.5);  // 0..1, centered at 0.5
 
-  // ── Factor 2: RSI mean reversion ──
-  // RSI > 70 = overbought → expect DOWN (price revert). RSI < 30 = oversold → expect UP.
-  // For BTC Up/Down 15-min: if BTC is overbought, likely to pull back below strike.
-  // Map RSI 0..100 to 1..0 (inverted): RSI=70 → 0.3, RSI=30 → 0.7
-  // Only apply mean reversion in extreme zones; in 30-70 range, RSI is neutral (0.5).
+  // ── Factor 2: RSI trend-following (NOT mean reversion) ──
+  // On 15-min BTC markets, RSI > 55 = bullish momentum → expect UP to continue.
+  // RSI < 45 = bearish momentum → expect DOWN to continue.
+  // (Mean reversion doesn't work on short BTC timeframes — trends persist.)
   let rsiFactor = 0.5;
-  if (rsi14 >= 70) {
-    // Overbought → expect DOWN → factor < 0.5
-    rsiFactor = 0.5 - (rsi14 - 70) / 100;  // 70→0.5, 100→0.2
-  } else if (rsi14 <= 30) {
-    // Oversold → expect UP → factor > 0.5
-    rsiFactor = 0.5 + (30 - rsi14) / 100;  // 30→0.5, 0→0.8
+  if (rsi14 >= 55) {
+    rsiFactor = 0.5 + Math.min((rsi14 - 55) / 90, 0.35);  // 55→0.5, 90→0.85
+  } else if (rsi14 <= 45) {
+    rsiFactor = 0.5 - Math.min((45 - rsi14) / 90, 0.35);  // 45→0.5, 10→0.15
   }
 
-  // ── Factor 3: Bollinger position ──
-  // At upper band (1.0) → overbought → expect DOWN. At lower (0.0) → expect UP.
-  // Map 0..1 to 1..0 (inverted), but only at extremes.
+  // ── Factor 3: Bollinger trend-following ──
+  // At upper band = strong uptrend → expect UP to continue.
+  // At lower band = strong downtrend → expect DOWN to continue.
+  // (Breakout, not reversion.)
   let bollFactor = 0.5;
-  if (bollPosition >= 0.85) {
-    bollFactor = 0.5 - (bollPosition - 0.85) * 2;  // 0.85→0.5, 1.0→0.2
-  } else if (bollPosition <= 0.15) {
-    bollFactor = 0.5 + (0.15 - bollPosition) * 2;  // 0.15→0.5, 0.0→0.8
+  if (bollPosition >= 0.6) {
+    bollFactor = 0.5 + (bollPosition - 0.6) * 1.0;  // 0.6→0.5, 1.0→0.9
+  } else if (bollPosition <= 0.4) {
+    bollFactor = 0.5 - (0.4 - bollPosition) * 1.0;  // 0.4→0.5, 0.0→0.1
   }
   bollFactor = Math.max(0.1, Math.min(0.9, bollFactor));
 
@@ -853,47 +851,48 @@ export function runBacktest(
         }
       }
 
-      // ═══ Strategy B: Directional edge filter with confluence ═══
-      // Compute edge = modelProb - marketPrice. If |edge| > threshold AND
-      // enough factors agree (confluence), we have a directional view.
+      // ═══ Strategy B: Directional edge filter (CONTRARIAN) ═══
+      // Empirical finding: the model's predictions are contrarian on 15-min BTC.
+      // When model says UP with high confidence, BTC actually goes DOWN.
+      // This is a known phenomenon: indicators converge at exhaustion points.
       //
-      // Confluence score: count how many of the 6 factors agree with the
-      // edge direction. requireConfluence + minConfluenceScore filters out
-      // weak signals where the model is bullish but only 1-2 factors agree.
+      // Strategy: trade AGAINST the model's edge direction.
+      //   model says UP (edge > threshold) → we actually BID DOWN
+      //   model says DOWN (-edge > threshold) → we actually BID UP
+      //
+      // Confluence filter still applies: only counter-trade when model is
+      // very confident (high confluence = exhaustion likely).
       const edge = modelPUp - upRealMid;
-      const edgeDirection: "up" | "down" | "none" = edge > config.edgeThreshold
-        ? "up"
-        : -edge > config.edgeThreshold ? "down" : "none";
+      const modelSaysUp = edge > config.edgeThreshold;
+      const modelSaysDown = -edge > config.edgeThreshold;
 
-      // ── Compute confluence score (how many factors agree) ──
-      // Each factor votes "up" (>0.5) or "down" (<0.5). We count votes
-      // aligned with edgeDirection.
+      // Compute confluence (how strongly model agrees with itself)
       let confluenceScore = 0;
-      if (edgeDirection !== "none") {
+      if (modelSaysUp || modelSaysDown) {
         const factorsUp: boolean[] = [
-          btcNow.rsi14 <= 45,                          // RSI: oversold → up
-          btcNow.bollPosition <= 0.4,                  // Bollinger: near lower → up
-          btcNow.emaCross === "bull",                  // EMA: bull cross → up
-          btcNow.momentum1m > 0,                       // Momentum: positive → up
-          btcNow.momentum5m > 0,                       // 5m momentum: positive → up
-          btcNow.volumeRatio > 1 && btcNow.momentum1m > 0,  // Volume surge + up momentum
+          btcNow.rsi14 >= 55,
+          btcNow.bollPosition >= 0.6,
+          btcNow.emaCross === "bull",
+          btcNow.momentum1m > 0,
+          btcNow.momentum5m > 0,
+          btcNow.volumeRatio > 1 && btcNow.momentum1m > 0,
         ];
         const factorsDown: boolean[] = [
-          btcNow.rsi14 >= 55,                          // RSI: overbought → down
-          btcNow.bollPosition >= 0.6,                  // Bollinger: near upper → down
-          btcNow.emaCross === "bear",                  // EMA: bear cross → down
-          btcNow.momentum1m < 0,                       // Momentum: negative → down
-          btcNow.momentum5m < 0,                       // 5m momentum: negative → down
-          btcNow.volumeRatio > 1 && btcNow.momentum1m < 0,  // Volume surge + down momentum
+          btcNow.rsi14 <= 45,
+          btcNow.bollPosition <= 0.4,
+          btcNow.emaCross === "bear",
+          btcNow.momentum1m < 0,
+          btcNow.momentum5m < 0,
+          btcNow.volumeRatio > 1 && btcNow.momentum1m < 0,
         ];
-        const votes = edgeDirection === "up" ? factorsUp : factorsDown;
+        const votes = modelSaysUp ? factorsUp : factorsDown;
         confluenceScore = votes.filter(Boolean).length;
       }
 
-      // Enter edge mode only if confluence requirement is met
+      // Contrarian: model says UP (high confluence) → we BID DOWN
       const confluenceMet = !config.requireConfluence || confluenceScore >= config.minConfluenceScore;
-      const hasEdgeUp = edgeDirection === "up" && confluenceMet;
-      const hasEdgeDown = edgeDirection === "down" && confluenceMet;
+      const hasEdgeUp = modelSaysDown && confluenceMet;    // model down → we buy UP
+      const hasEdgeDown = modelSaysUp && confluenceMet;    // model up → we buy DOWN
       const inEdgeMode = hasEdgeUp || hasEdgeDown;
 
       // ── Rebalance mode: skip BID on the long side ──
