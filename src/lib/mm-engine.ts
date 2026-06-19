@@ -243,7 +243,7 @@ const config: BotConfig = {
   // ── Inventory management v2 ──
   rebalanceThreshold: 12,
   adverseSelectionFactor: 3,
-  stopLossPct: 0.50,          // 50% — effectively disabled (was 15%). Hold to settlement instead.
+  stopLossPct: 0.20,          // 20% fixed fallback (dynamic ATR used in markToMarket)
   liveMode: false,
 };
 
@@ -1399,16 +1399,28 @@ function markToMarket(_btc: BtcPriceData): void {
     if (pos.currentValue > pos.peakValue) pos.peakValue = pos.currentValue;
     totalUnrealized += pos.unrealizedPnl;
 
-    // ── Stop-loss: close position if unrealized loss exceeds threshold ──
-    // We measure loss as a fraction of cost basis (not current value), so a
-    // position bought for $10 that's now worth $8.50 has a 15% loss.
+    // ── DYNAMIC STOP-LOSS based on ATR + 1 min to expiry ──
+    // Two INDEPENDENT conditions (either triggers close):
+    // 1. Loss >= dynamic ATR-based percentage (5-20% depending on volatility)
+    // 2. Less than 1 min to expiry → close regardless of PnL
     if (pos.costBasis > 0 && pos.unrealizedPnl < 0) {
+      const tau = (market.expiresAt - Date.now()) / 60000;
+      const btcPrice = _btc.price > 0 ? _btc.price : 63000;
+      const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
+      const dynSlPct = Math.max(0.05, Math.min(0.20, atrPct * 12));
       const lossPct = -pos.unrealizedPnl / pos.costBasis;
-      if (lossPct >= config.stopLossPct) {
+      
+      if (lossPct >= dynSlPct) {
         stopLossTriggers.push({
           posId,
           marketId: pos.marketId,
-          reason: `stop_loss_${(lossPct * 100).toFixed(0)}pct`,
+          reason: `dyn_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
+        });
+      } else if (tau < 1) {
+        stopLossTriggers.push({
+          posId,
+          marketId: pos.marketId,
+          reason: `stop_loss_1min_to_expiry`,
         });
       }
     }
