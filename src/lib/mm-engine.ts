@@ -519,8 +519,8 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
       upAsks: upBook?.asks ?? [],
       downBids: downBook?.bids ?? [],
       downAsks: downBook?.asks ?? [],
-      volume: parseFloat(data.volume24hr || data.volume || "0"),
-      liquidity: parseFloat(data.liquidity || "0"),
+      volume: parseFloat(data.volumeNum || data.volume || data.volume24hr || "0") || 0,
+      liquidity: parseFloat(data.liquidityNum || data.liquidity || "0") || 0,
       feeRate: takerFeeRate,
       makerFeeRate,
       isReal: true,
@@ -535,7 +535,7 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
 
 async function scanMarkets(_btc: BtcPriceData): Promise<void> {
   const now = Date.now();
-  if (now - lastScanTime < 30000) return;
+  if (now - lastScanTime < 1000) return;  // Scan every 1s
   lastScanTime = now;
 
   const discovered: Market[] = [];
@@ -555,10 +555,22 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
       const existing = Array.from(markets.values()).find(m => m.slug === slug);
       if (existing && existing.active && existing.expiresAt > now + 60000) {
         try {
-          const [upBook, downBook] = await Promise.all([
+          // Refresh order book + market data (volume, liquidity) from Gamma API
+          const [upBook, downBook, freshData] = await Promise.all([
             fetchOrderBook(existing.upTokenId).catch(() => null),
             fetchOrderBook(existing.downTokenId).catch(() => null),
+            fetch(`https://gamma-api.polymarket.com/markets/slug/${slug}`, {
+              signal: AbortSignal.timeout(5000),
+            }).then(r => r.ok ? r.json() : null).catch(() => null),
           ]);
+
+          // Update volume and liquidity from fresh API data
+          if (freshData) {
+            const freshVol = parseFloat(freshData.volumeNum || freshData.volume || freshData.volume24hr || "0") || 0;
+            const freshLiq = parseFloat(freshData.liquidityNum || freshData.liquidity || "0") || 0;
+            if (freshVol > 0) existing.volume = freshVol;
+            if (freshLiq > 0) existing.liquidity = freshLiq;
+          }
 
           if (upBook) {
             existing.realUpMid = upBook.mid;
