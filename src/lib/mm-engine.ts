@@ -662,8 +662,10 @@ function settleMarket(marketId: string, market: Market): void {
     // In live mode, CLOB handles settlement — we just update our bookkeeping
     const fee = 0; // No fee on redemption in Polymarket
 
+    const settlePnl = (settleValue - fee) - pos.costBasis;
     cashBalance += settleValue - fee;
-    realizedPnl += (settleValue - fee) - pos.costBasis;
+    realizedPnl += settlePnl;
+    recordTradeAnalytics(settlePnl, fee, 0);
 
     trades.push({
       id: uid(), marketId, side: `SETTLE_${pos.side}`,
@@ -671,6 +673,7 @@ function settleMarket(marketId: string, market: Market): void {
       totalCost: settleValue, fee,
       slippage: 0, reason: upWins ? "settle_up_wins" : "settle_down_wins",
       executedAt: Date.now(), isPaperTrade: !config.liveMode,
+      pnl: settlePnl,
     });
 
     positions.delete(posId);
@@ -1063,7 +1066,7 @@ function generateQuotes(btc: BtcPriceData): void {
       // ASK_UP — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askUp > entryPrice × 1.005 (min 0.5% profit).
       // If position is in loss, DON'T sell — hold to settlement (chance of $1).
-      const minProfitAskUp = upPos ? upPos.entryPrice * 1.005 : 0;
+      const minProfitAskUp = upPos ? upPos.entryPrice * 1.08 : 0;
       if (upQtyOwned >= qtyAskUp && askUp >= minProfitAskUp) {
         const askQty = Math.min(qtyAskUp, upQtyOwned);
         const existingAsk = findActive("ASK_UP");
@@ -1093,7 +1096,7 @@ function generateQuotes(btc: BtcPriceData): void {
 
       // ASK_DOWN — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askDown > entryPrice × 1.005 (min 0.5% profit).
-      const minProfitAskDown = downPos ? downPos.entryPrice * 1.005 : 0;
+      const minProfitAskDown = downPos ? downPos.entryPrice * 1.08 : 0;
       if (downQtyOwned >= qtyAskDown && askDown >= minProfitAskDown) {
         const askQty = Math.min(qtyAskDown, downQtyOwned);
         const existingAsk = findActive("ASK_DOWN");
@@ -1366,6 +1369,8 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 
   quote.status = "filled";
 
+  const tradePnl = side.startsWith("BID") ? 0 : (totalCost - fee - (fillQty * (positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`)?.entryPrice ?? fillPrice)));
+  if (tradePnl !== 0) recordTradeAnalytics(tradePnl, fee, GAS_FEE_ORDER);
   trades.push({
     id: uid(), marketId: quote.marketId, side,
     price: fillPrice, quantity: fillQty,
@@ -1373,6 +1378,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
     reason: isTaker ? "taker_fill" : "maker_fill",
     executedAt: Date.now(),
     isPaperTrade: true,
+    pnl: tradePnl,
   });
 }
 
@@ -1457,14 +1463,17 @@ function closePositionById(posId: string, reason: string): void {
   const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
   const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
 
+  const closePnl = (closeValue - fee) - pos.costBasis;
   cashBalance += closeValue - fee;
-  realizedPnl += (closeValue - fee) - pos.costBasis;
+  realizedPnl += closePnl;
+  recordTradeAnalytics(closePnl, fee, 0);
 
   trades.push({
     id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
     price: closePrice, quantity: pos.quantity, totalCost: closeValue,
     fee, slippage: 0, reason, executedAt: Date.now(),
     isPaperTrade: !config.liveMode,
+    pnl: closePnl,
   });
 
   // Update inventory (selling reduces net position)
@@ -1483,6 +1492,45 @@ function closePositionById(posId: string, reason: string): void {
         q.status = "cancelled";
       }
     }
+  }
+}
+
+// ─── Taker Take-Profit: sell profitable positions immediately ──
+function takerTakeProfit(): void {
+  for (const [posId, pos] of positions) {
+    const market = markets.get(pos.marketId);
+    if (!market) continue;
+
+    const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
+    if (realBid <= 0) continue;
+
+    const closePrice = tickFloor(realBid);
+    const minProfitPrice = pos.entryPrice * 1.08;  // 8% take-profit
+    if (closePrice < minProfitPrice) continue;
+
+    const sellQty = pos.quantity;
+    const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+    const fee = calcTakerFee(sellQty, closePrice, feeRate);
+    const gasFee = GAS_FEE_ORDER;
+    const closeValue = closePrice * sellQty - fee - gasFee;
+    if (closeValue <= pos.costBasis) continue;
+
+    const tpPnl = closeValue - pos.costBasis;
+    cashBalance += closeValue;
+    realizedPnl += tpPnl;
+    recordTradeAnalytics(tpPnl, fee, gasFee);
+
+    trades.push({
+      id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+      price: closePrice, quantity: sellQty, totalCost: closeValue,
+      fee, slippage: 0, reason: "taker_take_profit", executedAt: Date.now(),
+      isPaperTrade: !config.liveMode, pnl: tpPnl,
+    });
+
+    const inv = inventory.get(pos.marketId) || 0;
+    if (pos.side === "UP") inventory.set(pos.marketId, inv - sellQty);
+    else inventory.set(pos.marketId, inv + sellQty);
+    positions.delete(posId);
   }
 }
 
@@ -1539,14 +1587,17 @@ function closePositionsForMarket(marketId: string, reason: string): void {
     const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
     const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
 
+    const exitPnl = (closeValue - fee) - pos.costBasis;
     cashBalance += closeValue - fee;
-    realizedPnl += (closeValue - fee) - pos.costBasis;
+    realizedPnl += exitPnl;
+    recordTradeAnalytics(exitPnl, fee, 0);
 
     trades.push({
       id: uid(), marketId, side: `SELL_${pos.side}`,
       price: closePrice, quantity: pos.quantity, totalCost: closeValue,
       fee, slippage: 0, reason: `${reason}_profit`, executedAt: Date.now(),
       isPaperTrade: !config.liveMode,
+      pnl: exitPnl,
     });
 
     positions.delete(posId);
@@ -1630,6 +1681,7 @@ export async function runTradingCycle(): Promise<void> {
   }
 
   markToMarket(btc);
+  takerTakeProfit();
   autoExit();
   takePnLSnapshot();
 
