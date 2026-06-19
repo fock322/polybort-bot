@@ -820,12 +820,12 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
 
     // Filter 2: Minimum volume — need real traders to fill our quotes
-    // BTC 15-min markets with < $1000 volume are too illiquid for MM
-    const MIN_VOLUME_USD = 1000;
+    // Lowered from $1000 to $100 — BTC 15-min markets start slow but are tradeable
+    const MIN_VOLUME_USD = 100;
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
-    const MIN_LIQUIDITY_USD = 500;
+    const MIN_LIQUIDITY_USD = 200;
     if (market.liquidity < MIN_LIQUIDITY_USD) continue;
 
     const inv = inventory.get(marketId) || 0;
