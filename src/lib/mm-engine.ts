@@ -329,7 +329,10 @@ function calcTakerFee(shares: number, price: number, feeRate: number = DEFAULT_T
 }
 
 function calcMakerRebate(shares: number, price: number, feeRate: number = DEFAULT_TAKER_FEE_RATE): number {
-  return shares * feeRate * price * (1 - price) * MAKER_REBATE_PCT;
+  // BUG FIX: Polymarket does NOT pay per-fill maker rebate.
+  // The rebate program is protocol-level, not per-trade.
+  // Setting to 0 prevents inflated cashBalance and realizedPnl.
+  return 0;
 }
 
 // ─── 15-Minute Slot ───────────────────────────────────────
@@ -444,7 +447,7 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
     try {
       const takerBaseBPS = parseInt(data.takerBaseFee || "0", 10);
       const makerBaseBPS = parseInt(data.makerBaseFee || "0", 10);
-      if (takerBaseBPS > 0) takerFeeRate = takerBaseBPS / 14000;
+      if (takerBaseBPS > 0) takerFeeRate = takerBaseBPS / 10000;  // BUG FIX: was /14000
       if (makerBaseBPS > 0) makerFeeRate = makerBaseBPS / 10000;
     } catch { /* defaults */ }
 
@@ -606,11 +609,14 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
   for (const m of discovered) markets.set(m.id, m);
 
   // Cleanup expired + settle
+  // BUG FIX: call settleMarket BEFORE deleting from map (was reversed)
+  // If settleMarket falls back to closePositionsForMarket, it needs
+  // the market to still be in the map to look up bid/ask prices.
   const cutoff = now - 30 * 60 * 1000;
   for (const [id, m] of markets) {
     if (m.expiresAt < cutoff) {
-      markets.delete(id);
-      settleMarket(id, m);
+      settleMarket(id, m);   // settle FIRST
+      markets.delete(id);     // then remove
     }
   }
 
@@ -1390,7 +1396,9 @@ function markToMarket(_btc: BtcPriceData): void {
     closePositionById(t.posId, t.reason);
   }
 
-  const totalPnl = (cashBalance - config.startingBalance) + totalUnrealized;
+  // BUG FIX: totalPnl was (cash - starting) + unrealized, which double-counts
+  // the cost of open positions. Correct formula: realizedPnl + unrealizedPnl
+  const totalPnl = realizedPnl + totalUnrealized;
   if (-totalPnl / config.startingBalance > config.circuitBreakerPct) {
     circuitBreaker = true;
     console.error(`[MM] CIRCUIT BREAKER: totalPnl=${totalPnl.toFixed(2)}, threshold=${config.circuitBreakerPct}`);
@@ -1399,7 +1407,10 @@ function markToMarket(_btc: BtcPriceData): void {
   // Live mode: daily loss check
   if (config.liveMode) {
     checkDailyReset();
-    const dailyPnl = cashBalance - dailyStartBalance;
+    // BUG FIX: dailyPnL was cash-only, ignoring open positions
+    // Now includes unrealized PnL to prevent false circuit breaker trips
+    const openValue = Array.from(positions.values()).reduce((s, p) => s + p.currentValue, 0);
+    const dailyPnl = (cashBalance + openValue) - dailyStartBalance;
     if (dailyStartBalance > 0 && -dailyPnl / dailyStartBalance > LIVE_MAX_DAILY_LOSS_PCT) {
       circuitBreaker = true;
       console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: dailyPnl=${dailyPnl.toFixed(2)}, maxLoss=${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}%`);
@@ -1485,8 +1496,21 @@ function closePositionsForMarket(marketId: string, reason: string): void {
 
     // Smart exit: only sell if in profit
     if (closePrice < pos.entryPrice) {
-      // In loss — hold to settlement, don't realize the loss
-      continue;
+      // BUG FIX: EV-based hold-vs-sell instead of unconditional hold
+      // Old: always hold losers to settlement (loses $0.70 instead of $0.55)
+      // New: only hold if P(win) > bid price (positive expected value)
+      // If P(win) < bid → sell now, salvage partial value
+      const btcNow = cachedBtcPrice > 0 ? cachedBtcPrice : 0;
+      const pWin = pos.side === "UP" 
+        ? calcUpProbability(market, { price: btcNow, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" } as any)
+        : 1 - calcUpProbability(market, { price: btcNow, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" } as any);
+      
+      if (pWin > closePrice) {
+        // P(win) > bid → positive EV to hold, keep position
+        continue;
+      }
+      // P(win) < bid → sell now, salvage what we can
+      // Fall through to sell logic below
     }
 
     // In profit — sell now, lock the gain
