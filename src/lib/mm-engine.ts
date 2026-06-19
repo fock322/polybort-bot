@@ -189,6 +189,7 @@ export interface BotStatus {
   totalPnl: number;
   realizedPnl: number;
   unrealizedPnl: number;
+  positionsValue: number;  // BUG FIX (2026-06-20): total $ in open positions
   circuitBreaker: boolean;
   uptime: number;
   btcPrice: number;
@@ -2190,6 +2191,9 @@ export function getStatus(btc: BtcPriceData): BotStatus {
     startingBalance: config.startingBalance,
     positionCount: positions.size, activeMarkets: markets.size,
     totalPnl, realizedPnl, unrealizedPnl: totalUnrealized,
+    // BUG FIX (2026-06-20): positionsValue was missing in API response
+    // Dashboard used d.positionsValue but field didn't exist → showed $0.00
+    positionsValue: openValueNow,
     circuitBreaker, uptime: running ? Date.now() - startTime : 0,
     btcPrice: btc.price, btcTrend: btc.trend,
     quoteCount: Array.from(quotes.values()).filter(q => q.status === "active").length,

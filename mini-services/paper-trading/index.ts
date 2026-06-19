@@ -172,7 +172,10 @@ function updateUI(d){
   document.getElementById('statusDot').className='status-dot '+(running?'running':'stopped');
   document.getElementById('statusText').textContent=running?'🟢 Бот работает':'🔴 Бот остановлен';
   document.getElementById('balance').textContent='$'+(d.balance||0).toFixed(2);
-  document.getElementById('cashSub').textContent='Наличные: $'+(d.cashBalance||0).toFixed(2)+' | В позициях: $'+(d.positionsValue||0).toFixed(2);
+  // BUG FIX (2026-06-20): positionsValue was missing from API → showed $0.00 always
+  // Now backend returns positionsValue (sum of currentValue across open positions)
+  const posVal=d.positionsValue||0;
+  document.getElementById('cashSub').innerHTML='Наличные: <strong>$'+(d.cashBalance||0).toFixed(2)+'</strong> | В позициях: <strong style="color:'+(posVal>0?'#22c55e':'#71717a')+'">$'+posVal.toFixed(2)+'</strong>';
   const pnl=d.totalPnl||0;
   const pnlEl=document.getElementById('pnl');
   pnlEl.textContent=(pnl>=0?'+':'')+'$'+pnl.toFixed(2);
@@ -209,7 +212,42 @@ function updateUI(d){
   if(d.markets&&d.markets.length>0){mktEl.innerHTML=d.markets.map(m=>{const q=(m.question||'?').substring(0,50);const v=(m.volume||0).toLocaleString('en-US',{maximumFractionDigits:0});const b=(m.realUpBestBid||0).toFixed(2);const a=(m.realUpBestAsk||0).toFixed(2);const exp=m.expiresAt||0;const now=Date.now();const ml=Math.max(0,(exp-now)/60000);const mn=Math.floor(ml);const sc=Math.floor((ml-mn)*60);const ts=mn<1?sc+'s':mn+'m '+sc+'s';const tc=ml<3?'#ef4444':ml<5?'#f59e0b':'#71717a';return '<div class="row"><span class="row-label">'+q+'<br><small style="color:'+tc+'">⏱ '+ts+' • bid '+b+' • ask '+a+'</small></span><span class="row-value">Vol $'+v+'</span></div>';}).join('');}else{mktEl.innerHTML='<div class="empty">Нет рынков</div>';}
 }
 async function fetchTrades(){try{const r=await fetch(API+'/trades');const d=await r.json();const t=d.trades||[];const el=document.getElementById('tradesList');if(t.length===0){el.innerHTML='<div class="empty">Нет сделок</div>';return;}el.innerHTML=t.slice(0,15).map(t=>{const s=t.side||'?';const p=(t.price||0).toFixed(2);const q=t.quantity||0;const rs=t.reason||'?';const pnl=t.pnl||0;const ps=pnl!==0?(pnl>0?'+':'')+'$'+pnl.toFixed(4):'—';const pc=pnl>0?'pnl-positive':pnl<0?'pnl-negative':'';const ts=new Date(t.executedAt||0).toLocaleTimeString('ru-RU');return '<div class="row"><span class="row-label">'+ts+' • '+s+' '+q+'@$'+p+' <small>('+rs+')</small></span><span class="row-value '+pc+'">'+ps+'</span></div>';}).join('');}catch(e){}}
-async function fetchAnalytics(){try{const r=await fetch(API+'/analytics');const a=await r.json();const el=document.getElementById('analytics');const wr=(a.winRate*100).toFixed(1);const wc=a.winRate>=0.8?'#22c55e':a.winRate>=0.6?'#f59e0b':'#ef4444';const pf=isFinite(a.profitFactor)?a.profitFactor.toFixed(2):'∞';const pfc=a.profitFactor>=1.5?'#22c55e':a.profitFactor>=1.0?'#f59e0b':'#ef4444';el.innerHTML='<div class="row"><span class="row-label">Win Rate</span><span class="row-value" style="color:'+wr+'">'+wr+'%</span></div>'.replace('style="color:'+wr+'"','style="color:'+wc+'"')+'<div class="row"><span class="row-label">Побед / Поражений</span><span class="row-value">🟢 '+a.totalWins+' / 🔴 '+a.totalLosses+'</span></div><div class="row"><span class="row-label">Сумма выигрышей</span><span class="row-value pnl-positive">+$'+a.totalWinAmount.toFixed(2)+'</span></div><div class="row"><span class="row-label">Сумма проигрышей</span><span class="row-value pnl-negative">-$'+a.totalLossAmount.toFixed(2)+'</span></div><div class="row"><span class="row-label">Чистая прибыль</span><span class="row-value '+(a.netProfit>=0?'pnl-positive':'pnl-negative')+'">'+(a.netProfit>=0?'+':'')+'$'+a.netProfit.toFixed(2)+'</span></div><div class="row"><span class="row-label">Profit Factor</span><span class="row-value" style="color:'+pfc+'">'+pf+'</span></div><div class="row"><span class="row-label">Gas + Fees</span><span class="row-label">-$'+(a.totalGasPaid+a.totalFeesPaid).toFixed(4)+'</span></div>';}catch(e){}}
+async function fetchAnalytics(){
+  try{
+    const r=await fetch(API+'/analytics');
+    if(!r.ok){document.getElementById('analytics').innerHTML='<div class="empty">Ошибка аналитики: HTTP '+r.status+'</div>';return;}
+    const a=await r.json();
+    const el=document.getElementById('analytics');
+    // BUG FIX (2026-06-20): removed fragile .replace() pattern that broke when winRate=0
+    // Now using template literals with proper color directly
+    const wr=((a.winRate||0)*100).toFixed(1);
+    const wc=(a.winRate||0)>=0.8?'#22c55e':(a.winRate||0)>=0.6?'#f59e0b':'#ef4444';
+    const pfRaw=a.profitFactor||0;
+    const pf=isFinite(pfRaw)&&pfRaw>0?pfRaw.toFixed(2):pfRaw===0?'—':'∞';
+    const pfc=pfRaw>=1.5?'#22c55e':pfRaw>=1.0?'#f59e0b':'#ef4444';
+    const netProfit=a.netProfit||0;
+    const npc=netProfit>=0?'pnl-positive':'pnl-negative';
+    const totalTrades=a.totalTrades||0;
+    if(totalTrades===0){
+      el.innerHTML='<div class="empty">Нет закрытых сделок для аналитики</div>';
+      return;
+    }
+    const rows=[
+      ['Win Rate','<span style="color:'+wc+';font-weight:600;">'+wr+'%</span>'],
+      ['Побед / Поражений','🟢 '+(a.totalWins||0)+' / 🔴 '+(a.totalLosses||0)],
+      ['Сумма выигрышей','<span class="pnl-positive">+$'+(a.totalWinAmount||0).toFixed(4)+'</span>'],
+      ['Сумма проигрышей','<span class="pnl-negative">-$'+(a.totalLossAmount||0).toFixed(4)+'</span>'],
+      ['Чистая прибыль','<span class="'+npc+'">'+(netProfit>=0?'+':'')+'$'+netProfit.toFixed(4)+'</span>'],
+      ['Profit Factor','<span style="color:'+pfc+';font-weight:600;">'+pf+'</span>'],
+      ['Средняя прибыль','+$'+(a.avgWin||0).toFixed(4)],
+      ['Средний убыток','-$'+(a.avgLoss||0).toFixed(4)],
+      ['Gas + Fees','<span class="pnl-negative">-$'+((a.totalGasPaid||0)+(a.totalFeesPaid||0)).toFixed(4)+'</span>']
+    ];
+    el.innerHTML=rows.map(r=>'<div class="row"><span class="row-label">'+r[0]+'</span><span class="row-value">'+r[1]+'</span></div>').join('');
+  }catch(e){
+    document.getElementById('analytics').innerHTML='<div class="empty">Ошибка аналитики: '+(e.message||e)+'</div>';
+  }
+}
 async function sendCommand(cmd){try{await fetch(API+'/'+cmd,{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
 fetchStatus();fetchTrades();fetchAnalytics();
 setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);
