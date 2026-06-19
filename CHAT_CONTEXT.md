@@ -94,6 +94,69 @@
 
 ---
 
+## ИСПРАВЛЕНО 2026-06-20: TP не срабатывал при +16% unrealized PnL
+
+**Симптом**: Позиция UP entry $0.12, qty=30, PnL=+$0.60 (16.7% gain), но realized PnL = $0.00.
+TP должен был сработать (threshold $0.1296), но не сработал.
+
+**Корневые причины**:
+
+### Bug #1: Несоответствие mid vs bid price
+- `markToMarket()` использует `realUpMid` (MID) для unrealized PnL → показывает +$0.60
+- `takerTakeProfit()` использует `realUpBestBid` (BID) для TP проверки
+- На Polymarket BTC 15-min рынках spread = 2-4¢
+- Пример: bid=$0.12, ask=$0.16, mid=$0.14
+  - mid PnL = +16.7% (показывает +$0.60)
+  - bid closePrice = $0.12 < TP threshold $0.1296 → TP не срабатывает!
+
+### Bug #2: realBid=0 → позиция зависает
+- `takerTakeProfit()`: `if (realBid <= 0) continue;` — пропускает позицию
+- На истёкших/малоликвидных рынках стакан пустой → позиция зависает со stale PnL
+
+### Bug #3: Orphaned positions на истёкших рынках
+- `settleMarket()` вызывается из `scanMarkets()` для истёкших рынков
+- Если `cachedBtcPrice <= 0` → вызывается `closePositionsForMarket("expiry_no_price")`
+- `closePositionsForMarket` имеет `if (closePrice <= 0) continue;` → пропускает
+- Позиция остаётся в `positions` map, рынок удалён из `markets` map
+- `takerTakeProfit()` и `markToMarket()` пропускают с `if (!market) continue;`
+- PnL остаётся stale навсегда
+
+### Исправления (commit pending):
+
+1. **`takerTakeProfit()`**:
+   - Fallback на mid-1tick если bid=0
+   - Diagnostic logging: показывает bid/ask/mid/spread/closePrice/TP threshold
+   - Логирует только если midPnL >= 5% (чтобы не спамить)
+   - Логирует успешные TP срабатывания с PnL
+
+2. **`closePositionsForMarket()`**:
+   - Тот же fallback на mid если bid=0
+
+3. **Новая функция `cleanupOrphanedPositions()`**:
+   - Запускается каждый цикл после autoExit
+   - Находит позиции, чьих рынков нет в `markets` map
+   - Settles их по правилу: UP wins if BTC > entryStrikePrice, иначе DOWN wins
+   - Если нет BTC цены — закрывает по $0 (total loss)
+   - Записывает в trades с reason "orphaned_settle_win" / "orphaned_settle_loss"
+
+4. **`Position` interface**:
+   - Добавлено поле `entryStrikePrice: number`
+   - Устанавливается при открытии позиции = `market.strikePrice`
+
+5. **`getPositions()` API**:
+   - Возвращает расширенные данные: currentBid, currentAsk, currentMid, spread, tpThreshold, closePrice, midPnlPct, bidPnlPct, tpReady, marketExpired, timeToExpiryMin
+
+6. **Dashboard (paper-trading)**:
+   - Для каждой позиции показывает:
+     - bid/ask/mid/spread (с цветовым кодированием: красный при spread >= 4¢)
+     - TP threshold и closePrice (реальная цена продажи)
+     - midPnL% и bidPnL%
+     - ✅ TP READY / ❌ TP wait индикатор
+     - ⚠️ MARKET EXPIRED для orphaned позиций
+     - ⏰ время до экспирации если < 3 мин
+
+---
+
 ## VPS СЕРВЕР
 - IP: 151.245.140.23
 - Login: root

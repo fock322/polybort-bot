@@ -184,7 +184,27 @@ function updateUI(d){
   const up=(d.uptime||0)/1000;const h=Math.floor(up/3600);const m=Math.floor((up%3600)/60);
   document.getElementById('uptimeSub').textContent='Время работы: '+h+'ч '+m+'м';
   const posEl=document.getElementById('positions');
-  if(d.positions&&d.positions.length>0){posEl.innerHTML=d.positions.map(p=>{const u=p.unrealizedPnl||0;const c=u>=0?'pnl-positive':'pnl-negative';return '<div class="row"><span class="row-label">'+p.side+' • qty='+p.quantity+' • вход $'+(p.entryPrice||0).toFixed(2)+'</span><span class="row-value '+c+'">'+(u>=0?'+':'')+'$'+u.toFixed(2)+'</span></div>';}).join('');}else{posEl.innerHTML='<div class="empty">Нет позиций</div>';}
+  if(d.positions&&d.positions.length>0){posEl.innerHTML=d.positions.map(p=>{
+    const u=p.unrealizedPnl||0;const c=u>=0?'pnl-positive':'pnl-negative';
+    const bid=(p.currentBid||0).toFixed(2);const ask=(p.currentAsk||0).toFixed(2);
+    const mid=(p.currentMid||0).toFixed(2);const sp=(p.spread||0).toFixed(2);
+    const tp=(p.tpThreshold||0).toFixed(4);const cp=(p.closePrice||0).toFixed(2);
+    const midPnl=(p.midPnlPct||0).toFixed(1);const bidPnl=(p.bidPnlPct||0).toFixed(1);
+    const ready=p.tpReady?' ✅ TP READY':' ❌ TP wait';
+    const expired=p.marketExpired?' ⚠️ MARKET EXPIRED':'';
+    const tte=p.timeToExpiryMin?(p.timeToExpiryMin<3?' ⏰ '+p.timeToExpiryMin.toFixed(1)+'m':''):'';
+    const spc=sp>=0.04?'#ef4444':sp>=0.02?'#f59e0b':'#71717a';
+    return '<div class="row" style="flex-direction:column;align-items:stretch;padding:10px 0;">'+
+      '<div style="display:flex;justify-content:space-between;">'+
+        '<span class="row-label">'+p.side+' • qty='+p.quantity+' • вход $'+(p.entryPrice||0).toFixed(2)+expired+tte+'</span>'+
+        '<span class="row-value '+c+'">'+(u>=0?'+':'')+'$'+u.toFixed(2)+'</span>'+
+      '</div>'+
+      '<small style="color:#52525b;margin-top:4px;display:block;">'+
+        'bid $'+bid+' • ask $'+ask+' • mid $'+mid+' • spread <span style="color:'+spc+'">'+sp+'¢</span> | '+
+        'TP>$'+tp+' • close@'+cp+' | midPnL '+midPnl+'% • bidPnL '+bidPnl+'%'+ready+
+      '</small>'+
+    '</div>';
+  }).join('');}else{posEl.innerHTML='<div class="empty">Нет позиций</div>';}
   const mktEl=document.getElementById('markets');
   if(d.markets&&d.markets.length>0){mktEl.innerHTML=d.markets.map(m=>{const q=(m.question||'?').substring(0,50);const v=(m.volume||0).toLocaleString('en-US',{maximumFractionDigits:0});const b=(m.realUpBestBid||0).toFixed(2);const a=(m.realUpBestAsk||0).toFixed(2);const exp=m.expiresAt||0;const now=Date.now();const ml=Math.max(0,(exp-now)/60000);const mn=Math.floor(ml);const sc=Math.floor((ml-mn)*60);const ts=mn<1?sc+'s':mn+'m '+sc+'s';const tc=ml<3?'#ef4444':ml<5?'#f59e0b':'#71717a';return '<div class="row"><span class="row-label">'+q+'<br><small style="color:'+tc+'">⏱ '+ts+' • bid '+b+' • ask '+a+'</small></span><span class="row-value">Vol $'+v+'</span></div>';}).join('');}else{mktEl.innerHTML='<div class="empty">Нет рынков</div>';}
 }

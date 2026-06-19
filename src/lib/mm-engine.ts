@@ -111,6 +111,7 @@ export interface Position {
   // ── Inventory management v2 ──
   entryMid: number;  // market mid price at position open (for adverse selection detection)
   peakValue: number; // peak currentValue (for trailing stop in future)
+  entryStrikePrice: number;  // strike price at position open (for orphaned position settlement)
 }
 
 export interface Trade {
@@ -1360,6 +1361,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
         isRealPosition: false,
         entryMid,
         peakValue: totalCost,
+        entryStrikePrice: market.strikePrice,  // for orphaned position settlement
       });
     }
   }
@@ -1505,29 +1507,87 @@ function closePositionById(posId: string, reason: string): void {
 }
 
 // ─── Taker Take-Profit: sell profitable positions immediately ──
+// BUG FIX (2026-06-20): TP не срабатывал даже при +16% unrealized PnL.
+// Причины:
+//   1. markToMarket использует MID price для unrealized PnL
+//   2. takerTakeProfit использует BID price для TP проверки
+//   3. На Polymarket BTC 15-min рынках spread может быть 2-4¢
+//      → mid=$0.14, bid=$0.12, TP threshold=$0.1296 → TP не срабатывает
+//   4. Если realBid=0 (пустой стакан), позиция зависает
+//
+// Решение:
+//   - Fallback на mid price если bid=0 (с buffer 1¢ на slippage)
+//   - Diagnostic logging: показывает почему TP не сработал
+//   - Если closeValue <= costBasis после fees, пропускаем (с логированием)
 function takerTakeProfit(): void {
   for (const [posId, pos] of positions) {
     const market = markets.get(pos.marketId);
-    if (!market) continue;
+    if (!market) {
+      // Orphaned position: рынок истёк и был удалён из markets map.
+      // settleMarket() должен был обработать, но если не смог — закрываем по $0/$1
+      console.warn(`[TP] Orphaned position ${posId} on ${pos.marketId} — market not in map. Skipping (will be settled).`);
+      continue;
+    }
 
     const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
-    if (realBid <= 0) continue;
+    const realMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
+    const realAsk = pos.side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
 
-    const closePrice = tickFloor(realBid);
+    // Fallback: если bid=0, но mid>0, используем mid-1¢ как close price
+    // Это моделирует sell по чуть худшей цене чем mid (taker order)
+    let closePrice: number;
+    let slippageNote = "";
+    if (realBid > 0) {
+      closePrice = tickFloor(realBid);
+    } else if (realMid > 0) {
+      // Нет bid, но есть mid — используем mid - 1¢ (1 тик slippage)
+      closePrice = tickFloor(Math.max(TICK_SIZE, realMid - TICK_SIZE));
+      slippageNote = " (fallback: mid-1tick, no bid)";
+      console.warn(`[TP] No bid for ${pos.side} on ${market.slug}, using mid fallback: $${closePrice.toFixed(2)} (mid=$${realMid.toFixed(2)})`);
+    } else {
+      // Нет ни bid, ни mid — пропускаем
+      continue;
+    }
+
     const minProfitPrice = pos.entryPrice * 1.08;  // 8% take-profit
-    if (closePrice < minProfitPrice) continue;
+    if (closePrice < minProfitPrice) {
+      // Diagnostic logging — показывает пользователю ПОЧЕМУ TP не сработал
+      const spread = realAsk > 0 && realBid > 0 ? (realAsk - realBid) : 0;
+      const midPnl = realMid > 0 ? (realMid - pos.entryPrice) / pos.entryPrice * 100 : 0;
+      if (midPnl >= 5) {
+        // Логируем только если mid уже показывает заметную прибыль (>=5%)
+        console.log(
+          `[TP] Skipping ${pos.side} pos ${posId}: closePrice=$${closePrice.toFixed(2)} < TP=$${minProfitPrice.toFixed(4)} | ` +
+          `bid=$${realBid.toFixed(2)} ask=$${realAsk.toFixed(2)} mid=$${realMid.toFixed(2)} spread=${spread.toFixed(2)}¢ | ` +
+          `entry=$${pos.entryPrice.toFixed(2)} midPnL=${midPnl.toFixed(1)}%${slippageNote}`
+        );
+      }
+      continue;
+    }
 
     const sellQty = pos.quantity;
     const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
     const fee = calcTakerFee(sellQty, closePrice, feeRate);
     const gasFee = GAS_FEE_ORDER;
     const closeValue = closePrice * sellQty - fee - gasFee;
-    if (closeValue <= pos.costBasis) continue;
+    if (closeValue <= pos.costBasis) {
+      console.log(
+        `[TP] closeValue=$${closeValue.toFixed(4)} <= costBasis=$${pos.costBasis.toFixed(4)} ` +
+        `(fee=$${fee.toFixed(4)} gas=$${gasFee}) — net loss after fees, skipping`
+      );
+      continue;
+    }
 
     const tpPnl = closeValue - pos.costBasis;
     cashBalance += closeValue;
     realizedPnl += tpPnl;
     recordTradeAnalytics(tpPnl, fee, gasFee);
+
+    console.log(
+      `[TP] ✅ TAKE-PROFIT triggered: ${pos.side} ${sellQty}@$${closePrice.toFixed(2)} ` +
+      `(entry $${pos.entryPrice.toFixed(2)}, +${((closePrice/pos.entryPrice - 1) * 100).toFixed(1)}%) ` +
+      `PnL=+$${tpPnl.toFixed(4)} (fee=$${fee.toFixed(4)}, gas=$${gasFee})${slippageNote}`
+    );
 
     trades.push({
       id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
@@ -1565,12 +1625,21 @@ function closePositionsForMarket(marketId: string, reason: string): void {
     if (pos.marketId !== marketId) continue;
 
     const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
-    const closePrice = clamp(
-      realBid > 0 ? tickFloor(realBid) : 0,
-      TICK_SIZE, 1 - TICK_SIZE
-    );
+    const realMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
 
-    if (closePrice <= 0) continue;
+    // BUG FIX (2026-06-20): fallback на mid если bid=0
+    // Раньше: if (closePrice <= 0) continue; → позиция зависала навсегда
+    // Теперь: используем mid-1tick как fallback close price
+    let closePrice: number;
+    if (realBid > 0) {
+      closePrice = clamp(tickFloor(realBid), TICK_SIZE, 1 - TICK_SIZE);
+    } else if (realMid > 0) {
+      closePrice = clamp(tickFloor(Math.max(TICK_SIZE, realMid - TICK_SIZE)), TICK_SIZE, 1 - TICK_SIZE);
+      console.warn(`[EXIT] No bid for ${pos.side} on ${market.slug}, using mid fallback: $${closePrice.toFixed(2)}`);
+    } else {
+      // Нет ни bid, ни mid — пропускаем (settleMarket обработает по BTC outcome)
+      continue;
+    }
 
     // Smart exit: only sell if in profit
     if (closePrice < pos.entryPrice) {
@@ -1627,6 +1696,75 @@ function closePositionsForMarket(marketId: string, reason: string): void {
     if (client?.connected) {
       client.cancelMarketOrders(market.conditionId).catch(() => {});
     }
+  }
+}
+
+// ─── Cleanup Orphaned Positions ───────────────────────────
+// BUG FIX (2026-06-20): позиции на рынках, которые больше не в markets map
+// (например, истекли и были удалены, или Gamma API больше не возвращает)
+// зависают навсегда со stale unrealized PnL.
+// Эта функция запускается каждый цикл и форсирует settlement таких позиций
+// по правилу: UP wins if BTC > strike, иначе DOWN wins.
+function cleanupOrphanedPositions(): void {
+  if (positions.size === 0) return;
+
+  const orphaned: Array<[string, Position]> = [];
+  for (const [posId, pos] of positions) {
+    if (!markets.has(pos.marketId)) {
+      orphaned.push([posId, pos]);
+    }
+  }
+
+  if (orphaned.length === 0) return;
+
+  console.warn(`[CLEANUP] Found ${orphaned.length} orphaned position(s) — settling by BTC outcome`);
+
+  for (const [posId, pos] of orphaned) {
+    const btc = cachedBtcPrice;
+    if (btc <= 0) {
+      // Нет цены BTC — не можем определить outcome. Закрываем по $0 (total loss).
+      console.warn(`[CLEANUP] No BTC price for orphaned ${pos.side} pos ${posId} — closing at $0`);
+      const settleValue = 0;
+      const settlePnl = settleValue - pos.costBasis;
+      realizedPnl += settlePnl;
+      recordTradeAnalytics(settlePnl, 0, 0);
+      trades.push({
+        id: uid(), marketId: pos.marketId, side: `SETTLE_${pos.side}`,
+        price: 0, quantity: pos.quantity, totalCost: 0, fee: 0,
+        slippage: 0, reason: "orphaned_no_btc_price", executedAt: Date.now(),
+        isPaperTrade: !config.liveMode, pnl: settlePnl,
+      });
+      positions.delete(posId);
+      continue;
+    }
+
+    // Нет strike price — используем entry price как approximation
+    // (если рынок истёк, а strike не был установлен)
+    const strike = pos.entryStrikePrice > 0 ? pos.entryStrikePrice : btc;
+    const upWins = btc > strike;
+    const wins = (pos.side === "UP" && upWins) || (pos.side === "DOWN" && !upWins);
+    const resolvedPrice = wins ? 1.0 : 0.0;
+    const settleValue = pos.quantity * resolvedPrice;
+    const settlePnl = settleValue - pos.costBasis;
+
+    cashBalance += settleValue;
+    realizedPnl += settlePnl;
+    recordTradeAnalytics(settlePnl, 0, 0);
+
+    console.log(
+      `[CLEANUP] Settled orphaned ${pos.side} pos ${posId}: ` +
+      `BTC=$${btc.toFixed(2)} strike=$${strike.toFixed(2)} → ${wins ? 'WIN' : 'LOSS'} ` +
+      `PnL=${settlePnl >= 0 ? '+' : ''}$${settlePnl.toFixed(4)}`
+    );
+
+    trades.push({
+      id: uid(), marketId: pos.marketId, side: `SETTLE_${pos.side}`,
+      price: resolvedPrice, quantity: pos.quantity, totalCost: settleValue, fee: 0,
+      slippage: 0, reason: wins ? "orphaned_settle_win" : "orphaned_settle_loss",
+      executedAt: Date.now(), isPaperTrade: !config.liveMode, pnl: settlePnl,
+    });
+
+    positions.delete(posId);
   }
 }
 
@@ -1692,6 +1830,7 @@ export async function runTradingCycle(): Promise<void> {
   markToMarket(btc);
   takerTakeProfit();
   autoExit();
+  cleanupOrphanedPositions();  // BUG FIX (2026-06-20): settle positions on expired/missing markets
   takePnLSnapshot();
 
   persistState();
@@ -1789,6 +1928,7 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
             isRealPosition: true,
             entryMid,
             peakValue: totalCost,
+            entryStrikePrice: market.strikePrice,  // for orphaned position settlement
           });
         }
       } else {
@@ -2097,7 +2237,38 @@ export function getMarkets(btc: BtcPriceData) {
 }
 
 export function getPositions() {
-  return Array.from(positions.values());
+  // BUG FIX (2026-06-20): добавляем bid/ask/mid/spread в выдачу
+  // чтобы пользователь видел ПОЧЕМУ TP не срабатывает
+  return Array.from(positions.values()).map(pos => {
+    const market = markets.get(pos.marketId);
+    if (!market) {
+      return {
+        ...pos,
+        currentBid: 0, currentAsk: 0, currentMid: 0, spread: 0,
+        tpThreshold: pos.entryPrice * 1.08,
+        midPnlPct: 0, bidPnlPct: 0,
+        tpReady: false, marketExpired: true,
+      };
+    }
+    const currentBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
+    const currentAsk = pos.side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
+    const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
+    const spread = (currentAsk > 0 && currentBid > 0) ? currentAsk - currentBid : 0;
+    const tpThreshold = pos.entryPrice * 1.08;
+    const closePrice = currentBid > 0 ? Math.floor(currentBid * 100) / 100 : 0;
+    const midPnlPct = currentMid > 0 ? (currentMid / pos.entryPrice - 1) * 100 : 0;
+    const bidPnlPct = closePrice > 0 ? (closePrice / pos.entryPrice - 1) * 100 : 0;
+    return {
+      ...pos,
+      currentBid, currentAsk, currentMid, spread,
+      tpThreshold,
+      closePrice,  // цена по которой бот сможет реально продать (bid floored)
+      midPnlPct, bidPnlPct,
+      tpReady: closePrice >= tpThreshold,
+      marketExpired: false,
+      timeToExpiryMin: Math.max(0, (market.expiresAt - Date.now()) / 60000),
+    };
+  });
 }
 
 export function getTrades(limit = 50) {
