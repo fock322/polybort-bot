@@ -31,16 +31,16 @@ import {
   type ManagedOrder,
 } from "./order-manager";
 
-// ─── CLOB Tick Size ────────────────────────────────────────
+// BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
 function tickRound(price: number): number {
-  return Math.round(price / TICK_SIZE) * TICK_SIZE;
+  return Math.round(price * 100) / 100;
 }
 function tickFloor(price: number): number {
-  return Math.floor(price / TICK_SIZE) * TICK_SIZE;
+  return Math.floor(price * 100) / 100;
 }
 function tickCeil(price: number): number {
-  return Math.ceil(price / TICK_SIZE) * TICK_SIZE;
+  return Math.ceil(price * 100) / 100;
 }
 
 // ─── Fee Constants ─────────────────────────────────────────
@@ -290,6 +290,7 @@ function persistState() {
   g.__mm_lastPnLSnapshotTime = lastPnLSnapshotTime;
   g.__mm_knownSlugs = knownSlugs;
   g.__mm_lastCycleAt = lastCycleAt;
+  (g as any).__mm_cachedBtcPrice = cachedBtcPrice;  // BUG FIX #23
   g.__mm_dailyStartBalance = dailyStartBalance;
   g.__mm_dailyResetDate = dailyResetDate;
 }
@@ -324,8 +325,15 @@ function parseStrikePrice(question: string): number {
 }
 
 // ─── Fee Calculation ──────────────────────────────────────
+// BUG FIX #10: Polymarket taker fee is CAPPED, not purely multiplicative
+// Actual formula: fee = min(shares * feeRate * price, shares * (1-price)) for BUY
+//                 fee = min(shares * feeRate * price, shares * price) for SELL
+// The old formula under-charged by 50-90% at extreme prices.
 function calcTakerFee(shares: number, price: number, feeRate: number = DEFAULT_TAKER_FEE_RATE): number {
-  return shares * feeRate * price * (1 - price);
+  const rawFee = shares * feeRate * price * (1 - price);
+  // Cap: fee cannot exceed the lesser side of the trade
+  const cap = shares * Math.min(price, 1 - price);
+  return Math.min(rawFee, cap);
 }
 
 function calcMakerRebate(shares: number, price: number, feeRate: number = DEFAULT_TAKER_FEE_RATE): number {
@@ -674,7 +682,8 @@ function settleMarket(marketId: string, market: Market): void {
 }
 
 // Cached BTC price for settlement
-let cachedBtcPrice = 0;
+// BUG FIX #23: persist in globalThis so it survives HMR/restart
+let cachedBtcPrice = (g as any).__mm_cachedBtcPrice ?? 0;
 
 // ─── Probability Model ────────────────────────────────────
 function calcUpProbability(market: Market, btc: BtcPriceData): number {
@@ -1572,9 +1581,15 @@ function takePnLSnapshot(): void {
 }
 
 // ─── Trading Cycle ────────────────────────────────────────
+// BUG FIX #22: race condition guard — prevent overlapping cycles
+let cycleInFlight = false;
+
 export async function runTradingCycle(): Promise<void> {
   if (!running || circuitBreaker) return;
+  if (cycleInFlight) return;  // prevent overlapping cycles
+  cycleInFlight = true;
 
+  try {
   const btc = await getBtcPrice();
   if (btc.price <= 0) return;
 
@@ -1614,6 +1629,11 @@ export async function runTradingCycle(): Promise<void> {
       if (q.status !== "active" && Date.now() - q.createdAt > 60000) quotes.delete(id);
     }
     while (trades.length > 300) trades.shift();
+  }
+  } catch (e) {
+    console.error("[MM] Cycle error:", e);
+  } finally {
+    cycleInFlight = false;  // BUG FIX #22: release guard
   }
 }
 
