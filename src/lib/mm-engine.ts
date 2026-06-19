@@ -1404,7 +1404,7 @@ function markToMarket(_btc: BtcPriceData): void {
       const tau = (market.expiresAt - Date.now()) / 60000;
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
       const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
-      const dynSlPct = Math.max(0.05, Math.min(0.20, atrPct * 12));
+      const dynSlPct = Math.max(0.15, Math.min(0.30, atrPct * 12));  // 15-30% (was 5-20%, too tight)
       const lossPct = -pos.unrealizedPnl / pos.costBasis;
       
       if (lossPct >= dynSlPct) {
