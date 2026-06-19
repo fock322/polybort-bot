@@ -839,8 +839,10 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
 
     // Filter 2: Minimum volume — need real traders to fill our quotes
-    // Lowered from $1000 to $100 — BTC 15-min markets start slow but are tradeable
-    const MIN_VOLUME_USD = 100;
+    // Raised from $100 to $1000 — на low-volume рынках спреды широкие,
+    // phantom liquidity, и stop-loss срабатывает раньше TP.
+    // На $1000+ объёме реально есть interest и bid/ask компактные.
+    const MIN_VOLUME_USD = 1000;
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
