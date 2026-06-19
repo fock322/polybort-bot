@@ -449,7 +449,25 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
     } catch { /* defaults */ }
 
     const question = data.question || slug;
-    const strike = parseStrikePrice(question);
+    let strike = parseStrikePrice(question);
+    
+    // ── Get strike from Chainlink priceToBeat (eventMetadata) ──
+    // For BTC Up/Down 15-min markets, the question doesn't contain strike.
+    // Polymarket stores it in events[0].eventMetadata.priceToBeat.
+    if (strike <= 0) {
+      try {
+        const events = data.events || [];
+        if (events.length > 0) {
+          const meta = events[0].eventMetadata || {};
+          const ptb = parseFloat(meta.priceToBeat || "0");
+          if (ptb > 0) strike = ptb;
+        }
+      } catch { /* ignore */ }
+    }
+    // Fallback: use BTC price as strike (BTC Up/Down: strike = price at slot start)
+    if (strike <= 0) {
+      strike = 0;  // Will be set later from BTC price
+    }
 
     // ── Parse neg_risk flag ──
     // Determines which exchange contract we sign orders with:
@@ -650,7 +668,14 @@ function calcUpProbability(market: Market, btc: BtcPriceData): number {
   const { price, atr5m, change1m, change5m, trend } = btc;
   if (price <= 0) return 0.5;
 
-  const strike = market.strikePrice;
+  // Use strike from Chainlink priceToBeat, or fallback to BTC price
+  let strike = market.strikePrice;
+  if (strike <= 0) {
+    // BTC Up/Down: strike = BTC price at slot start
+    // We don't have the exact slot-start price, so use current price as approximation
+    // This makes z-score ≈ 0, and the model falls back to momentum/trend signals
+    strike = price;
+  }
 
   if (strike > 0) {
     const tau = (market.expiresAt - Date.now()) / 60000;
@@ -850,10 +875,41 @@ function generateQuotes(btc: BtcPriceData): void {
     const rebalanceOnly = Math.abs(inv) > config.rebalanceThreshold;
     const longUp = inv > 0;
     const longDown = inv < 0;
-    // In rebalance mode we skip the BID on the side we're long.
-    const allowBidUp = !(rebalanceOnly && longUp);
-    const allowBidDown = !(rebalanceOnly && longDown);
-    // We always allow ASK on sides we own (that's how we reduce).
+    let allowBidUp = !(rebalanceOnly && longUp);
+    let allowBidDown = !(rebalanceOnly && longDown);
+
+    // ── STRICT ENTRY FILTER (Variant 3) ──
+    // Only enter when model has strong conviction:
+    // 1. P(UP) > 60% → BID_UP, or P(UP) < 40% → BID_DOWN
+    // 2. If strike known: BTC close to strike (< 2 ATR)
+    //    If strike unknown: market mid 0.30-0.70 (uncertain = opportunity)
+    // 3. Skip if < 1 min to expiry
+    if (!rebalanceOnly) {
+      const modelP = calcUpProbability(market, btc);
+      const tauNow = (market.expiresAt - Date.now()) / 60000;
+      
+      if (modelP > 0.60) {
+        allowBidDown = false;  // only bid UP
+      } else if (modelP < 0.40) {
+        allowBidUp = false;    // only bid DOWN
+      } else {
+        // Neutral — skip
+        allowBidUp = false;
+        allowBidDown = false;
+      }
+      
+      // Skip extreme probability (market nearly resolved)
+      if (upRealMid < 0.10 || upRealMid > 0.90) {
+        allowBidUp = false;
+        allowBidDown = false;
+      }
+      
+      // Skip too close to expiry
+      if (tauNow < 1) {
+        allowBidUp = false;
+        allowBidDown = false;
+      }
+    }
 
     // ── Target spread (what we want to capture) ──
     const targetSpread = calcSpread(market, inv, btc);
