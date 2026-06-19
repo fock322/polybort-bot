@@ -454,6 +454,8 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
     // ── Get strike from Chainlink priceToBeat (eventMetadata) ──
     // For BTC Up/Down 15-min markets, the question doesn't contain strike.
     // Polymarket stores it in events[0].eventMetadata.priceToBeat.
+    // NOTE: eventMetadata is only available AFTER market closes.
+    // For active markets, we use BTC price at slot start as strike.
     if (strike <= 0) {
       try {
         const events = data.events || [];
@@ -464,9 +466,14 @@ async function fetchMarketBySlug(slug: string): Promise<Market | null> {
         }
       } catch { /* ignore */ }
     }
-    // Fallback: use BTC price as strike (BTC Up/Down: strike = price at slot start)
+    // Fallback: BTC price at slot start = strike
+    // For BTC Up/Down: if BTC > start_price at expiry → UP wins
+    // We approximate start_price using current BTC price (will be set in runTradingCycle)
+    // This is imperfect but allows the model to function on active markets.
     if (strike <= 0) {
-      strike = 0;  // Will be set later from BTC price
+      // Will be set to btc.price when market is first processed
+      // (stored in market object, updated once)
+      strike = -1;  // sentinel: means "use BTC price on first cycle"
     }
 
     // ── Parse neg_risk flag ──
@@ -671,9 +678,8 @@ function calcUpProbability(market: Market, btc: BtcPriceData): number {
   // Use strike from Chainlink priceToBeat, or fallback to BTC price
   let strike = market.strikePrice;
   if (strike <= 0) {
-    // BTC Up/Down: strike = BTC price at slot start
-    // We don't have the exact slot-start price, so use current price as approximation
-    // This makes z-score ≈ 0, and the model falls back to momentum/trend signals
+    // strike = -1 means "first time seeing this market" → use current BTC price
+    // This approximates the slot-start price (we don't have Chainlink data for active markets)
     strike = price;
   }
 
@@ -1553,6 +1559,17 @@ export async function runTradingCycle(): Promise<void> {
   lastCycleAt = Date.now();
 
   await scanMarkets(btc);
+  
+  // ── Set strike for markets that don't have it (BTC Up/Down) ──
+  // Polymarket doesn't provide priceToBeat for active markets.
+  // Use BTC price as strike on first cycle (approximation of slot-start price).
+  for (const [id, m] of markets) {
+    if (m.strikePrice <= 0 && btc.price > 0) {
+      m.strikePrice = btc.price;
+      console.log(`[MM] Set strike for ${m.slug}: $${btc.price.toFixed(2)} (BTC price fallback)`);
+    }
+  }
+  
   generateQuotes(btc);
 
   if (config.liveMode) {
