@@ -49,6 +49,12 @@ const DEFAULT_MAKER_FEE_RATE = 0;
 const MAKER_REBATE_PCT = 0.20;
 const MIN_MAKER_FILL_DELAY_MS = 2000;
 
+// ─── Gas / Transaction Fee per order ──────────────────────
+// BUG FIX (2026-06-20): GAS_FEE_ORDER was undefined → ReferenceError crash
+// in takerTakeProfit() and recordTradeAnalytics() call → bot cycle died silently.
+// Cost: $0.015 per order (Polymarket gas estimation for Polygon trades).
+const GAS_FEE_ORDER = 0.015;
+
 // ─── Live Mode Safety ─────────────────────────────────────
 const LIVE_MIN_BALANCE = 10;        // Don't trade if balance < $10
 const LIVE_MAX_DAILY_LOSS_PCT = 0.15; // Circuit breaker at 15% daily loss
