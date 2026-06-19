@@ -237,9 +237,9 @@ const config: BotConfig = {
   autoExitMinutes: 3,
   circuitBreakerPct: 0.50,    // 50% — less aggressive for paper trading (was 25%)
   maxInventory: 30,
-  quoteSize: 10,
+  quoteSize: 5,
   inventorySkewFactor: 0.008,
-  cycleIntervalMs: 10000,
+  cycleIntervalMs: 1000,
   // ── Inventory management v2 ──
   rebalanceThreshold: 12,
   adverseSelectionFactor: 3,
@@ -2031,13 +2031,14 @@ export function resetEngine(): void {
 export function getStatus(btc: BtcPriceData): BotStatus {
   let totalUnrealized = 0;
   for (const [, pos] of positions) totalUnrealized += pos.unrealizedPnl;
-  const totalPnl = (cashBalance - config.startingBalance) + totalUnrealized;
+  const totalPnl = realizedPnl + totalUnrealized;  // BUG FIX: was (cash - start) + unrealized
 
   const clob = getClobClient();
   const omStats = getOrderManagerStats();
 
   checkDailyReset();
-  const dailyPnl = cashBalance - dailyStartBalance;
+  const openValueNow = Array.from(positions.values()).reduce((s, p) => s + p.currentValue, 0);
+  const dailyPnl = (cashBalance + openValueNow) - dailyStartBalance;
 
   return {
     running, balance: cashBalance, cashBalance,
