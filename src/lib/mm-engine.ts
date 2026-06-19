@@ -628,13 +628,10 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
 
   for (const m of discovered) markets.set(m.id, m);
 
-  // Cleanup expired + settle
-  // BUG FIX: call settleMarket BEFORE deleting from map (was reversed)
-  // If settleMarket falls back to closePositionsForMarket, it needs
-  // the market to still be in the map to look up bid/ask prices.
-  const cutoff = now - 30 * 60 * 1000;
+  // Cleanup expired + settle — IMMEDIATELY on expiry (was 30 min delay)
+  const now_ms = Date.now();
   for (const [id, m] of markets) {
-    if (m.expiresAt < cutoff) {
+    if (m.expiresAt < now_ms) {
       settleMarket(id, m);   // settle FIRST
       markets.delete(id);     // then remove
     }
