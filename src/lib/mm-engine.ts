@@ -2042,6 +2042,35 @@ export function getTrades(limit = 50) {
   return trades.slice(-limit).reverse();
 }
 
+// ── Analytics tracking ──
+let totalWins = (g as any).__mm_totalWins ?? 0;
+let totalLosses = (g as any).__mm_totalLosses ?? 0;
+let totalWinAmount = (g as any).__mm_totalWinAmount ?? 0;
+let totalLossAmount = (g as any).__mm_totalLossAmount ?? 0;
+let totalGasPaid = (g as any).__mm_totalGasPaid ?? 0;
+let totalFeesPaid = (g as any).__mm_totalFeesPaid ?? 0;
+
+function recordTradeAnalytics(pnl: number, fee: number, gasFee: number) {
+  totalFeesPaid += fee;
+  totalGasPaid += gasFee;
+  if (pnl > 0) { totalWins++; totalWinAmount += pnl; }
+  else if (pnl < 0) { totalLosses++; totalLossAmount += Math.abs(pnl); }
+}
+
+export function getAnalytics() {
+  const totalTrades = totalWins + totalLosses;
+  const winRate = totalTrades > 0 ? totalWins / totalTrades : 0;
+  return {
+    totalWins, totalLosses, totalTrades, winRate,
+    totalWinAmount, totalLossAmount,
+    netProfit: totalWinAmount - totalLossAmount,
+    avgWin: totalWins > 0 ? totalWinAmount / totalWins : 0,
+    avgLoss: totalLosses > 0 ? totalLossAmount / totalLosses : 0,
+    profitFactor: totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? Infinity : 0,
+    totalGasPaid, totalFeesPaid,
+  };
+}
+
 export function getQuotes() {
   return Array.from(quotes.values()).filter(q => q.status === "active");
 }
