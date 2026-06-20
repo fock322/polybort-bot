@@ -337,6 +337,7 @@ function persistState() {
   g.__mm_knownSlugs = knownSlugs;
   g.__mm_lastCycleAt = lastCycleAt;
   (g as any).__mm_cachedBtcPrice = cachedBtcPrice;  // BUG FIX #23
+  (g as any).__mm_cachedBtcData = cachedBtcData;  // FIX 5
   g.__mm_dailyStartBalance = dailyStartBalance;
   g.__mm_dailyResetDate = dailyResetDate;
 }
@@ -754,8 +755,8 @@ function settleMarket(marketId: string, market: Market): void {
   }
 
   const upWins = btcPrice > market.strikePrice;
-  // Build minimal BTC data for trade context
-  const btcData: BtcPriceData = { price: btcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" };
+  // FIX 5: use cachedBtcData (has real change1m/change5m) instead of mocked data
+  const btcData = cachedBtcData;
 
   for (const [posId, pos] of positions) {
     if (pos.marketId !== marketId) continue;
@@ -804,6 +805,14 @@ function settleMarket(marketId: string, market: Market): void {
 // Cached BTC price for settlement
 // BUG FIX #23: persist in globalThis so it survives HMR/restart
 let cachedBtcPrice = (g as any).__mm_cachedBtcPrice ?? 0;
+// FIX 5 (2026-06-20): cache full BtcPriceData (not just price) so exit trades
+// (takerTakeProfit, closePositionById, etc.) can access real change1m/change5m
+// for trade context. Previously passed mocked {change1m:0, change5m:0} which
+// made L2/BTC analysis show 0% for all exit trades.
+let cachedBtcData: BtcPriceData = (g as any).__mm_cachedBtcData ?? {
+  price: 0, atr1m: 0, atr5m: 0, atr15m: 0, volatilityPct: 0,
+  change1m: 0, change5m: 0, trend: "neutral", timestamp: 0, klines: [], lastUpdate: 0, connected: false,
+};
 
 // ─── Probability Model ────────────────────────────────────
 function calcUpProbability(market: Market, btc: BtcPriceData): number {
@@ -940,10 +949,13 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
 
     // Filter 2: Minimum volume — need real traders to fill our quotes
-    // Raised from $100 to $1000 — на low-volume рынках спреды широкие,
-    // phantom liquidity, и stop-loss срабатывает раньше TP.
-    // На $1000+ объёме реально есть interest и bid/ask компактные.
-    const MIN_VOLUME_USD = 1000;
+    // FIX (2026-06-20): raised from $1000 to $3000
+    // Analysis showed 3/5 losing trades happened on vol=$1880 market:
+    //   - Wide spreads → SL triggers before TP
+    //   - Adverse selection: bot fills at peak, price reverses
+    //   - Low trader interest → unreliable price discovery
+    // On $3000+ markets: tighter spreads, more reliable signals
+    const MIN_VOLUME_USD = 3000;
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
@@ -1026,8 +1038,17 @@ function generateQuotes(btc: BtcPriceData): void {
     // Signals: BTC trend (1m+5m) + L2 depth pressure + probability model + time window
     // Only enter when 3+ signals align with strong conviction (>= 70 confidence, 10+ gap)
     //
-    // Also: NO ACCUMULATION — if position already exists on this market+side, skip
-    // (was bug: bot added to losing positions, avg loss $1.72 instead of $0.75)
+    // FIX 1 (2026-06-20): Cancel active BID quotes when signal changes
+    //   Old: smart entry only blocked NEW bids, but EXISTING quotes kept filling
+    //   New: when signal flips, cancel all active BID quotes on this market
+    //
+    // FIX 2 (2026-06-20): Hard L2 filter — no entry if L2 imbalance < -30%
+    //   Analysis: 5/5 stop-loss trades had L2 imbalance AGAINST position
+    //   (-25%, -79%, -42%, -40%, -57%) — bot was fighting the book
+    //
+    // FIX 4 (2026-06-20): NO ACCUMULATION via quote cancellation
+    //   After first fill on market+side, cancel that BID quote to prevent
+    //   further maker fills adding to position
     if (!rebalanceOnly) {
       const signal = smartEntrySignal(market, btc, calcUpProbability(market, btc));
 
@@ -1041,7 +1062,27 @@ function generateQuotes(btc: BtcPriceData): void {
         );
       }
 
+      // FIX 2: Hard L2 filter — even if smart signal says "enter",
+      // block if L2 imbalance is strongly against the chosen side.
+      // L2 imbalance < -30% means sellers dominate → adverse selection risk.
+      const MIN_L2_IMBALANCE = -0.30;  // reject if imbalance below this
+      let l2Blocked = false;
       if (signal.should) {
+        const sideImbalance = signal.side === "UP"
+          ? signal.details.upL2.imbalance
+          : signal.details.downL2.imbalance;
+        if (sideImbalance < MIN_L2_IMBALANCE) {
+          l2Blocked = true;
+          if (tradeCycleCount % 15 === 0) {
+            console.log(
+              `[SMART] ${market.slug}: ${signal.side} signal blocked by L2 filter ` +
+              `(imbalance=${(sideImbalance * 100).toFixed(0)}% < ${(MIN_L2_IMBALANCE * 100).toFixed(0)}%)`
+            );
+          }
+        }
+      }
+
+      if (signal.should && !l2Blocked) {
         // Smart entry confirmed — only allow bid on signal side
         if (signal.side === "UP") {
           allowBidUp = true;
@@ -1051,24 +1092,54 @@ function generateQuotes(btc: BtcPriceData): void {
           allowBidDown = true;
         }
 
+        // FIX 1: Cancel active BID quotes on the OPPOSITE side
+        // (e.g. if signal is UP, cancel any active BID_DOWN — they're stale)
+        for (const [, q] of quotes) {
+          if (q.status !== "active" || q.marketId !== marketId) continue;
+          if (signal.side === "UP" && q.side === "BID_DOWN") {
+            q.status = "cancelled";
+          }
+          if (signal.side === "DOWN" && q.side === "BID_UP") {
+            q.status = "cancelled";
+          }
+        }
+
         // NO ACCUMULATION: if position already exists on this side, skip new bid
+        // AND cancel active BID on this side (was adding to position via maker fills)
         const posId = `${marketId}_${signal.side}`;
         const existingPos = positions.get(posId);
+        const bidSideToCheck = signal.side === "UP" ? "BID_UP" : "BID_DOWN";
         if (existingPos) {
           allowBidUp = false;
           allowBidDown = false;
+          // FIX 4: Cancel active BID on this side — position exists, don't add more
+          for (const [, q] of quotes) {
+            if (q.status !== "active" || q.marketId !== marketId) continue;
+            if (q.side === bidSideToCheck) {
+              q.status = "cancelled";
+            }
+          }
           // Don't log every cycle (spammy) — only log once when position blocks entry
           if (tradeCycleCount % 15 === 0) {
             console.log(
               `[SMART] ${market.slug}: ${signal.side} signal (conf=${signal.confidence}) but position already open ` +
-              `(qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)}) — skip`
+              `(qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)}) — skip + cancel BID`
             );
           }
         }
       } else {
-        // No signal — skip entry entirely
+        // No signal (or L2 blocked) — skip entry entirely
         allowBidUp = false;
         allowBidDown = false;
+
+        // FIX 1: Cancel ALL active BID quotes on this market
+        // (no signal = no conviction, don't let stale quotes fill)
+        for (const [, q] of quotes) {
+          if (q.status !== "active" || q.marketId !== marketId) continue;
+          if (q.side === "BID_UP" || q.side === "BID_DOWN") {
+            q.status = "cancelled";
+          }
+        }
         // Log skip reason every 15 cycles (avoid spam)
         if (tradeCycleCount % 15 === 0 && signal.reasons.length > 0) {
           console.log(`[SMART] ${market.slug}: skip — ${signal.reasons[0]}`);
@@ -1499,6 +1570,20 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 
   quote.status = "filled";
 
+  // FIX 4 (2026-06-20): NO ACCUMULATION — after a BID fill, cancel ALL other
+  // active BID quotes on the same market+side. This prevents maker fills from
+  // adding to the position over subsequent cycles.
+  // Analysis showed positions grew to 13-20 tokens via repeated maker fills,
+  // causing avg loss $0.89 instead of theoretical $0.50.
+  if (side.startsWith("BID")) {
+    for (const [, q] of quotes) {
+      if (q.status !== "active" || q.marketId !== quote.marketId) continue;
+      if (q.side === side) {
+        q.status = "cancelled";
+      }
+    }
+  }
+
   const tradePnl = side.startsWith("BID") ? 0 : (totalCost - fee - (fillQty * (positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`)?.entryPrice ?? fillPrice)));
   if (tradePnl !== 0) recordTradeAnalytics(tradePnl, fee, GAS_FEE_ORDER);
   // For SELL trades, find the position to capture entry context
@@ -1622,7 +1707,7 @@ function closePositionById(posId: string, reason: string): void {
     fee, slippage: 0, reason, executedAt: Date.now(),
     isPaperTrade: !config.liveMode,
     pnl: closePnl,
-    context: buildTradeContext(pos.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
+    context: buildTradeContext(pos.marketId, cachedBtcData, pos),
   });
 
   // Update inventory (selling reduces net position)
@@ -1732,7 +1817,7 @@ function takerTakeProfit(): void {
       price: closePrice, quantity: sellQty, totalCost: closeValue,
       fee, slippage: 0, reason: "taker_take_profit", executedAt: Date.now(),
       isPaperTrade: !config.liveMode, pnl: tpPnl,
-      context: buildTradeContext(pos.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
+      context: buildTradeContext(pos.marketId, cachedBtcData, pos),
     });
 
     const inv = inventory.get(pos.marketId) || 0;
@@ -1815,7 +1900,7 @@ function closePositionsForMarket(marketId: string, reason: string): void {
       fee, slippage: 0, reason: `${reason}_profit`, executedAt: Date.now(),
       isPaperTrade: !config.liveMode,
       pnl: exitPnl,
-      context: buildTradeContext(marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
+      context: buildTradeContext(marketId, cachedBtcData, pos),
     });
 
     positions.delete(posId);
@@ -1946,6 +2031,7 @@ export async function runTradingCycle(): Promise<void> {
   if (btc.price <= 0) return;
 
   cachedBtcPrice = btc.price;
+  cachedBtcData = btc;  // FIX 5: cache full BtcPriceData for exit trade context
   tradeCycleCount++;
   lastCycleAt = Date.now();
 
@@ -2108,7 +2194,7 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
         reason: isTaker ? "live_taker_fill" : "live_maker_fill",
         executedAt: Date.now(), isPaperTrade: false,
         pnl: 0,
-        context: buildTradeContext(filled.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }),
+        context: buildTradeContext(filled.marketId, cachedBtcData),
       });
 
       console.log(
@@ -2301,6 +2387,7 @@ export function resetEngine(): void {
   inventory.clear();
   knownSlugs.clear();
   cachedBtcPrice = 0;
+  cachedBtcData = { price: 0, atr1m: 0, atr5m: 0, atr15m: 0, volatilityPct: 0, change1m: 0, change5m: 0, trend: "neutral", timestamp: 0, klines: [], lastUpdate: 0, connected: false };
   lastRealBalance = 0;
   dailyStartBalance = 0;
   dailyResetDate = "";
