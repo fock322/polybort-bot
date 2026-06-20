@@ -5,7 +5,7 @@
  * Port: 3002
  */
 
-import { startEngine, stopEngine, resetEngine, getStatus, getMarkets, getPositions, getTrades, getAnalytics } from "../../src/lib/mm-engine";
+import { startEngine, stopEngine, resetEngine, getStatus, getMarkets, getPositions, getTrades, getAnalytics, getTradeAnalysis } from "../../src/lib/mm-engine";
 import { getBtcPrice } from "../../src/lib/btc-feed";
 
 const PORT = 3002;
@@ -70,6 +70,10 @@ const server = Bun.serve({
 
       if (path === "/analytics" && method === "GET") {
         return Response.json(getAnalytics(), { headers: corsHeaders });
+      }
+
+      if (path === "/trade-analysis" && method === "GET") {
+        return Response.json(getTradeAnalysis(), { headers: corsHeaders });
       }
 
       if (path === "/health" && method === "GET") {
@@ -162,6 +166,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="section"><div class="section-title">🏪 Активные рынки</div><div id="markets"><div class="empty">Нет рынков</div></div></div>
   <div class="section"><div class="section-title">📜 История сделок</div><div id="tradesList"><div class="empty">Нет сделок</div></div></div>
   <div class="section"><div class="section-title">📊 Аналитика</div><div id="analytics"><div class="empty">Загрузка...</div></div></div>
+  <div class="section"><div class="section-title">🔍 Анализ паттернов (win/loss по bucket'ам)</div><div id="tradeAnalysis"><div class="empty">Загрузка...</div></div></div>
   <div class="refresh-info">Авто-обновление каждые 5 секунд</div>
 </div>
 <script>
@@ -277,9 +282,92 @@ async function fetchAnalytics(){
     document.getElementById('analytics').innerHTML='<div class="empty">Ошибка аналитики: '+(e.message||e)+'</div>';
   }
 }
+async function fetchTradeAnalysis(){
+  try{
+    const r=await fetch(API+'/trade-analysis');
+    if(!r.ok){document.getElementById('tradeAnalysis').innerHTML='<div class="empty">Ошибка анализа: HTTP '+r.status+'</div>';return;}
+    const a=await r.json();
+    const el=document.getElementById('tradeAnalysis');
+    if(!a||a.totalPairs===0){
+      el.innerHTML='<div class="empty">Нет сделок для анализа (нужно подождать первые entry+exit пары)</div>';
+      return;
+    }
+    let html='';
+    // Summary
+    const s=a.summary||{};
+    const wr=(s.winRate||0)*100;
+    const wrc=wr>=70?'#22c55e':wr>=50?'#f59e0b':'#ef4444';
+    html+='<div class="row"><span class="row-label">Всего пар (entry+exit)</span><span class="row-value">'+a.totalPairs+' (закрытых: '+a.closedPairs+', открытых: '+a.openPositions+')</span></div>';
+    html+='<div class="row"><span class="row-label">Wins / Losses</span><span class="row-value">🟢 '+s.wins+' / 🔴 '+s.losses+'</span></div>';
+    html+='<div class="row"><span class="row-label">Win Rate</span><span class="row-value" style="color:'+wrc+';font-weight:600;">'+wr.toFixed(1)+'%</span></div>';
+    html+='<div class="row"><span class="row-label">Total PnL</span><span class="row-value '+(s.totalPnl>=0?'pnl-positive':'pnl-negative')+'">'+(s.totalPnl>=0?'+':'')+'$'+(s.totalPnl||0).toFixed(4)+'</span></div>';
+
+    // Helper to render bucket table
+    function bucketTable(title,buckets){
+      if(!buckets||buckets.length===0)return '';
+      let h='<div style="margin-top:12px;font-size:13px;color:#a1a1aa;font-weight:600;">'+title+'</div>';
+      h+='<div style="margin-top:4px;font-size:11px;color:#71717a;display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid #2a2d37;">';
+      h+='<span style="flex:1;">Bucket</span><span style="width:50px;text-align:right;">Count</span><span style="width:80px;text-align:right;">Win%</span><span style="width:80px;text-align:right;">PnL</span></div>';
+      for(const b of buckets){
+        const wr2=((b.winRate||0)*100).toFixed(0);
+        const wrc2=(b.winRate||0)>=0.7?'#22c55e':(b.winRate||0)>=0.5?'#f59e0b':'#ef4444';
+        const pnlc=(b.totalPnl||0)>=0?'pnl-positive':'pnl-negative';
+        h+='<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:12px;">';
+        h+='<span style="flex:1;color:#e4e4e7;">'+b.bucket+'</span>';
+        h+='<span style="width:50px;text-align:right;color:#a1a1aa;">'+b.count+'</span>';
+        h+='<span style="width:80px;text-align:right;color:'+wrc2+';">'+wr2+'%</span>';
+        h+='<span style="width:80px;text-align:right;" class="'+pnlc+'">'+(b.totalPnl>=0?'+':'')+'$'+(b.totalPnl||0).toFixed(3)+'</span>';
+        h+='</div>';
+      }
+      return h;
+    }
+
+    html+=bucketTable('⏰ По времени до экспирации (tau at entry)',a.byTau);
+    html+=bucketTable('💰 По объёму рынка (volume at entry)',a.byVolume);
+    html+=bucketTable('📚 По L2 imbalance (bid/ask pressure)',a.byL2Imbalance);
+    html+=bucketTable('📈 По BTC 1m change at entry',a.byBtc1m);
+    html+=bucketTable('📈 По BTC 5m change at entry',a.byBtc5m);
+    html+=bucketTable('⏱️ По времени удержания (hold time)',a.byHoldTime);
+    html+=bucketTable('🚪 По причине выхода (exit reason)',a.byExitReason);
+    html+=bucketTable('🎯 По стороне (UP vs DOWN)',a.bySide);
+
+    // Worst trades
+    if(a.worstTrades&&a.worstTrades.length>0){
+      html+='<div style="margin-top:12px;font-size:13px;color:#ef4444;font-weight:600;">🔴 Худшие сделки (top 10)</div>';
+      for(const t of a.worstTrades){
+        const holdSec=((t.holdTimeMs||0)/1000).toFixed(0);
+        html+='<div style="margin-top:4px;padding:6px;background:#2a1015;border-radius:6px;font-size:11px;">';
+        html+='<div style="display:flex;justify-content:space-between;">';
+        html+='<span style="color:#e4e4e7;">'+t.side+' $'+(t.entryPrice||0).toFixed(2)+'→$'+(t.exitPrice||0).toFixed(2)+'</span>';
+        html+='<span class="pnl-negative">$'+(t.pnl||0).toFixed(4)+'</span>';
+        html+='</div>';
+        html+='<div style="color:#71717a;margin-top:2px;">exit: '+t.exitReason+' | tau='+(t.tauAtEntry||0).toFixed(1)+'m vol=$'+(t.volume||0).toFixed(0)+' L2imb='+(((t.l2Imbalance||0)*100).toFixed(0))+'% btc1m='+((t.btc1m||0)*100).toFixed(2)+'% btc5m='+((t.btc5m||0)*100).toFixed(2)+'% hold='+holdSec+'s</div>';
+        html+='</div>';
+      }
+    }
+    // Best trades
+    if(a.bestTrades&&a.bestTrades.length>0){
+      html+='<div style="margin-top:12px;font-size:13px;color:#22c55e;font-weight:600;">🟢 Лучшие сделки (top 10)</div>';
+      for(const t of a.bestTrades){
+        const holdSec=((t.holdTimeMs||0)/1000).toFixed(0);
+        html+='<div style="margin-top:4px;padding:6px;background:#0f2a18;border-radius:6px;font-size:11px;">';
+        html+='<div style="display:flex;justify-content:space-between;">';
+        html+='<span style="color:#e4e4e7;">'+t.side+' $'+(t.entryPrice||0).toFixed(2)+'→$'+(t.exitPrice||0).toFixed(2)+'</span>';
+        html+='<span class="pnl-positive">+$'+(t.pnl||0).toFixed(4)+'</span>';
+        html+='</div>';
+        html+='<div style="color:#71717a;margin-top:2px;">exit: '+t.exitReason+' | tau='+(t.tauAtEntry||0).toFixed(1)+'m vol=$'+(t.volume||0).toFixed(0)+' L2imb='+(((t.l2Imbalance||0)*100).toFixed(0))+'% btc1m='+((t.btc1m||0)*100).toFixed(2)+'% btc5m='+((t.btc5m||0)*100).toFixed(2)+'% hold='+holdSec+'s</div>';
+        html+='</div>';
+      }
+    }
+
+    el.innerHTML=html;
+  }catch(e){
+    document.getElementById('tradeAnalysis').innerHTML='<div class="empty">Ошибка анализа: '+(e.message||e)+'</div>';
+  }
+}
 async function sendCommand(cmd){try{await fetch(API+'/'+cmd,{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
-fetchStatus();fetchTrades();fetchAnalytics();
-setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);
+fetchStatus();fetchTrades();fetchAnalytics();fetchTradeAnalysis();
+setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);setInterval(fetchTradeAnalysis,30000);
 </script>
 </body>
 </html>`;

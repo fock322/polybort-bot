@@ -127,6 +127,35 @@ export interface Position {
   entryStrikePrice: number;  // strike price at position open (for orphaned position settlement)
 }
 
+export interface TradeContext {
+  // Market state at trade execution
+  marketVolume?: number;        // total volume USD at trade time
+  marketLiquidity?: number;     // total liquidity USD at trade time
+  tauMin?: number;              // minutes to expiry at trade time
+  upMid?: number;               // UP token mid price
+  downMid?: number;             // DOWN token mid price
+  upBid?: number;               // UP best bid
+  upAsk?: number;               // UP best ask
+  downBid?: number;
+  downAsk?: number;
+  spreadUp?: number;            // UP spread (ask-bid)
+  spreadDown?: number;
+  upL2Depth?: number;           // L2 depth USD (top 5 levels)
+  downL2Depth?: number;
+  upL2Imbalance?: number;       // (bidDepth - askDepth) / total (-1..+1)
+  downL2Imbalance?: number;
+  // BTC state at trade time
+  btcPrice?: number;
+  btcChange1m?: number;         // fractional (0.001 = 0.1%)
+  btcChange5m?: number;
+  btcAtr5m?: number;
+  btcTrend?: string;
+  // Position info (for exit trades)
+  entryPrice?: number;          // position entry price (for SELL trades)
+  holdTimeMs?: number;          // how long position was held (exit - entry)
+  peakPnl?: number;             // peak unrealized PnL during hold
+}
+
 export interface Trade {
   id: string;
   marketId: string;
@@ -139,6 +168,8 @@ export interface Trade {
   reason: string;
   executedAt: number;
   isPaperTrade: boolean;
+  pnl: number;
+  context?: TradeContext;  // market + BTC state at trade time
 }
 
 export interface Quote {
@@ -337,6 +368,65 @@ function parseStrikePrice(question: string): number {
     return parseFloat(match[1].replace(/,/g, ""));
   }
   return 0;
+}
+
+// ─── Trade Context Builder ────────────────────────────────
+// Captures market + BTC state at trade execution time for post-hoc analysis
+// of winning vs losing trade patterns.
+export function buildTradeContext(marketId: string, btc: BtcPriceData, pos?: Position): TradeContext {
+  const market = markets.get(marketId);
+  if (!market) {
+    return pos ? { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis } : {};
+  }
+
+  // L2 depth analysis (top 5 levels)
+  let upBidDepth = 0, upAskDepth = 0, downBidDepth = 0, downAskDepth = 0;
+  for (let i = 0; i < Math.min(5, market.upBids.length); i++) {
+    const l = market.upBids[i];
+    if (l && l.size > 0) upBidDepth += l.size * l.price;
+  }
+  for (let i = 0; i < Math.min(5, market.upAsks.length); i++) {
+    const l = market.upAsks[i];
+    if (l && l.size > 0) upAskDepth += l.size * l.price;
+  }
+  for (let i = 0; i < Math.min(5, market.downBids.length); i++) {
+    const l = market.downBids[i];
+    if (l && l.size > 0) downBidDepth += l.size * l.price;
+  }
+  for (let i = 0; i < Math.min(5, market.downAsks.length); i++) {
+    const l = market.downAsks[i];
+    if (l && l.size > 0) downAskDepth += l.size * l.price;
+  }
+
+  const upTotal = upBidDepth + upAskDepth;
+  const downTotal = downBidDepth + downAskDepth;
+  const tauMin = Math.max(0, (market.expiresAt - Date.now()) / 60000);
+
+  return {
+    marketVolume: market.volume,
+    marketLiquidity: market.liquidity,
+    tauMin,
+    upMid: market.realUpMid,
+    downMid: market.realDownMid,
+    upBid: market.realUpBestBid,
+    upAsk: market.realUpBestAsk,
+    downBid: market.realDownBestBid,
+    downAsk: market.realDownBestAsk,
+    spreadUp: market.realSpreadUp,
+    spreadDown: market.realSpreadDown,
+    upL2Depth: upTotal,
+    downL2Depth: downTotal,
+    upL2Imbalance: upTotal > 0 ? (upBidDepth - upAskDepth) / upTotal : 0,
+    downL2Imbalance: downTotal > 0 ? (downBidDepth - downAskDepth) / downTotal : 0,
+    btcPrice: btc.price,
+    btcChange1m: btc.change1m,
+    btcChange5m: btc.change5m,
+    btcAtr5m: btc.atr5m,
+    btcTrend: btc.trend,
+    entryPrice: pos?.entryPrice,
+    holdTimeMs: pos ? Date.now() - pos.openedAt : undefined,
+    peakPnl: pos ? pos.peakValue - pos.costBasis : undefined,
+  };
 }
 
 // ─── Fee Calculation ──────────────────────────────────────
@@ -657,13 +747,15 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
 
 // ─── Settlement ───────────────────────────────────────────
 function settleMarket(marketId: string, market: Market): void {
-  const btc = cachedBtcPrice;
-  if (btc <= 0) {
+  const btcPrice = cachedBtcPrice;
+  if (btcPrice <= 0) {
     closePositionsForMarket(marketId, "expiry_no_price");
     return;
   }
 
-  const upWins = btc > market.strikePrice;
+  const upWins = btcPrice > market.strikePrice;
+  // Build minimal BTC data for trade context
+  const btcData: BtcPriceData = { price: btcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" };
 
   for (const [posId, pos] of positions) {
     if (pos.marketId !== marketId) continue;
@@ -686,6 +778,7 @@ function settleMarket(marketId: string, market: Market): void {
       slippage: 0, reason: upWins ? "settle_up_wins" : "settle_down_wins",
       executedAt: Date.now(), isPaperTrade: !config.liveMode,
       pnl: settlePnl,
+      context: buildTradeContext(marketId, btcData, pos),
     });
 
     positions.delete(posId);
@@ -1408,6 +1501,8 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 
   const tradePnl = side.startsWith("BID") ? 0 : (totalCost - fee - (fillQty * (positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`)?.entryPrice ?? fillPrice)));
   if (tradePnl !== 0) recordTradeAnalytics(tradePnl, fee, GAS_FEE_ORDER);
+  // For SELL trades, find the position to capture entry context
+  const posForContext = side.startsWith("ASK") ? positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`) : undefined;
   trades.push({
     id: uid(), marketId: quote.marketId, side,
     price: fillPrice, quantity: fillQty,
@@ -1416,6 +1511,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
     executedAt: Date.now(),
     isPaperTrade: true,
     pnl: tradePnl,
+    context: buildTradeContext(quote.marketId, _btc, posForContext),
   });
 }
 
@@ -1526,6 +1622,7 @@ function closePositionById(posId: string, reason: string): void {
     fee, slippage: 0, reason, executedAt: Date.now(),
     isPaperTrade: !config.liveMode,
     pnl: closePnl,
+    context: buildTradeContext(pos.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
   });
 
   // Update inventory (selling reduces net position)
@@ -1635,6 +1732,7 @@ function takerTakeProfit(): void {
       price: closePrice, quantity: sellQty, totalCost: closeValue,
       fee, slippage: 0, reason: "taker_take_profit", executedAt: Date.now(),
       isPaperTrade: !config.liveMode, pnl: tpPnl,
+      context: buildTradeContext(pos.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
     });
 
     const inv = inventory.get(pos.marketId) || 0;
@@ -1717,6 +1815,7 @@ function closePositionsForMarket(marketId: string, reason: string): void {
       fee, slippage: 0, reason: `${reason}_profit`, executedAt: Date.now(),
       isPaperTrade: !config.liveMode,
       pnl: exitPnl,
+      context: buildTradeContext(marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }, pos),
     });
 
     positions.delete(posId);
@@ -1774,6 +1873,7 @@ function cleanupOrphanedPositions(): void {
         price: 0, quantity: pos.quantity, totalCost: 0, fee: 0,
         slippage: 0, reason: "orphaned_no_btc_price", executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: settlePnl,
+        context: { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis },
       });
       positions.delete(posId);
       continue;
@@ -1803,6 +1903,7 @@ function cleanupOrphanedPositions(): void {
       price: resolvedPrice, quantity: pos.quantity, totalCost: settleValue, fee: 0,
       slippage: 0, reason: wins ? "orphaned_settle_win" : "orphaned_settle_loss",
       executedAt: Date.now(), isPaperTrade: !config.liveMode, pnl: settlePnl,
+      context: { btcPrice: btc, entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis },
     });
 
     positions.delete(posId);
@@ -2006,6 +2107,8 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
         totalCost, fee, slippage: Math.abs(filled.fillPrice - matchingQuote.price),
         reason: isTaker ? "live_taker_fill" : "live_maker_fill",
         executedAt: Date.now(), isPaperTrade: false,
+        pnl: 0,
+        context: buildTradeContext(filled.marketId, { price: cachedBtcPrice, atr5m: 0, change1m: 0, change5m: 0, trend: "neutral" }),
       });
 
       console.log(
@@ -2366,6 +2469,207 @@ export function getAnalytics() {
     profitFactor: totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? Infinity : 0,
     totalGasPaid, totalFeesPaid,
   };
+}
+
+// ─── Trade Pattern Analysis ───────────────────────────────
+// Analyses entry+exit trade pairs to find patterns in winning vs losing trades.
+// Pairs are matched by marketId + side (BID entry → SELL exit, or SETTLE).
+// Returns statistics by buckets: tau, volume, L2 imbalance, BTC change, hold time.
+export function getTradeAnalysis() {
+  // Build entry → exit pairs
+  interface TradePair {
+    entry: Trade;
+    exit?: Trade;
+    pnl: number;
+    side: "UP" | "DOWN";
+    won: boolean;
+  }
+  const pairs: TradePair[] = [];
+  const entryMap = new Map<string, Trade>();  // key: marketId_side → entry trade
+
+  for (const t of trades) {
+    const isEntry = t.side.startsWith("BID") || t.side.startsWith("live_taker") || t.side.startsWith("live_maker");
+    const posSide = t.side.includes("UP") ? "UP" : "DOWN";
+    const key = `${t.marketId}_${posSide}`;
+
+    if (isEntry) {
+      // Entry (BUY). Keep first entry only (no accumulation).
+      if (!entryMap.has(key)) entryMap.set(key, t);
+    } else {
+      // Exit (SELL or SETTLE). Match with entry.
+      const entry = entryMap.get(key);
+      if (entry) {
+        pairs.push({
+          entry,
+          exit: t,
+          pnl: t.pnl,
+          side: posSide as "UP" | "DOWN",
+          won: t.pnl > 0,
+        });
+        entryMap.delete(key);
+      }
+    }
+  }
+  // Open positions (entry without exit yet)
+  for (const [, entry] of entryMap) {
+    const posSide = entry.side.includes("UP") ? "UP" : "DOWN";
+    pairs.push({
+      entry,
+      pnl: 0,
+      side: posSide as "UP" | "DOWN",
+      won: false,  // unknown, still open
+    });
+  }
+
+  // Bucket stats helper
+  function bucketStats(items: TradePair[], label: string) {
+    if (items.length === 0) return null;
+    const wins = items.filter(i => i.won);
+    const losses = items.filter(i => !i.won && i.exit);
+    const totalPnl = items.reduce((s, i) => s + i.pnl, 0);
+    return {
+      bucket: label,
+      count: items.length,
+      wins: wins.length,
+      losses: losses.length,
+      winRate: items.length > 0 ? wins.length / items.length : 0,
+      totalPnl,
+      avgPnl: totalPnl / items.length,
+    };
+  }
+
+  // 1. By tauMin at entry (5-min buckets: 0-5, 5-10, 10-15)
+  const byTau = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    const tau = p.entry.context?.tauMin ?? 0;
+    const bucket = tau < 5 ? "0-5min" : tau < 10 ? "5-10min" : "10-15min";
+    if (!byTau.has(bucket)) byTau.set(bucket, []);
+    byTau.get(bucket)!.push(p);
+  }
+
+  // 2. By market volume at entry ($1000 buckets)
+  const byVolume = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    const vol = p.entry.context?.marketVolume ?? 0;
+    const bucket = vol < 1000 ? "<$1k" : vol < 3000 ? "$1-3k" : vol < 10000 ? "$3-10k" : ">$10k";
+    if (!byVolume.has(bucket)) byVolume.set(bucket, []);
+    byVolume.get(bucket)!.push(p);
+  }
+
+  // 3. By L2 imbalance at entry (token side)
+  const byL2Imb = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    const imb = p.side === "UP" ? p.entry.context?.upL2Imbalance : p.entry.context?.downL2Imbalance;
+    if (imb === undefined) continue;
+    const bucket = imb < -0.3 ? "bearish (<-30%)" : imb < 0 ? "weak bear (-30..0%)" : imb < 0.3 ? "weak bull (0..30%)" : "bullish (>30%)";
+    if (!byL2Imb.has(bucket)) byL2Imb.set(bucket, []);
+    byL2Imb.get(bucket)!.push(p);
+  }
+
+  // 4. By BTC 1m change at entry
+  const byBtc1m = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    const c = p.entry.context?.btcChange1m ?? 0;
+    const bucket = c < -0.001 ? "down <-0.1%" : c < 0 ? "slight down" : c < 0.001 ? "slight up" : "up >0.1%";
+    if (!byBtc1m.has(bucket)) byBtc1m.set(bucket, []);
+    byBtc1m.get(bucket)!.push(p);
+  }
+
+  // 5. By BTC 5m change at entry
+  const byBtc5m = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    const c = p.entry.context?.btcChange5m ?? 0;
+    const bucket = c < -0.003 ? "down <-0.3%" : c < 0 ? "slight down" : c < 0.003 ? "slight up" : "up >0.3%";
+    if (!byBtc5m.has(bucket)) byBtc5m.set(bucket, []);
+    byBtc5m.get(bucket)!.push(p);
+  }
+
+  // 6. By hold time
+  const byHoldTime = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    if (!p.exit?.context?.holdTimeMs) continue;
+    const ms = p.exit.context.holdTimeMs;
+    const min = ms / 60000;
+    const bucket = min < 1 ? "<1min" : min < 3 ? "1-3min" : min < 7 ? "3-7min" : ">7min";
+    if (!byHoldTime.has(bucket)) byHoldTime.set(bucket, []);
+    byHoldTime.get(bucket)!.push(p);
+  }
+
+  // 7. By exit reason
+  const byReason = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    if (!p.exit) continue;
+    const r = p.exit.reason;
+    if (!byReason.has(r)) byReason.set(r, []);
+    byReason.get(r)!.push(p);
+  }
+
+  // 8. By side (UP vs DOWN)
+  const bySide = new Map<string, TradePair[]>();
+  for (const p of pairs) {
+    if (!bySide.has(p.side)) bySide.set(p.side, []);
+    bySide.get(p.side)!.push(p);
+  }
+
+  // Build response
+  const result: any = {
+    totalPairs: pairs.length,
+    openPositions: pairs.filter(p => !p.exit).length,
+    closedPairs: pairs.filter(p => p.exit).length,
+    summary: {
+      wins: pairs.filter(p => p.won).length,
+      losses: pairs.filter(p => p.exit && !p.won).length,
+      winRate: pairs.filter(p => p.exit).length > 0
+        ? pairs.filter(p => p.won).length / pairs.filter(p => p.exit).length
+        : 0,
+      totalPnl: pairs.reduce((s, p) => s + p.pnl, 0),
+    },
+    byTau: Array.from(byTau.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byVolume: Array.from(byVolume.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byL2Imbalance: Array.from(byL2Imb.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byBtc1m: Array.from(byBtc1m.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byBtc5m: Array.from(byBtc5m.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byHoldTime: Array.from(byHoldTime.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    byExitReason: Array.from(byReason.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    bySide: Array.from(bySide.entries()).map(([k, v]) => bucketStats(v, k)).filter(Boolean),
+    // Worst losing trades (top 10 by abs pnl)
+    worstTrades: pairs
+      .filter(p => p.exit && p.pnl < 0)
+      .sort((a, b) => a.pnl - b.pnl)
+      .slice(0, 10)
+      .map(p => ({
+        side: p.side,
+        pnl: p.pnl,
+        entryPrice: p.entry.price,
+        exitPrice: p.exit!.price,
+        exitReason: p.exit!.reason,
+        tauAtEntry: p.entry.context?.tauMin,
+        volume: p.entry.context?.marketVolume,
+        l2Imbalance: p.side === "UP" ? p.entry.context?.upL2Imbalance : p.entry.context?.downL2Imbalance,
+        btc1m: p.entry.context?.btcChange1m,
+        btc5m: p.entry.context?.btcChange5m,
+        holdTimeMs: p.exit!.context?.holdTimeMs,
+      })),
+    // Best winning trades (top 10)
+    bestTrades: pairs
+      .filter(p => p.exit && p.pnl > 0)
+      .sort((a, b) => b.pnl - a.pnl)
+      .slice(0, 10)
+      .map(p => ({
+        side: p.side,
+        pnl: p.pnl,
+        entryPrice: p.entry.price,
+        exitPrice: p.exit!.price,
+        exitReason: p.exit!.reason,
+        tauAtEntry: p.entry.context?.tauMin,
+        volume: p.entry.context?.marketVolume,
+        l2Imbalance: p.side === "UP" ? p.entry.context?.upL2Imbalance : p.entry.context?.downL2Imbalance,
+        btc1m: p.entry.context?.btcChange1m,
+        btc5m: p.entry.context?.btcChange5m,
+        holdTimeMs: p.exit!.context?.holdTimeMs,
+      })),
+  };
+  return result;
 }
 
 export function getQuotes() {
