@@ -209,7 +209,36 @@ function updateUI(d){
     '</div>';
   }).join('');}else{posEl.innerHTML='<div class="empty">Нет позиций</div>';}
   const mktEl=document.getElementById('markets');
-  if(d.markets&&d.markets.length>0){mktEl.innerHTML=d.markets.map(m=>{const q=(m.question||'?').substring(0,50);const v=(m.volume||0).toLocaleString('en-US',{maximumFractionDigits:0});const b=(m.realUpBestBid||0).toFixed(2);const a=(m.realUpBestAsk||0).toFixed(2);const exp=m.expiresAt||0;const now=Date.now();const ml=Math.max(0,(exp-now)/60000);const mn=Math.floor(ml);const sc=Math.floor((ml-mn)*60);const ts=mn<1?sc+'s':mn+'m '+sc+'s';const tc=ml<3?'#ef4444':ml<5?'#f59e0b':'#71717a';return '<div class="row"><span class="row-label">'+q+'<br><small style="color:'+tc+'">⏱ '+ts+' • bid '+b+' • ask '+a+'</small></span><span class="row-value">Vol $'+v+'</span></div>';}).join('');}else{mktEl.innerHTML='<div class="empty">Нет рынков</div>';}
+  if(d.markets&&d.markets.length>0){mktEl.innerHTML=d.markets.map(m=>{
+    const q=(m.question||'?').substring(0,50);
+    const v=(m.volume||0).toLocaleString('en-US',{maximumFractionDigits:0});
+    const b=(m.realUpBestBid||0).toFixed(2);
+    const a=(m.realUpBestAsk||0).toFixed(2);
+    const exp=m.expiresAt||0;
+    const now=Date.now();
+    const ml=Math.max(0,(exp-now)/60000);
+    const mn=Math.floor(ml);
+    const sc=Math.floor((ml-mn)*60);
+    const ts=mn<1?sc+'s':mn+'m '+sc+'s';
+    const tc=ml<3?'#ef4444':ml<5?'#f59e0b':'#71717a';
+    // Smart entry signal display
+    const s=m.smartSignal||{};
+    let sigHtml='';
+    if(s.should){
+      const sc2=s.confidence>=80?'#22c55e':s.confidence>=70?'#f59e0b':'#ef4444';
+      sigHtml='<div style="margin-top:4px;font-size:12px;color:'+sc2+';">🎯 ENTER '+s.side+' (conf='+s.confidence+'/100, UP='+s.upConfidence+' DOWN='+s.downConfidence+')</div>'+
+        '<small style="color:#52525b;display:block;margin-top:2px;">pUp='+(s.pUp*100).toFixed(0)+'% btc1m='+(s.btc1m*100).toFixed(2)+'% btc5m='+(s.btc5m*100).toFixed(2)+'% upL2imb='+(s.upL2Imbalance*100).toFixed(0)+'% downL2imb='+(s.downL2Imbalance*100).toFixed(0)+'%</small>';
+    }else{
+      sigHtml='<div style="margin-top:4px;font-size:12px;color:#71717a;">⏸ '+((s.reason||'').substring(0,80))+'</div>';
+    }
+    return '<div class="row" style="flex-direction:column;align-items:stretch;padding:10px 0;">'+
+      '<div style="display:flex;justify-content:space-between;">'+
+        '<span class="row-label">'+q+'<br><small style="color:'+tc+'">⏱ '+ts+' • bid '+b+' • ask '+a+'</small></span>'+
+        '<span class="row-value">Vol $'+v+'</span>'+
+      '</div>'+
+      sigHtml+
+    '</div>';
+  }).join('');}else{mktEl.innerHTML='<div class="empty">Нет рынков</div>';}
 }
 async function fetchTrades(){try{const r=await fetch(API+'/trades');const d=await r.json();const t=d.trades||[];const el=document.getElementById('tradesList');if(t.length===0){el.innerHTML='<div class="empty">Нет сделок</div>';return;}el.innerHTML=t.slice(0,15).map(t=>{const s=t.side||'?';const p=(t.price||0).toFixed(2);const q=t.quantity||0;const rs=t.reason||'?';const pnl=t.pnl||0;const ps=pnl!==0?(pnl>0?'+':'')+'$'+pnl.toFixed(4):'—';const pc=pnl>0?'pnl-positive':pnl<0?'pnl-negative':'';const ts=new Date(t.executedAt||0).toLocaleTimeString('ru-RU');return '<div class="row"><span class="row-label">'+ts+' • '+s+' '+q+'@$'+p+' <small>('+rs+')</small></span><span class="row-value '+pc+'">'+ps+'</span></div>';}).join('');}catch(e){}}
 async function fetchAnalytics(){

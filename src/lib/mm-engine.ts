@@ -30,6 +30,13 @@ import {
   getOrderManagerStats,
   type ManagedOrder,
 } from "./order-manager";
+import {
+  smartEntrySignal,
+  smartTpThreshold,
+  SMART_TP_PCT,
+  SMART_SL_PCT,
+  type SmartEntrySignal,
+} from "./smart-entry";
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
@@ -921,36 +928,58 @@ function generateQuotes(btc: BtcPriceData): void {
     let allowBidUp = !(rebalanceOnly && longUp);
     let allowBidDown = !(rebalanceOnly && longDown);
 
-    // ── STRICT ENTRY FILTER (Variant 3) ──
-    // Only enter when model has strong conviction:
-    // 1. P(UP) > 60% → BID_UP, or P(UP) < 40% → BID_DOWN
-    // 2. If strike known: BTC close to strike (< 2 ATR)
-    //    If strike unknown: market mid 0.30-0.70 (uncertain = opportunity)
-    // 3. Skip if < 1 min to expiry
+    // ── SMART L2 ENTRY (replaces STRICT ENTRY FILTER) ──
+    // Goal: ~90% win rate via multi-signal confirmation
+    // Signals: BTC trend (1m+5m) + L2 depth pressure + probability model + time window
+    // Only enter when 3+ signals align with strong conviction (>= 70 confidence, 10+ gap)
+    //
+    // Also: NO ACCUMULATION — if position already exists on this market+side, skip
+    // (was bug: bot added to losing positions, avg loss $1.72 instead of $0.75)
     if (!rebalanceOnly) {
-      const modelP = calcUpProbability(market, btc);
-      const tauNow = (market.expiresAt - Date.now()) / 60000;
-      
-      if (modelP > 0.60) {
-        allowBidDown = false;  // only bid UP
-      } else if (modelP < 0.40) {
-        allowBidUp = false;    // only bid DOWN
+      const signal = smartEntrySignal(market, btc, calcUpProbability(market, btc));
+
+      // Log signal every cycle for debugging (shows WHY bot entered or skipped)
+      if (signal.should) {
+        console.log(
+          `[SMART] ${market.slug} → ${signal.side} (conf=${signal.confidence}/100) | ` +
+          `tau=${signal.details.tau.toFixed(1)}m pUp=${(signal.details.pUp * 100).toFixed(0)}% ` +
+          `btc1m=${(signal.details.btcChange1m * 100).toFixed(2)}% btc5m=${(signal.details.btcChange5m * 100).toFixed(2)}% ` +
+          `upL2imb=${(signal.details.upL2.imbalance * 100).toFixed(0)}% downL2imb=${(signal.details.downL2.imbalance * 100).toFixed(0)}%`
+        );
+      }
+
+      if (signal.should) {
+        // Smart entry confirmed — only allow bid on signal side
+        if (signal.side === "UP") {
+          allowBidUp = true;
+          allowBidDown = false;
+        } else {
+          allowBidUp = false;
+          allowBidDown = true;
+        }
+
+        // NO ACCUMULATION: if position already exists on this side, skip new bid
+        const posId = `${marketId}_${signal.side}`;
+        const existingPos = positions.get(posId);
+        if (existingPos) {
+          allowBidUp = false;
+          allowBidDown = false;
+          // Don't log every cycle (spammy) — only log once when position blocks entry
+          if (tradeCycleCount % 15 === 0) {
+            console.log(
+              `[SMART] ${market.slug}: ${signal.side} signal (conf=${signal.confidence}) but position already open ` +
+              `(qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)}) — skip`
+            );
+          }
+        }
       } else {
-        // Neutral — skip
+        // No signal — skip entry entirely
         allowBidUp = false;
         allowBidDown = false;
-      }
-      
-      // Skip extreme probability (market nearly resolved)
-      if (upRealMid < 0.10 || upRealMid > 0.90) {
-        allowBidUp = false;
-        allowBidDown = false;
-      }
-      
-      // Skip too close to expiry
-      if (tauNow < 1) {
-        allowBidUp = false;
-        allowBidDown = false;
+        // Log skip reason every 15 cycles (avoid spam)
+        if (tradeCycleCount % 15 === 0 && signal.reasons.length > 0) {
+          console.log(`[SMART] ${market.slug}: skip — ${signal.reasons[0]}`);
+        }
       }
     }
 
@@ -1073,7 +1102,7 @@ function generateQuotes(btc: BtcPriceData): void {
       // ASK_UP — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askUp > entryPrice × 1.005 (min 0.5% profit).
       // If position is in loss, DON'T sell — hold to settlement (chance of $1).
-      const minProfitAskUp = upPos ? upPos.entryPrice * 1.08 : 0;
+      const minProfitAskUp = upPos ? smartTpThreshold(upPos.entryPrice) : 0;  // 6% TP (smart R:R)
       if (upQtyOwned >= qtyAskUp && askUp >= minProfitAskUp) {
         const askQty = Math.min(qtyAskUp, upQtyOwned);
         const existingAsk = findActive("ASK_UP");
@@ -1103,7 +1132,7 @@ function generateQuotes(btc: BtcPriceData): void {
 
       // ASK_DOWN — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askDown > entryPrice × 1.005 (min 0.5% profit).
-      const minProfitAskDown = downPos ? downPos.entryPrice * 1.08 : 0;
+      const minProfitAskDown = downPos ? smartTpThreshold(downPos.entryPrice) : 0;  // 6% TP (smart R:R)
       if (downQtyOwned >= qtyAskDown && askDown >= minProfitAskDown) {
         const askQty = Math.min(qtyAskDown, downQtyOwned);
         const existingAsk = findActive("ASK_DOWN");
@@ -1415,14 +1444,17 @@ function markToMarket(_btc: BtcPriceData): void {
       const tau = (market.expiresAt - Date.now()) / 60000;
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
       const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
-      const dynSlPct = Math.max(0.15, Math.min(0.30, atrPct * 12));  // 15-30% (was 5-20%, too tight)
+      // SMART SL: 10-20% dynamic (was 15-30%)
+      // Tighter SL for high-win-rate strategy: cut losses faster
+      // Break-even: 10/(10+6) = 62.5% win rate needed
+      const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.20, atrPct * 12));  // 10-20%
       const lossPct = -pos.unrealizedPnl / pos.costBasis;
       
       if (lossPct >= dynSlPct) {
         stopLossTriggers.push({
           posId,
           marketId: pos.marketId,
-          reason: `dyn_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
+          reason: `smart_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
         });
       } else if (tau < 1) {
         stopLossTriggers.push({
@@ -1558,7 +1590,7 @@ function takerTakeProfit(): void {
       continue;
     }
 
-    const minProfitPrice = pos.entryPrice * 1.08;  // 8% take-profit
+    const minProfitPrice = smartTpThreshold(pos.entryPrice);  // 6% take-profit (smart R:R)
     if (closePrice < minProfitPrice) {
       // Diagnostic logging — показывает пользователю ПОЧЕМУ TP не сработал
       const spread = realAsk > 0 && realBid > 0 ? (realAsk - realBid) : 0;
@@ -2216,36 +2248,56 @@ export function getStatus(btc: BtcPriceData): BotStatus {
 }
 
 export function getMarkets(btc: BtcPriceData) {
-  return Array.from(markets.values()).map(m => ({
-    id: m.id,
-    question: m.question,
-    slug: m.slug,
-    conditionId: m.conditionId,
-    upTokenId: m.upTokenId,
-    downTokenId: m.downTokenId,
-    expiresAt: m.expiresAt,
-    strikePrice: m.strikePrice,
-    negRisk: m.negRisk,
-    lastUpPrice: m.lastUpPrice,
-    lastDownPrice: m.lastDownPrice,
-    volume: m.volume,
-    liquidity: m.liquidity,
-    feeRate: m.feeRate,
-    makerFeeRate: m.makerFeeRate,
-    isReal: m.isReal,
-    active: m.active,
-    realUpMid: m.realUpMid,
-    realUpBestBid: m.realUpBestBid,
-    realUpBestAsk: m.realUpBestAsk,
-    realDownMid: m.realDownMid,
-    realDownBestBid: m.realDownBestBid,
-    realDownBestAsk: m.realDownBestAsk,
-    realSpreadUp: m.realSpreadUp,
-    realSpreadDown: m.realSpreadDown,
-    timeToExpiry: Math.max(0, (m.expiresAt - Date.now()) / 60000).toFixed(1),
-    inventory: inventory.get(m.id) || 0,
-    ourUpPrice: calcUpProbability(m, btc),
-  }));
+  return Array.from(markets.values()).map(m => {
+    // Compute smart entry signal for each market (for dashboard display)
+    const signal = smartEntrySignal(m, btc, calcUpProbability(m, btc));
+    return {
+      id: m.id,
+      question: m.question,
+      slug: m.slug,
+      conditionId: m.conditionId,
+      upTokenId: m.upTokenId,
+      downTokenId: m.downTokenId,
+      expiresAt: m.expiresAt,
+      strikePrice: m.strikePrice,
+      negRisk: m.negRisk,
+      lastUpPrice: m.lastUpPrice,
+      lastDownPrice: m.lastDownPrice,
+      volume: m.volume,
+      liquidity: m.liquidity,
+      feeRate: m.feeRate,
+      makerFeeRate: m.makerFeeRate,
+      isReal: m.isReal,
+      active: m.active,
+      realUpMid: m.realUpMid,
+      realUpBestBid: m.realUpBestBid,
+      realUpBestAsk: m.realUpBestAsk,
+      realDownMid: m.realDownMid,
+      realDownBestBid: m.realDownBestBid,
+      realDownBestAsk: m.realDownBestAsk,
+      realSpreadUp: m.realSpreadUp,
+      realSpreadDown: m.realSpreadDown,
+      timeToExpiry: Math.max(0, (m.expiresAt - Date.now()) / 60000).toFixed(1),
+      inventory: inventory.get(m.id) || 0,
+      ourUpPrice: calcUpProbability(m, btc),
+      // Smart entry signal (for dashboard display)
+      smartSignal: {
+        should: signal.should,
+        side: signal.side,
+        confidence: signal.confidence,
+        upConfidence: signal.details.upConfidence,
+        downConfidence: signal.details.downConfidence,
+        reason: signal.reasons[0] || "",
+        pUp: signal.details.pUp,
+        btc1m: signal.details.btcChange1m,
+        btc5m: signal.details.btcChange5m,
+        upL2Imbalance: signal.details.upL2.imbalance,
+        downL2Imbalance: signal.details.downL2.imbalance,
+        upL2Depth: signal.details.upL2.totalDepth,
+        downL2Depth: signal.details.downL2.totalDepth,
+      },
+    };
+  });
 }
 
 export function getPositions() {
@@ -2257,7 +2309,7 @@ export function getPositions() {
       return {
         ...pos,
         currentBid: 0, currentAsk: 0, currentMid: 0, spread: 0,
-        tpThreshold: pos.entryPrice * 1.08,
+        tpThreshold: smartTpThreshold(pos.entryPrice),  // 6% TP (smart R:R)
         midPnlPct: 0, bidPnlPct: 0,
         tpReady: false, marketExpired: true,
       };
@@ -2266,7 +2318,7 @@ export function getPositions() {
     const currentAsk = pos.side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
     const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
     const spread = (currentAsk > 0 && currentBid > 0) ? currentAsk - currentBid : 0;
-    const tpThreshold = pos.entryPrice * 1.08;
+    const tpThreshold = smartTpThreshold(pos.entryPrice);  // 6% TP (smart R:R)
     const closePrice = currentBid > 0 ? Math.floor(currentBid * 100) / 100 : 0;
     const midPnlPct = currentMid > 0 ? (currentMid / pos.entryPrice - 1) * 100 : 0;
     const bidPnlPct = closePrice > 0 ? (closePrice / pos.entryPrice - 1) * 100 : 0;
