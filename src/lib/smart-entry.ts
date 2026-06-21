@@ -1,21 +1,26 @@
-// ─── Smart L2 Entry Strategy ──────────────────────────────
-// Goal: achieve ~90% win rate by entering only when MULTIPLE signals align:
-//   1. BTC trend (1m + 5m change confirms direction)
-//   2. L2 order book depth (bid/ask pressure imbalance)
-//   3. Probability model (P(UP) edge vs market price)
-//   4. Time window (2-12 min to expiry — not too early, not too late)
-//   5. Price filter (avoid extremes 0.10/0.90 and middle 0.45-0.55)
+// ─── Contrarian Strategy v2 (2026-06-21) ──────────────────
+// Complete rewrite from momentum-following to contrarian.
 //
-// Key principle: CONFIDENCE-BASED ENTRY
-// Bot only enters when 3+ signals agree on direction → high conviction → high win rate.
-// If signals conflict or are weak → SKIP (no entry is better than bad entry).
+// RATIONALE (from 25% win rate analysis):
+// 1. Momentum strategy bought UP after BTC rally → price already 0.80-0.90 → no room
+// 2. Fees 4.4% round-trip kill symmetric R:R (need 73% win rate at entry $0.75)
+// 3. L2 bid pressure is PRO-CYCLICAL (retail FOMO at top = worst entry)
+// 4. Model P(UP) just mirrors market price → no edge
 //
-// Risk/Reward:
-//   TP = 6% (entry * 1.06) — realistic, hit often when direction is right
-//   SL = 10% (entry * 0.90) — tight enough to cut losses, loose enough for noise
-//   Break-even win rate: 10 / (10 + 6) = 62.5%
-//   At 90% win rate: EV = 0.9 * $0.156 - 0.1 * $0.375 = +$0.10/trade
-//   Profit factor at 90%: (0.9 * 0.156) / (0.1 * 0.375) = 3.74
+// NEW APPROACH: Contrarian + Asymmetric R:R + Maker entry
+// - BTC 5m > 1.5% rally → BUY DOWN (expect mean reversion)
+// - BTC 5m < -1.5% drop → BUY UP (expect bounce)
+// - TP=15%, SL=5% → R:R=2.8, break-even win rate 25%
+// - Maker entry (BID at best bid, no crossing) → 0 taker fee on entry
+// - Entry at tau=10-13min when price ~0.50 (true coin flip, room for TP)
+//
+// MATHEMATICS:
+// Entry $0.55, TP=$0.6325, SL=$0.5225
+// Maker fee entry = $0, taker fee exit ≈ $0.04
+// Net win = +$0.42, Net loss = -$0.15
+// R:R = 2.8, break-even = 25%
+// At 50% win rate: EV = +$0.13/trade
+// At 70% win rate: EV = +$0.25/trade
 
 export interface L2Level {
   price: number;
@@ -23,52 +28,33 @@ export interface L2Level {
 }
 
 export interface L2DepthAnalysis {
-  bidDepth: number;       // sum of (size * price) for top N bid levels (USD)
-  askDepth: number;       // sum of (size * price) for top N ask levels (USD)
+  bidDepth: number;
+  askDepth: number;
   totalDepth: number;
-  bidPressure: number;    // bidDepth / totalDepth (0-1, >0.5 = buyers dominate)
-  askPressure: number;    // askDepth / totalDepth (0-1, >0.5 = sellers dominate)
-  imbalance: number;      // (bidDepth - askDepth) / totalDepth (-1 to +1)
-  bidLevels: number;      // count of meaningful bid levels
-  askLevels: number;      // count of meaningful ask levels
+  bidPressure: number;
+  askPressure: number;
+  imbalance: number;
+  bidLevels: number;
+  askLevels: number;
 }
 
-// Analyze L2 depth: aggregate top N levels of order book
-export function analyzeL2Depth(
-  bids: L2Level[],
-  asks: L2Level[],
-  topN: number = 5
-): L2DepthAnalysis {
-  let bidDepth = 0;
-  let askDepth = 0;
-  let bidLevels = 0;
-  let askLevels = 0;
-
+export function analyzeL2Depth(bids: L2Level[], asks: L2Level[], topN: number = 5): L2DepthAnalysis {
+  let bidDepth = 0, askDepth = 0, bidLevels = 0, askLevels = 0;
   for (let i = 0; i < Math.min(topN, bids.length); i++) {
     const lvl = bids[i];
-    if (lvl && lvl.size > 0 && lvl.price > 0) {
-      bidDepth += lvl.size * lvl.price;
-      bidLevels++;
-    }
+    if (lvl && lvl.size > 0 && lvl.price > 0) { bidDepth += lvl.size * lvl.price; bidLevels++; }
   }
   for (let i = 0; i < Math.min(topN, asks.length); i++) {
     const lvl = asks[i];
-    if (lvl && lvl.size > 0 && lvl.price > 0) {
-      askDepth += lvl.size * lvl.price;
-      askLevels++;
-    }
+    if (lvl && lvl.size > 0 && lvl.price > 0) { askDepth += lvl.size * lvl.price; askLevels++; }
   }
-
   const totalDepth = bidDepth + askDepth;
   return {
-    bidDepth,
-    askDepth,
-    totalDepth,
+    bidDepth, askDepth, totalDepth,
     bidPressure: totalDepth > 0 ? bidDepth / totalDepth : 0.5,
     askPressure: totalDepth > 0 ? askDepth / totalDepth : 0.5,
     imbalance: totalDepth > 0 ? (bidDepth - askDepth) / totalDepth : 0,
-    bidLevels,
-    askLevels,
+    bidLevels, askLevels,
   };
 }
 
@@ -100,11 +86,11 @@ export interface BtcLike {
 export interface SmartEntrySignal {
   should: boolean;
   side: "UP" | "DOWN";
-  confidence: number;       // 0-100, need >= 70 to enter
-  reasons: string[];        // human-readable signals
+  confidence: number;
+  reasons: string[];
   details: {
-    tau: number;            // minutes to expiry
-    pUp: number;            // model probability UP wins
+    tau: number;
+    pUp: number;
     btcChange1m: number;
     btcChange5m: number;
     upL2: L2DepthAnalysis;
@@ -116,189 +102,133 @@ export interface SmartEntrySignal {
   };
 }
 
-// Local probability calc (simple version to avoid circular import with mm-engine)
-function calcPUpSimple(market: MarketLike, btc: BtcLike): number {
-  const { price, atr5m } = btc;
-  if (price <= 0) return 0.5;
-
-  let strike = market.strikePrice;
-  if (strike <= 0) strike = price;
-  if (strike <= 0) return 0.5;
-
-  const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau <= 0) return price > strike ? 0.99 : 0.01;
-
-  const distPct = (price - strike) / price;
-  const atrPct = atr5m > 0 ? atr5m / price : 0.001;
-  const expectedMove = atrPct * Math.sqrt(Math.max(tau, 0.1) / 5);
-
-  if (expectedMove <= 0) return price > strike ? 0.6 : 0.4;
-
-  // Z-score: how many std devs is current price above strike
-  const z = distPct / expectedMove;
-
-  // Sigmoid: P(UP) = 1 / (1 + exp(-k*z))
-  // k=3 gives smooth probability curve
-  const k = 3;
-  const pUp = 1 / (1 + Math.exp(-k * z));
-
-  // Blend with market price (50% model, 50% market — Bayesian-ish)
-  const marketPUp = market.realUpMid > 0 ? market.realUpMid : 0.5;
-  return 0.6 * pUp + 0.4 * marketPUp;
-}
-
-// ─── MAIN SMART ENTRY SIGNAL ──────────────────────────────
-// Returns entry decision based on 4 signals:
-//   1. BTC trend (1m + 5m change)
-//   2. L2 depth pressure (bid/ask imbalance)
-//   3. Probability model (P(UP) edge)
-//   4. Time window (2-12 min to expiry)
+// ─── MAIN CONTRARIAN SIGNAL ───────────────────────────────
+// Logic: BTC 5m rally → expect mean reversion → BUY DOWN
+//        BTC 5m drop → expect bounce → BUY UP
 //
-// Confidence scoring (need >= 70 to enter, AND 10+ gap between UP/DOWN):
-//   - BTC 1m change > 0.05%: +25 for direction
-//   - BTC 5m change > 0.15%: +25 for direction
-//   - L2 bid pressure > 65%: +20 for direction (per token side)
-//   - L2 ask pressure > 65%: +20 for OPPOSITE direction (sellers = bearish)
-//   - Model P(UP) > 65%: +25 for UP, < 35%: +25 for DOWN
-//   - Time bonus (tau < 5): +5 both
+// Hard filters (early return if violated):
+//   - tau must be 10-13 min (price ~0.50, room for TP, low fees)
+//   - |BTC 1m| must be < 3% (no adverse selection on spikes)
+//   - BTC 5m must be > 1.5% or < -1.5% (need movement to fade)
+//   - BTC 5m |change| must be < 4% (avoid extreme exhaustion, but allow fade)
+//   - UP mid must be 0.20-0.80 (avoid near-resolved markets)
 //
-// Max possible: 25 + 25 + 20 + 20 + 25 + 5 = 120 (but rarely all align)
-// Realistic strong signal: 70-90
+// Soft scoring (need >= 50 confidence, lower than before because signals are stronger):
+//   - BTC 5m in [1.5%, 4%] → contrarian DOWN signal (+30)
+//   - BTC 5m in [-4%, -1.5%] → contrarian UP signal (+30)
+//   - BTC 1m confirms direction of 5m (momentum continuing) → +20 contrarian
+//   - L2 imbalance CONTRARIAN: high UP bid pressure (FOMO) → +20 DOWN (fade the crowd)
+//   - Price not extreme (0.30-0.70) → +10 (room for TP)
 export function smartEntrySignal(
   market: MarketLike,
   btc: BtcLike,
-  pUpExternal?: number  // optional: use external calcUpProbability if available
+  _pUpExternal?: number  // ignored — model P(UP) was useless (mirrors market)
 ): SmartEntrySignal {
   const reasons: string[] = [];
   let upConfidence = 0;
   let downConfidence = 0;
 
-  // ── 1. Time window filter ──
-  const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 2 || tau > 12) {
-    return {
-      should: false,
-      side: "UP",
-      confidence: 0,
-      reasons: [`⏰ Outside time window: tau=${tau.toFixed(1)}min (need 2-12min)`],
-      details: {
-        tau,
-        pUp: pUpExternal ?? 0.5,
-        btcChange1m: btc.change1m || 0,
-        btcChange5m: btc.change5m || 0,
-        upL2: analyzeL2Depth(market.upBids, market.upAsks),
-        downL2: analyzeL2Depth(market.downBids, market.downAsks),
-        upMid: market.realUpMid,
-        downMid: market.realDownMid,
-        upConfidence: 0,
-        downConfidence: 0,
-      },
-    };
-  }
-
-  // Time bonus: closer to expiry = signal more reliable (less time for reversal)
-  if (tau < 5) {
-    upConfidence += 5;
-    downConfidence += 5;
-    reasons.push(`⏰ Time: ${tau.toFixed(1)}min to expiry (close = +5 bonus)`);
-  } else {
-    reasons.push(`⏰ Time: ${tau.toFixed(1)}min to expiry (OK but no bonus)`);
-  }
-
-  // ── 2. BTC trend signals ──
   const change1m = btc.change1m || 0;
   const change5m = btc.change5m || 0;
-
-  // 1-minute change threshold: 0.05% = ~$30 on $60k BTC
-  if (change1m > 0.0005) {
-    upConfidence += 25;
-    reasons.push(`📈 BTC 1m +${(change1m * 100).toFixed(2)}% → UP (+25)`);
-  } else if (change1m < -0.0005) {
-    downConfidence += 25;
-    reasons.push(`📉 BTC 1m ${(change1m * 100).toFixed(2)}% → DOWN (+25)`);
-  } else {
-    reasons.push(`➡️ BTC 1m ${(change1m * 100).toFixed(3)}% (no signal, need ±0.05%)`);
-  }
-
-  // 5-minute change threshold: 0.15% = ~$95 on $60k BTC
-  if (change5m > 0.0015) {
-    upConfidence += 25;
-    reasons.push(`📈 BTC 5m +${(change5m * 100).toFixed(2)}% → UP trend (+25)`);
-  } else if (change5m < -0.0015) {
-    downConfidence += 25;
-    reasons.push(`📉 BTC 5m ${(change5m * 100).toFixed(2)}% → DOWN trend (+25)`);
-  } else {
-    reasons.push(`➡️ BTC 5m ${(change5m * 100).toFixed(3)}% (no signal, need ±0.15%)`);
-  }
-
-  // ── 3. L2 Depth analysis ──
+  const upMid = market.realUpMid;
+  const downMid = market.realDownMid;
   const upL2 = analyzeL2Depth(market.upBids, market.upAsks, 5);
   const downL2 = analyzeL2Depth(market.downBids, market.downAsks, 5);
 
-  // UP token L2: high bid pressure = people buying UP = bullish for UP
-  // Min depth $50 to filter out empty books
-  const MIN_L2_DEPTH = 50;
-  if (upL2.totalDepth >= MIN_L2_DEPTH) {
-    if (upL2.bidPressure > 0.65) {
-      upConfidence += 20;
-      reasons.push(`📚 UP L2 bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% → UP (+20)`);
-    } else if (upL2.askPressure > 0.65) {
-      // People selling UP = they think DOWN wins
-      downConfidence += 20;
-      reasons.push(`📚 UP L2 ask pressure ${(upL2.askPressure * 100).toFixed(0)}% → DOWN (+20)`);
-    } else {
-      reasons.push(`📚 UP L2 balanced (bid ${(upL2.bidPressure * 100).toFixed(0)}% / ask ${(upL2.askPressure * 100).toFixed(0)}%)`);
-    }
-  } else {
-    reasons.push(`⚠️ UP L2 too thin ($${upL2.totalDepth.toFixed(0)} < $${MIN_L2_DEPTH})`);
-  }
-
-  if (downL2.totalDepth >= MIN_L2_DEPTH) {
-    if (downL2.bidPressure > 0.65) {
-      downConfidence += 20;
-      reasons.push(`📚 DOWN L2 bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% → DOWN (+20)`);
-    } else if (downL2.askPressure > 0.65) {
-      // People selling DOWN = they think UP wins
-      upConfidence += 20;
-      reasons.push(`📚 DOWN L2 ask pressure ${(downL2.askPressure * 100).toFixed(0)}% → UP (+20)`);
-    } else {
-      reasons.push(`📚 DOWN L2 balanced (bid ${(downL2.bidPressure * 100).toFixed(0)}% / ask ${(downL2.askPressure * 100).toFixed(0)}%)`);
-    }
-  } else {
-    reasons.push(`⚠️ DOWN L2 too thin ($${downL2.totalDepth.toFixed(0)} < $${MIN_L2_DEPTH})`);
-  }
-
-  // ── 4. Probability model ──
-  const pUp = pUpExternal ?? calcPUpSimple(market, btc);
-  if (pUp > 0.65) {
-    upConfidence += 25;
-    reasons.push(`🎯 Model P(UP)=${(pUp * 100).toFixed(0)}% > 65% → UP (+25)`);
-  } else if (pUp < 0.35) {
-    downConfidence += 25;
-    reasons.push(`🎯 Model P(UP)=${(pUp * 100).toFixed(0)}% < 35% → DOWN (+25)`);
-  } else {
-    reasons.push(`🎯 Model P(UP)=${(pUp * 100).toFixed(0)}% (neutral, need <35% or >65%)`);
-  }
-
-  // ── 5. Price filter — avoid extremes and pure coin-flip ──
-  const upMid = market.realUpMid;
-  if (upMid < 0.10 || upMid > 0.90) {
+  // ── 1. Time window — 10-13 min (late enough for price discovery, early enough for TP) ──
+  const tau = (market.expiresAt - Date.now()) / 60000;
+  if (tau < 10 || tau > 13) {
     return {
-      should: false,
-      side: "UP",
-      confidence: 0,
-      reasons: [`🚫 UP mid $${upMid.toFixed(2)} too extreme (need 0.10-0.90)`, ...reasons],
-      details: {
-        tau, pUp, btcChange1m: change1m, btcChange5m: change5m,
-        upL2, downL2, upMid, downMid: market.realDownMid,
-        upConfidence, downConfidence,
-      },
+      should: false, side: "UP", confidence: 0,
+      reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 10-13min for price ~0.50)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (10-13min)`);
+
+  // ── 2. Hard volatility filter — skip if |1m| > 3% (adverse selection) ──
+  if (Math.abs(change1m) > 0.03) {
+    return {
+      should: false, side: "UP", confidence: 0,
+      reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±3% (adverse selection)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
 
-  // ── 6. Decision — need >= 70 confidence AND 10+ gap ──
-  const MIN_CONFIDENCE = 70;
-  const MIN_GAP = 10;
+  // ── 3. Price filter — avoid extremes ──
+  if (upMid < 0.20 || upMid > 0.80) {
+    return {
+      should: false, side: "UP", confidence: 0,
+      reasons: [`🚫 UP mid $${upMid.toFixed(2)} too extreme (need 0.20-0.80)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+
+  // ── 4. Contrarian signal — BTC 5m movement ──
+  // BTC 5m > 1.5% rally → expect mean reversion → BUY DOWN
+  // BTC 5m < -1.5% drop → expect bounce → BUY UP
+  // Hard cutoff at 4% (extreme moves may continue, don't fade)
+  const MIN_BTC_5M = 0.015;  // 1.5%
+  const MAX_BTC_5M = 0.04;   // 4%
+
+  if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
+    downConfidence += 30;
+    reasons.push(`📉 BTC 5m +${(change5m * 100).toFixed(2)}% → contrarian DOWN (+30, expect reversion)`);
+  } else if (change5m < -MIN_BTC_5M && change5m > -MAX_BTC_5M) {
+    upConfidence += 30;
+    reasons.push(`📈 BTC 5m ${(change5m * 100).toFixed(2)}% → contrarian UP (+30, expect bounce)`);
+  } else if (Math.abs(change5m) >= MAX_BTC_5M) {
+    return {
+      should: false, side: "UP", confidence: 0,
+      reasons: [`⚡ BTC 5m ${(change5m * 100).toFixed(2)}% too extreme (>|4%|, may continue, don't fade)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  } else {
+    return {
+      should: false, side: "UP", confidence: 0,
+      reasons: [`➡️ BTC 5m ${(change5m * 100).toFixed(3)}% too small (need ±1.5% to fade)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+
+  // ── 5. BTC 1m confirms 5m direction (momentum continuing = better fade) ──
+  if (change5m > 0 && change1m > 0.001) {
+    downConfidence += 20;
+    reasons.push(`📉 BTC 1m +${(change1m * 100).toFixed(2)}% confirms rally → DOWN (+20)`);
+  } else if (change5m < 0 && change1m < -0.001) {
+    upConfidence += 20;
+    reasons.push(`📈 BTC 1m ${(change1m * 100).toFixed(2)}% confirms drop → UP (+20)`);
+  } else {
+    reasons.push(`➡️ BTC 1m ${(change1m * 100).toFixed(2)}% doesn't confirm 5m (no bonus)`);
+  }
+
+  // ── 6. L2 CONTRARIAN signal — fade retail FOMO ──
+  // High UP bid pressure = retail buying UP at top = fade them → BUY DOWN
+  // High DOWN bid pressure = retail buying DOWN at bottom = fade them → BUY UP
+  const MIN_L2_DEPTH = 50;
+  if (upL2.totalDepth >= MIN_L2_DEPTH && upL2.bidPressure > 0.65) {
+    downConfidence += 20;
+    reasons.push(`📚 UP L2 bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian DOWN (+20)`);
+  } else if (downL2.totalDepth >= MIN_L2_DEPTH && downL2.bidPressure > 0.65) {
+    upConfidence += 20;
+    reasons.push(`📚 DOWN L2 bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian UP (+20)`);
+  } else {
+    reasons.push(`📚 L2 balanced (UP bid ${(upL2.bidPressure * 100).toFixed(0)}% / DOWN bid ${(downL2.bidPressure * 100).toFixed(0)}%)`);
+  }
+
+  // ── 7. Price room bonus — prefer 0.40-0.60 (true coin flip, max room) ──
+  if (upMid >= 0.40 && upMid <= 0.60) {
+    upConfidence += 10;
+    downConfidence += 10;
+    reasons.push(`💰 UP mid $${upMid.toFixed(2)} in sweet spot 0.40-0.60 (+10 both)`);
+  } else {
+    reasons.push(`💰 UP mid $${upMid.toFixed(2)} outside sweet spot 0.40-0.60 (no bonus)`);
+  }
+
+  // ── 8. Decision — need >= 50 confidence AND 20+ gap ──
+  // Lower threshold than before because contrarian signals are stronger
+  const MIN_CONFIDENCE = 50;
+  const MIN_GAP = 20;
 
   let side: "UP" | "DOWN" = "UP";
   let confidence = 0;
@@ -310,20 +240,12 @@ export function smartEntrySignal(
     side = "DOWN";
     confidence = downConfidence;
   } else {
-    // Not enough conviction — skip
     return {
       should: false,
       side: upConfidence >= downConfidence ? "UP" : "DOWN",
       confidence: Math.max(upConfidence, downConfidence),
-      reasons: [
-        `🚫 Insufficient conviction: UP=${upConfidence} DOWN=${downConfidence} (need ${MIN_CONFIDENCE}+ AND ${MIN_GAP}+ gap)`,
-        ...reasons,
-      ],
-      details: {
-        tau, pUp, btcChange1m: change1m, btcChange5m: change5m,
-        upL2, downL2, upMid, downMid: market.realDownMid,
-        upConfidence, downConfidence,
-      },
+      reasons: [`🚫 Insufficient conviction: UP=${upConfidence} DOWN=${downConfidence} (need ${MIN_CONFIDENCE}+ AND ${MIN_GAP}+ gap)`, ...reasons],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence, downConfidence },
     };
   }
 
@@ -331,29 +253,21 @@ export function smartEntrySignal(
     should: true,
     side,
     confidence,
-    reasons: [
-      `✅ ENTER ${side} (confidence=${confidence}/100, UP=${upConfidence} DOWN=${downConfidence})`,
-      ...reasons,
-    ],
-    details: {
-      tau, pUp, btcChange1m: change1m, btcChange5m: change5m,
-      upL2, downL2, upMid, downMid: market.realDownMid,
-      upConfidence, downConfidence,
-    },
+    reasons: [`✅ CONTRARIAN ENTER ${side} (conf=${confidence}, UP=${upConfidence} DOWN=${downConfidence})`, ...reasons],
+    details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence, downConfidence },
   };
 }
 
-// ─── Smart TP/SL thresholds ───────────────────────────────
-// Goal: favorable R:R for high-win-rate strategy
+// ─── Asymmetric TP/SL — favorable R:R after fees ──────────
+// TP=15% (entry * 1.15) — wide, but contrarian reversals are big
+// SL=5%  (entry * 0.95) — tight, cut losses fast if momentum continues
 //
-// TP = 6% (entry * 1.06) — realistic, hits often when direction is right
-// SL = 10% (entry * 0.90) — tight enough to cut losses, loose enough for noise
-//
-// Break-even win rate: 10 / (10 + 6) = 62.5%
-// At 90% win rate: EV = 0.9 * $0.156 - 0.1 * $0.375 = +$0.10/trade
-// Profit factor at 90%: (0.9 * 0.156) / (0.1 * 0.375) = 3.74
-export const SMART_TP_PCT = 0.06;  // 6% take-profit
-export const SMART_SL_PCT = 0.10;  // 10% stop-loss
+// R:R = 15/5 = 3.0 (gross), ~2.8 after fees
+// Break-even win rate: 5 / (5 + 15) = 25%
+// At 50% win rate: EV = 0.5 * $0.42 - 0.5 * $0.15 = +$0.13/trade
+// At 70% win rate: EV = 0.7 * $0.42 - 0.3 * $0.15 = +$0.25/trade
+export const SMART_TP_PCT = 0.15;  // 15% take-profit
+export const SMART_SL_PCT = 0.05;  // 5% stop-loss (tight)
 
 export function smartTpThreshold(entryPrice: number): number {
   return entryPrice * (1 + SMART_TP_PCT);

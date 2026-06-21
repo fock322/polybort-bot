@@ -1625,10 +1625,9 @@ function markToMarket(_btc: BtcPriceData): void {
       const tau = (market.expiresAt - Date.now()) / 60000;
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
       const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
-      // SMART SL: 10-20% dynamic (was 15-30%)
-      // Tighter SL for high-win-rate strategy: cut losses faster
-      // Break-even: 10/(10+6) = 62.5% win rate needed
-      const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.20, atrPct * 12));  // 10-20%
+      // CONTRARIAN v2 (2026-06-21): SL range 5-10% (tight, matches TP=15% SL=5% R:R=3)
+      // Tight SL cuts losses fast if momentum continues against contrarian entry
+      const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.10, atrPct * 12));  // 5-10%
       const lossPct = -pos.unrealizedPnl / pos.costBasis;
       
       if (lossPct >= dynSlPct) {
