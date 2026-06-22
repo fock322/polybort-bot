@@ -957,13 +957,9 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
 
     // Filter 2: Minimum volume — need real traders to fill our quotes
-    // FIX (2026-06-20): raised from $1000 to $3000
-    // Analysis showed 3/5 losing trades happened on vol=$1880 market:
-    //   - Wide spreads → SL triggers before TP
-    //   - Adverse selection: bot fills at peak, price reverses
-    //   - Low trader interest → unreliable price discovery
-    // On $3000+ markets: tighter spreads, more reliable signals
-    const MIN_VOLUME_USD = 3000;
+    // CONTRARIAN: $3000 (tighter, less trades but higher quality)
+    // MOMENTUM: $2000 (per user request, more entry opportunities on full market)
+    const MIN_VOLUME_USD = config.strategy === "momentum" ? 2000 : 3000;
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
@@ -1114,27 +1110,59 @@ function generateQuotes(btc: BtcPriceData): void {
           }
         }
 
-        // NO ACCUMULATION: if position already exists on this side, skip new bid
-        // AND cancel active BID on this side (was adding to position via maker fills)
+        // NO ACCUMULATION for contrarian; PARTIAL FILLS for momentum (up to 3 entries)
+        // MOMENTUM: scaling in — allows multiple fills to build position over time.
+        //   Each fill is small ($1-2), up to 3 fills total per market+side.
+        //   This averages entry price and reduces adverse selection risk.
+        // CONTRARIAN: single entry only (no adding to position)
         const posId = `${marketId}_${signal.side}`;
         const existingPos = positions.get(posId);
         const bidSideToCheck = signal.side === "UP" ? "BID_UP" : "BID_DOWN";
+
         if (existingPos) {
-          allowBidUp = false;
-          allowBidDown = false;
-          // FIX 4: Cancel active BID on this side — position exists, don't add more
-          for (const [, q] of quotes) {
-            if (q.status !== "active" || q.marketId !== marketId) continue;
-            if (q.side === bidSideToCheck) {
-              q.status = "cancelled";
+          if (config.strategy === "momentum") {
+            // MOMENTUM: allow partial fills up to MAX_PARTIAL_ENTRIES (3)
+            const MAX_PARTIAL_ENTRIES = 3;
+            const currentFillCount = Math.ceil(existingPos.quantity / 6);  // each fill ~6 tokens
+            if (currentFillCount >= MAX_PARTIAL_ENTRIES) {
+              // Max entries reached — stop adding
+              allowBidUp = false;
+              allowBidDown = false;
+              for (const [, q] of quotes) {
+                if (q.status !== "active" || q.marketId !== marketId) continue;
+                if (q.side === bidSideToCheck) q.status = "cancelled";
+              }
+              if (tradeCycleCount % 15 === 0) {
+                console.log(
+                  `[MOMENTUM] ${market.slug}: ${signal.side} max partial entries (${MAX_PARTIAL_ENTRIES}) reached ` +
+                  `(qty=${existingPos.quantity}) — stop adding`
+                );
+              }
+            } else {
+              // Allow another partial entry — keep BID active
+              if (tradeCycleCount % 15 === 0) {
+                console.log(
+                  `[MOMENTUM] ${market.slug}: ${signal.side} scaling in ` +
+                  `fill ${currentFillCount}/${MAX_PARTIAL_ENTRIES} (qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)})`
+                );
+              }
             }
-          }
-          // Don't log every cycle (spammy) — only log once when position blocks entry
-          if (tradeCycleCount % 15 === 0) {
-            console.log(
-              `[SMART] ${market.slug}: ${signal.side} signal (conf=${signal.confidence}) but position already open ` +
-              `(qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)}) — skip + cancel BID`
-            );
+          } else {
+            // CONTRARIAN: single entry only — cancel BID if position exists
+            allowBidUp = false;
+            allowBidDown = false;
+            for (const [, q] of quotes) {
+              if (q.status !== "active" || q.marketId !== marketId) continue;
+              if (q.side === bidSideToCheck) {
+                q.status = "cancelled";
+              }
+            }
+            if (tradeCycleCount % 15 === 0) {
+              console.log(
+                `[CONTRARIAN] ${market.slug}: ${signal.side} signal (conf=${signal.confidence}) but position already open ` +
+                `(qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)}) — skip + cancel BID`
+              );
+            }
           }
         }
       } else {
@@ -1580,12 +1608,10 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 
   quote.status = "filled";
 
-  // FIX 4 (2026-06-20): NO ACCUMULATION — after a BID fill, cancel ALL other
-  // active BID quotes on the same market+side. This prevents maker fills from
-  // adding to the position over subsequent cycles.
-  // Analysis showed positions grew to 13-20 tokens via repeated maker fills,
-  // causing avg loss $0.89 instead of theoretical $0.50.
-  if (side.startsWith("BID")) {
+  // CONTRARIAN: cancel all BID quotes after fill (no accumulation)
+  // MOMENTUM: KEEP BID quotes active for partial fills (scaling in)
+  // The partial-fill logic in generateQuotes limits to 3 entries per market+side.
+  if (side.startsWith("BID") && config.strategy !== "momentum") {
     for (const [, q] of quotes) {
       if (q.status !== "active" || q.marketId !== quote.marketId) continue;
       if (q.side === side) {
@@ -1627,33 +1653,85 @@ function markToMarket(_btc: BtcPriceData): void {
     if (pos.currentValue > pos.peakValue) pos.peakValue = pos.currentValue;
     totalUnrealized += pos.unrealizedPnl;
 
-    // ── DYNAMIC STOP-LOSS based on ATR + 1 min to expiry ──
-    // Two INDEPENDENT conditions (either triggers close):
-    // 1. Loss >= dynamic ATR-based percentage (5-20% depending on volatility)
-    // 2. Less than 1 min to expiry → close regardless of PnL
-    if (pos.costBasis > 0 && pos.unrealizedPnl < 0) {
+    // ── DYNAMIC STOP-LOSS ──
+    // CONTRARIAN: ATR-based % SL (5-10%)
+    // MOMENTUM: BTC-strike based SL — стоп по тикам от target, не по %
+    //   - Если bot купил UP (ожидает BTC > strike) и BTC упал ниже strike на N тиков → стоп
+    //   - Если bot купил DOWN (ожидает BTC < strike) и BTC вырос выше strike на N тиков → стоп
+    //   - Неважно какой % от entry price — стопается по BTC movement против позиции
+    if (pos.costBasis > 0) {
       const tau = (market.expiresAt - Date.now()) / 60000;
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
-      const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
-      // CONTRARIAN v2 (2026-06-21): SL range 5-10% (tight, matches TP=15% SL=5% R:R=3)
-      // Tight SL cuts losses fast if momentum continues against contrarian entry
-      // MOMENTUM: uses MOMENTUM_SL_PCT (5%) same range
-      const slPct = config.strategy === "momentum" ? MOMENTUM_SL_PCT : SMART_SL_PCT;
-      const dynSlPct = Math.max(slPct, Math.min(0.10, atrPct * 12));  // 5-10%
-      const lossPct = -pos.unrealizedPnl / pos.costBasis;
-      
-      if (lossPct >= dynSlPct) {
-        stopLossTriggers.push({
-          posId,
-          marketId: pos.marketId,
-          reason: `${config.strategy}_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
-        });
-      } else if (tau < 1) {
-        stopLossTriggers.push({
-          posId,
-          marketId: pos.marketId,
-          reason: `stop_loss_1min_to_expiry`,
-        });
+
+      if (config.strategy === "momentum") {
+        // MOMENTUM: BTC-strike stop loss
+        // 1 тик = $10 BTC (adjustable, для BTC $64000 это ~0.016%)
+        // Порог: 10 тиков = $100 = ~0.16% от BTC price
+        // Если BTC ушёл от strike против позиции на 10 тиков → стоп
+        const BTC_TICK_SIZE = 10;       // $10 per tick
+        const STOP_TICKS = 10;          // 10 ticks = $100
+        const strike = pos.entryStrikePrice > 0 ? pos.entryStrikePrice : market.strikePrice;
+
+        if (strike > 0) {
+          const btcDelta = btcPrice - strike;  // positive = BTC above strike
+          let shouldStop = false;
+          let stopReason = "";
+
+          if (pos.side === "UP") {
+            // Bot expects BTC > strike. If BTC < strike - STOP_TICKS*tickSize → stop
+            const stopThreshold = strike - (STOP_TICKS * BTC_TICK_SIZE);
+            if (btcPrice < stopThreshold) {
+              shouldStop = true;
+              stopReason = `momentum_btc_strike_sl_${STOP_TICKS}ticks_down`;
+            }
+          } else if (pos.side === "DOWN") {
+            // Bot expects BTC < strike. If BTC > strike + STOP_TICKS*tickSize → stop
+            const stopThreshold = strike + (STOP_TICKS * BTC_TICK_SIZE);
+            if (btcPrice > stopThreshold) {
+              shouldStop = true;
+              stopReason = `momentum_btc_strike_sl_${STOP_TICKS}ticks_up`;
+            }
+          }
+
+          if (shouldStop) {
+            console.log(
+              `[MOMENTUM] BTC-strike SL triggered on ${posId}: side=${pos.side} ` +
+              `btc=$${btcPrice.toFixed(2)} strike=$${strike.toFixed(2)} ` +
+              `delta=${btcDelta >= 0 ? '+' : ''}$${btcDelta.toFixed(2)} (threshold ${STOP_TICKS} ticks = $${STOP_TICKS * BTC_TICK_SIZE})`
+            );
+            stopLossTriggers.push({
+              posId,
+              marketId: pos.marketId,
+              reason: stopReason,
+            });
+          } else if (tau < 1) {
+            stopLossTriggers.push({
+              posId,
+              marketId: pos.marketId,
+              reason: `stop_loss_1min_to_expiry`,
+            });
+          }
+        }
+      } else {
+        // CONTRARIAN: ATR-based % SL (5-10%)
+        if (pos.unrealizedPnl < 0) {
+          const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
+          const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.10, atrPct * 12));  // 5-10%
+          const lossPct = -pos.unrealizedPnl / pos.costBasis;
+          if (lossPct >= dynSlPct) {
+            stopLossTriggers.push({
+              posId,
+              marketId: pos.marketId,
+              reason: `contrarian_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
+            });
+          } else if (tau < 1) {
+            stopLossTriggers.push({
+              posId,
+              marketId: pos.marketId,
+              reason: `stop_loss_1min_to_expiry`,
+            });
+          }
+        }
       }
     }
 

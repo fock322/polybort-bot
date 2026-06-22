@@ -78,16 +78,19 @@ export function momentumEntrySignal(
   const upL2 = analyzeL2Depth(market.upBids, market.upAsks, 5);
   const downL2 = analyzeL2Depth(market.downBids, market.downAsks, 5);
 
-  // ── 1. Time window — 7-14 min (same as contrarian) ──
+  // ── 1. Time window — FULL MARKET (no tau restriction) ──
+  // CHANGED (2026-06-22): was 7-14min, now trade full market.
+  // Only restrictions: vol > $2000 + L2 conditions + |BTC 1m| < 3%.
+  // This gives more entry opportunities throughout the 15-min market.
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 7 || tau > 14) {
+  if (tau < 1 || tau > 14.5) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⏰ Outside momentum window: tau=${tau.toFixed(1)}min (need 7-14min)`],
+      reasons: [`⏰ Outside tradeable window: tau=${tau.toFixed(1)}min (need 1-14.5min)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
-  reasons.push(`⏰ tau=${tau.toFixed(1)}min in momentum window (7-14min)`);
+  reasons.push(`⏰ tau=${tau.toFixed(1)}min — trading full market`);
 
   // ── 2. Hard volatility filter — skip if |1m| > 3% ──
   if (Math.abs(change1m) > 0.03) {
@@ -144,18 +147,42 @@ export function momentumEntrySignal(
     reasons.push(`➡️ BTC 1m ${(change1m * 100).toFixed(2)}% doesn't confirm 5m (no bonus)`);
   }
 
-  // ── 6. L2 PRO-CYCLICAL signal — confirm trend (opposite of contrarian) ──
-  // High UP bid pressure = retail buying UP = trend confirmed → BUY UP
-  // High DOWN bid pressure = retail buying DOWN = trend confirmed → BUY DOWN
-  const MIN_L2_DEPTH = 50;
-  if (upL2.totalDepth >= MIN_L2_DEPTH && upL2.bidPressure > 0.65) {
+  // ── 6. L2 PRO-CYCLICAL — HARD FILTER (smart entry from order book) ──
+  // CHANGED (2026-06-22): L2 is now MANDATORY, not optional.
+  // Bot must see liquidity + depth confirmation before entering.
+  // - UP entry: requires UP L2 bid pressure > 60% AND depth > $100
+  // - DOWN entry: requires DOWN L2 bid pressure > 60% AND depth > $100
+  // This prevents entering on thin/noisy books.
+  const MIN_L2_DEPTH_REQUIRED = 100;  // $100 minimum depth (was $50)
+  const MIN_L2_BID_PRESSURE = 0.60;   // 60% bid pressure (was 65%)
+
+  // Determine which side L2 should confirm based on 5m direction
+  const momentumSide = change5m > 0 ? "UP" : "DOWN";
+  const l2ForSide = momentumSide === "UP" ? upL2 : downL2;
+
+  if (l2ForSide.totalDepth < MIN_L2_DEPTH_REQUIRED) {
+    return {
+      should: false, side: momentumSide, confidence: 0,
+      reasons: [`🚫 ${momentumSide} L2 too thin: $${l2ForSide.totalDepth.toFixed(0)} < $${MIN_L2_DEPTH_REQUIRED} (need liquidity)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+
+  if (l2ForSide.bidPressure < MIN_L2_BID_PRESSURE) {
+    return {
+      should: false, side: momentumSide, confidence: 0,
+      reasons: [`🚫 ${momentumSide} L2 bid pressure ${(l2ForSide.bidPressure * 100).toFixed(0)}% < ${(MIN_L2_BID_PRESSURE * 100).toFixed(0)}% (no confirmation)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+
+  // L2 confirmed — add confidence
+  if (momentumSide === "UP") {
     upConfidence += 20;
-    reasons.push(`📚 UP L2 bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% (trend confirm) → momentum UP (+20)`);
-  } else if (downL2.totalDepth >= MIN_L2_DEPTH && downL2.bidPressure > 0.65) {
-    downConfidence += 20;
-    reasons.push(`📚 DOWN L2 bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% (trend confirm) → momentum DOWN (+20)`);
+    reasons.push(`📚 UP L2 CONFIRMED: bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% depth $${upL2.totalDepth.toFixed(0)} → momentum UP (+20)`);
   } else {
-    reasons.push(`📚 L2 balanced (UP bid ${(upL2.bidPressure * 100).toFixed(0)}% / DOWN bid ${(downL2.bidPressure * 100).toFixed(0)}%)`);
+    downConfidence += 20;
+    reasons.push(`📚 DOWN L2 CONFIRMED: bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% depth $${downL2.totalDepth.toFixed(0)} → momentum DOWN (+20)`);
   }
 
   // ── 7. Price room bonus — prefer 0.40-0.60 ──
