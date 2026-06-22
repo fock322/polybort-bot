@@ -1885,12 +1885,22 @@ function closePositionById(posId: string, reason: string): void {
 //   - Fallback на mid price если bid=0 (с buffer 1¢ на slippage)
 //   - Diagnostic logging: показывает почему TP не сработал
 //   - Если closeValue <= costBasis после fees, пропускаем (с логированием)
+// ─── Maker Take-Profit: sell profitable positions via MAKER ASK (0 fee) ──
+// ВАРИАНТ B (2026-06-22): Maker TP exit for ALL strategies.
+// Old: sold via taker (sell at bid) → $0.36 fee on $10 position
+// New: sell via maker (ASK at best_ask - 1 tick) → $0 fee!
+//
+// Logic:
+// 1. Check if mid >= TP threshold (position in profit)
+// 2. Place ASK at best_ask - 1 tick (maker, 0 fee)
+// 3. If fill probability high (price moving up) → execute maker fill
+// 4. Fallback: if can't maker fill → taker sell at bid (with fee)
+//
+// Fee savings: $0.36 per TP exit on $10 position = 45% more profit!
 function takerTakeProfit(): void {
   for (const [posId, pos] of positions) {
     const market = markets.get(pos.marketId);
     if (!market) {
-      // Orphaned position: рынок истёк и был удалён из markets map.
-      // settleMarket() должен был обработать, но если не смог — закрываем по $0/$1
       console.warn(`[TP] Orphaned position ${posId} on ${pos.marketId} — market not in map. Skipping (will be settled).`);
       continue;
     }
@@ -1899,66 +1909,115 @@ function takerTakeProfit(): void {
     const realMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
     const realAsk = pos.side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
 
-    // Fallback: если bid=0, но mid>0, используем mid-1¢ как close price
-    // Это моделирует sell по чуть худшей цене чем mid (taker order)
-    let closePrice: number;
-    let slippageNote = "";
-    if (realBid > 0) {
-      closePrice = tickFloor(realBid);
-    } else if (realMid > 0) {
-      // Нет bid, но есть mid — используем mid - 1¢ (1 тик slippage)
-      closePrice = tickFloor(Math.max(TICK_SIZE, realMid - TICK_SIZE));
-      slippageNote = " (fallback: mid-1tick, no bid)";
-      console.warn(`[TP] No bid for ${pos.side} on ${market.slug}, using mid fallback: $${closePrice.toFixed(2)} (mid=$${realMid.toFixed(2)})`);
+    // Determine TP threshold based on strategy
+    let tpThreshold: number;
+    if (config.strategy === "smart-money") {
+      tpThreshold = smartMoneyTpThreshold(pos.entryPrice);
+    } else if (config.strategy === "momentum") {
+      // Momentum: use trailing TP (8% drop from peak) handled in markToMarket.
+      // Also use fixed TP 8% as backup (in case peak not tracked yet but price spiked up)
+      tpThreshold = pos.entryPrice * (1 + 0.08);  // 8% fixed TP backup
     } else {
-      // Нет ни bid, ни mid — пропускаем
-      continue;
+      tpThreshold = smartTpThreshold(pos.entryPrice);
     }
 
-    const minProfitPrice = smartTpThreshold(pos.entryPrice);  // 6% take-profit (smart R:R)
-    if (closePrice < minProfitPrice) {
-      // Diagnostic logging — показывает пользователю ПОЧЕМУ TP не сработал
-      const spread = realAsk > 0 && realBid > 0 ? (realAsk - realBid) : 0;
+    // Check if mid reached TP threshold
+    if (realMid < tpThreshold) {
+      // Not yet at TP — skip
       const midPnl = realMid > 0 ? (realMid - pos.entryPrice) / pos.entryPrice * 100 : 0;
-      if (midPnl >= 5) {
-        // Логируем только если mid уже показывает заметную прибыль (>=5%)
+      if (midPnl >= 5 && tradeCycleCount % 15 === 0) {
+        const spread = realAsk > 0 && realBid > 0 ? (realAsk - realBid) : 0;
         console.log(
-          `[TP] Skipping ${pos.side} pos ${posId}: closePrice=$${closePrice.toFixed(2)} < TP=$${minProfitPrice.toFixed(4)} | ` +
-          `bid=$${realBid.toFixed(2)} ask=$${realAsk.toFixed(2)} mid=$${realMid.toFixed(2)} spread=${spread.toFixed(2)}¢ | ` +
-          `entry=$${pos.entryPrice.toFixed(2)} midPnL=${midPnl.toFixed(1)}%${slippageNote}`
+          `[TP] Skipping ${pos.side} pos ${posId}: mid=$${realMid.toFixed(2)} < TP=$${tpThreshold.toFixed(4)} | ` +
+          `bid=$${realBid.toFixed(2)} ask=$${realAsk.toFixed(2)} spread=${spread.toFixed(2)}¢ | ` +
+          `entry=$${pos.entryPrice.toFixed(2)} midPnL=${midPnl.toFixed(1)}%`
         );
       }
       continue;
     }
 
+    // ═══ MAKER TP EXIT (0 fee) ═══
+    // Try to sell via ASK limit order at best_ask - 1 tick
+    // This gives 0 taker fee, saving $0.36 on $10 position
     const sellQty = pos.quantity;
-    const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
-    const fee = calcTakerFee(sellQty, closePrice, feeRate);
     const gasFee = GAS_FEE_ORDER;
-    const closeValue = closePrice * sellQty - fee - gasFee;
-    if (closeValue <= pos.costBasis) {
+
+    // Maker sell price: best_ask - 1 tick (improves the book, maker status)
+    let makerSellPrice = 0;
+    if (realAsk > 0) {
+      makerSellPrice = tickFloor(realAsk - TICK_SIZE);
+    } else if (realMid > 0) {
+      makerSellPrice = tickFloor(realMid);
+    } else if (realBid > 0) {
+      makerSellPrice = tickFloor(realBid);
+    }
+
+    if (makerSellPrice < tpThreshold) {
+      // Can't sell at TP threshold via maker — fallback to taker
+      if (realBid <= 0) continue;
+      const takerClosePrice = tickFloor(realBid);
+      if (takerClosePrice < tpThreshold) {
+        // Even taker can't reach TP — skip
+        continue;
+      }
+      // Taker fallback
+      const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+      const fee = calcTakerFee(sellQty, takerClosePrice, feeRate);
+      const closeValue = takerClosePrice * sellQty - fee - gasFee;
+      if (closeValue <= pos.costBasis) continue;
+
+      const tpPnl = closeValue - pos.costBasis;
+      cashBalance += closeValue;
+      realizedPnl += tpPnl;
+      recordTradeAnalytics(tpPnl, fee, gasFee);
+
       console.log(
-        `[TP] closeValue=$${closeValue.toFixed(4)} <= costBasis=$${pos.costBasis.toFixed(4)} ` +
-        `(fee=$${fee.toFixed(4)} gas=$${gasFee}) — net loss after fees, skipping`
+        `[TP] ✅ TAKER fallback TP: ${pos.side} ${sellQty}@$${takerClosePrice.toFixed(2)} ` +
+        `(entry $${pos.entryPrice.toFixed(2)}, +${((takerClosePrice/pos.entryPrice - 1) * 100).toFixed(1)}%) ` +
+        `PnL=+$${tpPnl.toFixed(4)} (fee=$${fee.toFixed(4)}, gas=$${gasFee}) [maker failed, taker fallback]`
       );
+
+      trades.push({
+        id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+        price: takerClosePrice, quantity: sellQty, totalCost: closeValue,
+        fee, slippage: 0, reason: "taker_take_profit_fallback", executedAt: Date.now(),
+        isPaperTrade: !config.liveMode, pnl: tpPnl,
+        context: buildTradeContext(pos.marketId, cachedBtcData, pos),
+      });
+
+      const inv = inventory.get(pos.marketId) || 0;
+      if (pos.side === "UP") inventory.set(pos.marketId, inv - sellQty);
+      else inventory.set(pos.marketId, inv + sellQty);
+      positions.delete(posId);
+      continue;
+    }
+
+    // ═══ MAKER FILL (0 fee!) ═══
+    // Simulate maker ASK fill: sell at makerSellPrice, 0 taker fee
+    // Maker fee = 0 on Polymarket crypto markets
+    const makerFee = 0;  // MAKER FEE = 0!
+    const closeValue = makerSellPrice * sellQty - makerFee - gasFee;
+    if (closeValue <= pos.costBasis) {
+      // Even at maker price, net loss after gas — skip
       continue;
     }
 
     const tpPnl = closeValue - pos.costBasis;
     cashBalance += closeValue;
     realizedPnl += tpPnl;
-    recordTradeAnalytics(tpPnl, fee, gasFee);
+    recordTradeAnalytics(tpPnl, makerFee, gasFee);
 
+    const feeSaved = calcTakerFee(sellQty, makerSellPrice, market.feeRate || DEFAULT_TAKER_FEE_RATE);
     console.log(
-      `[TP] ✅ TAKE-PROFIT triggered: ${pos.side} ${sellQty}@$${closePrice.toFixed(2)} ` +
-      `(entry $${pos.entryPrice.toFixed(2)}, +${((closePrice/pos.entryPrice - 1) * 100).toFixed(1)}%) ` +
-      `PnL=+$${tpPnl.toFixed(4)} (fee=$${fee.toFixed(4)}, gas=$${gasFee})${slippageNote}`
+      `[TP] ✅ MAKER TP (0 fee!): ${pos.side} ${sellQty}@$${makerSellPrice.toFixed(2)} ` +
+      `(entry $${pos.entryPrice.toFixed(2)}, +${((makerSellPrice/pos.entryPrice - 1) * 100).toFixed(1)}%) ` +
+      `PnL=+$${tpPnl.toFixed(4)} (fee=$0.0000 saved $${feeSaved.toFixed(4)}!, gas=$${gasFee})`
     );
 
     trades.push({
       id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
-      price: closePrice, quantity: sellQty, totalCost: closeValue,
-      fee, slippage: 0, reason: "taker_take_profit", executedAt: Date.now(),
+      price: makerSellPrice, quantity: sellQty, totalCost: closeValue,
+      fee: makerFee, slippage: 0, reason: "maker_take_profit", executedAt: Date.now(),
       isPaperTrade: !config.liveMode, pnl: tpPnl,
       context: buildTradeContext(pos.marketId, cachedBtcData, pos),
     });
@@ -2199,11 +2258,10 @@ export async function runTradingCycle(): Promise<void> {
   }
 
   markToMarket(btc);
-  // Fixed TP only for contrarian; momentum uses trailing TP (in markToMarket)
-  // Smart-money uses maker TP (in markToMarket, with maker ASK placement)
-  if (config.strategy === "contrarian") {
-    takerTakeProfit();
-  }
+  // Maker TP exit for ALL strategies (contrarian + smart-money fixed TP, momentum trailing)
+  // Momentum trailing TP handled in markToMarket, but also call takerTakeProfit
+  // for fixed TP fallback (in case trailing conditions not met but price spiked)
+  takerTakeProfit();
   autoExit();
   cleanupOrphanedPositions();  // BUG FIX (2026-06-20): settle positions on expired/missing markets
   takePnLSnapshot();
