@@ -16,7 +16,8 @@
 //
 // R:R: variable (trailing), minimum 1:1 at breakeven, can be 5:1+ on big trends
 
-import { smartEntrySignal as _contrarianSignal } from "./smart-entry";
+import { analyzeL2Depth } from "./smart-entry";
+import type { MarketLike, BtcLike, SmartEntrySignal, L2Level, L2DepthAnalysis } from "./smart-entry";
 export { analyzeL2Depth } from "./smart-entry";
 export type { L2Level, L2DepthAnalysis, MarketLike, BtcLike, SmartEntrySignal } from "./smart-entry";
 
@@ -63,9 +64,9 @@ export function shouldTrailingTpTrigger(peakValue: number, currentValue: number)
 //   - L2 bid pressure confirms (PRO-CYCLICAL) → +20
 //   - Sweet spot 0.40-0.60 → +10
 export function momentumEntrySignal(
-  market: import("./smart-entry").MarketLike,
-  btc: import("./smart-entry").BtcLike
-): import("./smart-entry").SmartEntrySignal {
+  market: MarketLike,
+  btc: BtcLike
+): SmartEntrySignal {
   const reasons: string[] = [];
   let upConfidence = 0;
   let downConfidence = 0;
