@@ -43,6 +43,14 @@ import {
   TRAILING_TP_DROP_PCT,
   MOMENTUM_SL_PCT,
 } from "./momentum-entry";
+import {
+  smartMoneyEntrySignal,
+  shouldMakerTpTrigger,
+  smartMoneyTpThreshold,
+  SMART_MONEY_TP_PCT,
+  SMART_MONEY_SL_PCT,
+  MAKER_TP_TIMEOUT_MS,
+} from "./smart-money-entry";
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
@@ -213,7 +221,7 @@ export interface BotConfig {
   quoteSize: number;
   inventorySkewFactor: number;
   cycleIntervalMs: number;
-  strategy: "contrarian" | "momentum";  // strategy mode selector
+  strategy: "contrarian" | "momentum" | "smart-money";  // strategy mode selector
   // ── Inventory management (v2 — anti adverse selection) ──
   rebalanceThreshold: number;    // |inv| above this → enter rebalance-only mode
   adverseSelectionFactor: number; // multiplier on skew when price moves against us
@@ -959,7 +967,8 @@ function generateQuotes(btc: BtcPriceData): void {
     // Filter 2: Minimum volume — need real traders to fill our quotes
     // CONTRARIAN: $3000 (tighter, less trades but higher quality)
     // MOMENTUM: $2000 (per user request, more entry opportunities on full market)
-    const MIN_VOLUME_USD = config.strategy === "momentum" ? 2000 : 3000;
+    // SMART-MONEY: $2000 (same as momentum)
+    const MIN_VOLUME_USD = config.strategy === "contrarian" ? 3000 : 2000;
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
@@ -1056,6 +1065,8 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!rebalanceOnly) {
       const signal = config.strategy === "momentum"
         ? momentumEntrySignal(market, btc)
+        : config.strategy === "smart-money"
+        ? smartMoneyEntrySignal(market, btc)
         : smartEntrySignal(market, btc, calcUpProbability(market, btc));
 
       // Log signal every cycle for debugging (shows WHY bot entered or skipped)
@@ -1237,8 +1248,10 @@ function generateQuotes(btc: BtcPriceData): void {
 
     // ── Sizes (inventory-aware) ──
     // Base quote size scaled to the side's mid price.
-    const baseQtyUp = Math.max(1, Math.round(config.quoteSize / Math.max(upRealMid, TICK_SIZE)));
-    const baseQtyDown = Math.max(1, Math.round(config.quoteSize / Math.max(downRealMid, TICK_SIZE)));
+    // SMART-MONEY: position size $10 (vs $5 for others) — bigger profit per trade
+    const effectiveQuoteSize = config.strategy === "smart-money" ? 10 : config.quoteSize;
+    const baseQtyUp = Math.max(1, Math.round(effectiveQuoteSize / Math.max(upRealMid, TICK_SIZE)));
+    const baseQtyDown = Math.max(1, Math.round(effectiveQuoteSize / Math.max(downRealMid, TICK_SIZE)));
 
     // In rebalance mode, bid smaller (don't dig deeper) and ask bigger (reduce faster).
     const invRatio = config.maxInventory > 0 ? Math.min(Math.abs(inv) / config.maxInventory, 1) : 0;
@@ -1663,8 +1676,8 @@ function markToMarket(_btc: BtcPriceData): void {
       const tau = (market.expiresAt - Date.now()) / 60000;
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
 
-      if (config.strategy === "momentum") {
-        // MOMENTUM: BTC-strike stop loss
+      if (config.strategy === "momentum" || config.strategy === "smart-money") {
+        // MOMENTUM + SMART-MONEY: BTC-strike stop loss
         // 1 тик = $10 BTC (adjustable, для BTC $64000 это ~0.016%)
         // Порог: 10 тиков = $100 = ~0.16% от BTC price
         // Если BTC ушёл от strike против позиции на 10 тиков → стоп
@@ -1752,6 +1765,26 @@ function markToMarket(_btc: BtcPriceData): void {
           posId,
           marketId: pos.marketId,
           reason: `momentum_trailing_tp_drop${(TRAILING_TP_DROP_PCT * 100).toFixed(0)}pct`,
+        });
+      }
+    }
+
+    // ── SMART MONEY: Maker TP exit (0 fee) ──
+    // When price reaches TP threshold → trigger maker TP (taker fallback if needed).
+    // The actual maker ASK placement happens in simulateFills/liveTradingCycle.
+    // Here we just flag the position for TP exit.
+    if (config.strategy === "smart-money" && pos.costBasis > 0) {
+      const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
+      if (shouldMakerTpTrigger(pos.entryPrice, currentMid)) {
+        const profitPct = (currentMid - pos.entryPrice) / pos.entryPrice * 100;
+        console.log(
+          `[SMART-MONEY] Maker TP triggered on ${posId}: entry=$${pos.entryPrice.toFixed(4)} ` +
+          `mid=$${currentMid.toFixed(4)} (+${profitPct.toFixed(1)}% ≥ ${(SMART_MONEY_TP_PCT * 100).toFixed(0)}% TP)`
+        );
+        stopLossTriggers.push({
+          posId,
+          marketId: pos.marketId,
+          reason: `smart_money_maker_tp_${(SMART_MONEY_TP_PCT * 100).toFixed(0)}pct`,
         });
       }
     }
@@ -2167,7 +2200,8 @@ export async function runTradingCycle(): Promise<void> {
 
   markToMarket(btc);
   // Fixed TP only for contrarian; momentum uses trailing TP (in markToMarket)
-  if (config.strategy !== "momentum") {
+  // Smart-money uses maker TP (in markToMarket, with maker ASK placement)
+  if (config.strategy === "contrarian") {
     takerTakeProfit();
   }
   autoExit();
@@ -2561,6 +2595,8 @@ export function getMarkets(btc: BtcPriceData) {
     // Compute smart entry signal for each market (for dashboard display)
     const signal = config.strategy === "momentum"
       ? momentumEntrySignal(m, btc)
+      : config.strategy === "smart-money"
+      ? smartMoneyEntrySignal(m, btc)
       : smartEntrySignal(m, btc, calcUpProbability(m, btc));
     return {
       id: m.id,
