@@ -37,6 +37,12 @@ import {
   SMART_SL_PCT,
   type SmartEntrySignal,
 } from "./smart-entry";
+import {
+  momentumEntrySignal,
+  shouldTrailingTpTrigger,
+  TRAILING_TP_DROP_PCT,
+  MOMENTUM_SL_PCT,
+} from "./momentum-entry";
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
@@ -207,6 +213,7 @@ export interface BotConfig {
   quoteSize: number;
   inventorySkewFactor: number;
   cycleIntervalMs: number;
+  strategy: "contrarian" | "momentum";  // strategy mode selector
   // ── Inventory management (v2 — anti adverse selection) ──
   rebalanceThreshold: number;    // |inv| above this → enter rebalance-only mode
   adverseSelectionFactor: number; // multiplier on skew when price moves against us
@@ -286,6 +293,7 @@ const config: BotConfig = {
   quoteSize: 5,
   inventorySkewFactor: 0.008,
   cycleIntervalMs: 1000,
+  strategy: "contrarian",  // default; momentum service overrides to "momentum"
   // ── Inventory management v2 ──
   rebalanceThreshold: 12,
   adverseSelectionFactor: 3,
@@ -1050,7 +1058,9 @@ function generateQuotes(btc: BtcPriceData): void {
     //   After first fill on market+side, cancel that BID quote to prevent
     //   further maker fills adding to position
     if (!rebalanceOnly) {
-      const signal = smartEntrySignal(market, btc, calcUpProbability(market, btc));
+      const signal = config.strategy === "momentum"
+        ? momentumEntrySignal(market, btc)
+        : smartEntrySignal(market, btc, calcUpProbability(market, btc));
 
       // Log signal every cycle for debugging (shows WHY bot entered or skipped)
       if (signal.should) {
@@ -1627,20 +1637,43 @@ function markToMarket(_btc: BtcPriceData): void {
       const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
       // CONTRARIAN v2 (2026-06-21): SL range 5-10% (tight, matches TP=15% SL=5% R:R=3)
       // Tight SL cuts losses fast if momentum continues against contrarian entry
-      const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.10, atrPct * 12));  // 5-10%
+      // MOMENTUM: uses MOMENTUM_SL_PCT (5%) same range
+      const slPct = config.strategy === "momentum" ? MOMENTUM_SL_PCT : SMART_SL_PCT;
+      const dynSlPct = Math.max(slPct, Math.min(0.10, atrPct * 12));  // 5-10%
       const lossPct = -pos.unrealizedPnl / pos.costBasis;
       
       if (lossPct >= dynSlPct) {
         stopLossTriggers.push({
           posId,
           marketId: pos.marketId,
-          reason: `smart_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
+          reason: `${config.strategy}_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
         });
       } else if (tau < 1) {
         stopLossTriggers.push({
           posId,
           marketId: pos.marketId,
           reason: `stop_loss_1min_to_expiry`,
+        });
+      }
+    }
+
+    // ── MOMENTUM: Trailing Take-Profit ──
+    // No fixed TP ceiling. Track peak value, sell when drops 10% from peak.
+    // Let winners run as long as possible, lock profit on reversal.
+    if (config.strategy === "momentum" && pos.peakValue > pos.costBasis && pos.currentValue > 0) {
+      // Only trigger trailing TP if we've been in profit (peak > cost basis)
+      if (shouldTrailingTpTrigger(pos.peakValue, pos.currentValue)) {
+        const profitPct = (pos.peakValue - pos.costBasis) / pos.costBasis * 100;
+        const dropFromPeak = (pos.peakValue - pos.currentValue) / pos.peakValue * 100;
+        console.log(
+          `[MOMENTUM] Trailing TP triggered on ${posId}: peak=$${pos.peakValue.toFixed(4)} ` +
+          `current=$${pos.currentValue.toFixed(4)} (drop ${dropFromPeak.toFixed(1)}% from peak, ` +
+          `peak profit was ${profitPct.toFixed(1)}%)`
+        );
+        stopLossTriggers.push({
+          posId,
+          marketId: pos.marketId,
+          reason: `momentum_trailing_tp_drop${(TRAILING_TP_DROP_PCT * 100).toFixed(0)}pct`,
         });
       }
     }
@@ -2055,7 +2088,10 @@ export async function runTradingCycle(): Promise<void> {
   }
 
   markToMarket(btc);
-  takerTakeProfit();
+  // Fixed TP only for contrarian; momentum uses trailing TP (in markToMarket)
+  if (config.strategy !== "momentum") {
+    takerTakeProfit();
+  }
   autoExit();
   cleanupOrphanedPositions();  // BUG FIX (2026-06-20): settle positions on expired/missing markets
   takePnLSnapshot();
@@ -2299,6 +2335,11 @@ function getFunderAddress(): `0x${string}` | undefined {
 }
 
 // ─── Public API ───────────────────────────────────────────
+export function setStrategy(strategy: "contrarian" | "momentum"): void {
+  config.strategy = strategy;
+  console.log(`[MM] Strategy set to: ${strategy}`);
+}
+
 export function startEngine(): void {
   if (running) return;
   running = true;
@@ -2423,6 +2464,7 @@ export function getStatus(btc: BtcPriceData): BotStatus {
     lastCycleAt,
     // Live mode status
     liveMode: config.liveMode,
+    strategy: config.strategy,  // "contrarian" or "momentum"
     clobConnected: clob?.connected ?? false,
     clobAddress: clob?.address ?? "",
     clobError: clob?.lastError ?? "",
@@ -2439,7 +2481,9 @@ export function getStatus(btc: BtcPriceData): BotStatus {
 export function getMarkets(btc: BtcPriceData) {
   return Array.from(markets.values()).map(m => {
     // Compute smart entry signal for each market (for dashboard display)
-    const signal = smartEntrySignal(m, btc, calcUpProbability(m, btc));
+    const signal = config.strategy === "momentum"
+      ? momentumEntrySignal(m, btc)
+      : smartEntrySignal(m, btc, calcUpProbability(m, btc));
     return {
       id: m.id,
       question: m.question,

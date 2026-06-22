@@ -162,7 +162,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="card"><div class="card-label">📊 Сделки</div><div class="card-value neutral" id="trades">—</div><div class="card-sub" id="quotesSub">—</div></div>
     <div class="card"><div class="card-label">₿ BTC цена</div><div class="card-value neutral" id="btc">—</div><div class="card-sub" id="uptimeSub">—</div></div>
   </div>
-  <div class="section"><div class="section-title">📋 Открытые позиции</div><div id="positions"><div class="empty">Нет позиций</div></div></div>
+  <div class="section"><div class="section-title">⚔️ Сравнение стратегий (Contrarian vs Momentum)</div><div id="comparison"><div class="empty">Загрузка momentum...</div></div></div>
+  <div class="section"><div class="section-title">📋 Открытые позиции (Contrarian)</div><div id="positions"><div class="empty">Нет позиций</div></div></div>
   <div class="section"><div class="section-title">🏪 Активные рынки</div><div id="markets"><div class="empty">Нет рынков</div></div></div>
   <div class="section"><div class="section-title">📜 История сделок</div><div id="tradesList"><div class="empty">Нет сделок</div></div></div>
   <div class="section"><div class="section-title">📊 Аналитика</div><div id="analytics"><div class="empty">Загрузка...</div></div></div>
@@ -171,7 +172,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 <script>
 const API=window.location.origin;
-async function fetchStatus(){try{const r=await fetch(API+'/');const d=await r.json();updateUI(d);}catch(e){document.getElementById('statusText').textContent='❌ Нет связи';document.getElementById('statusDot').className='status-dot stopped';}}
+async function fetchStatus(){try{const r=await fetch(API+'/');const d=await r.json();window.__lastContrarian=d;updateUI(d);}catch(e){document.getElementById('statusText').textContent='❌ Нет связи';document.getElementById('statusDot').className='status-dot stopped';}}
 function updateUI(d){
   const running=d.running;
   document.getElementById('statusDot').className='status-dot '+(running?'running':'stopped');
@@ -365,9 +366,55 @@ async function fetchTradeAnalysis(){
     document.getElementById('tradeAnalysis').innerHTML='<div class="empty">Ошибка анализа: '+(e.message||e)+'</div>';
   }
 }
+async function fetchComparison(){
+  try{
+    // Fetch momentum service (port 3003) via same hostname
+    const momentumUrl='http://'+window.location.hostname+':3003/';
+    const r=await fetch(momentumUrl);
+    if(!r.ok){document.getElementById('comparison').innerHTML='<div class="empty">Momentum сервис недоступен (порт 3003)</div>';return;}
+    const m=await r.json();
+    const el=document.getElementById('comparison');
+    // Get contrarian stats from current page's last fetch
+    // We'll build comparison table using momentum data + cached contrarian
+    const mWr=((m.winRate||0)*100).toFixed(1);
+    const mWrColor=(m.winRate||0)>=0.7?'#22c55e':(m.winRate||0)>=0.5?'#f59e0b':'#ef4444';
+    const mPnl=m.totalPnl||0;
+    const mPnlColor=mPnl>=0?'pnl-positive':'pnl-negative';
+    const mUptime=(m.uptime||0)/1000;
+    const mH=Math.floor(mUptime/3600);const mMin=Math.floor((mUptime%3600)/60);
+
+    el.innerHTML='<div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;">'+
+      // Contrarian panel
+      '<div style="padding:15px;background:#1e2a1e;border-radius:8px;border:1px solid #22c55e;">'+
+        '<div style="font-size:14px;font-weight:700;color:#22c55e;margin-bottom:10px;">📊 CONTRARIAN (этот бот)</div>'+
+        '<div class="row"><span class="row-label">Баланс</span><span class="row-value" id="cmp_c_bal">$'+(window.__lastContrarian?.balance||0).toFixed(2)+'</span></div>'+
+        '<div class="row"><span class="row-label">PnL</span><span class="row-value '+(window.__lastContrarian?.totalPnl>=0?'pnl-positive':'pnl-negative')+'">'+((window.__lastContrarian?.totalPnl||0)>=0?'+':'')+'$'+(window.__lastContrarian?.totalPnl||0).toFixed(4)+'</span></div>'+
+        '<div class="row"><span class="row-label">Сделок</span><span class="row-value">'+(window.__lastContrarian?.tradeCount||0)+'</span></div>'+
+        '<div class="row"><span class="row-label">Позиций</span><span class="row-value">'+(window.__lastContrarian?.positionCount||0)+'</span></div>'+
+        '<div class="row"><span class="row-label">Стратегия</span><span class="row-value" style="color:#22c55e;">Fade trend</span></div>'+
+        '<div class="row"><span class="row-label">TP/SL</span><span class="row-value">15% / 5%</span></div>'+
+      '</div>'+
+      // Momentum panel
+      '<div style="padding:15px;background:#2a1e1e;border-radius:8px;border:1px solid #f59e0b;">'+
+        '<div style="font-size:14px;font-weight:700;color:#f59e0b;margin-bottom:10px;">🚀 MOMENTUM (порт 3003)</div>'+
+        '<div class="row"><span class="row-label">Баланс</span><span class="row-value">$'+(m.balance||0).toFixed(2)+'</span></div>'+
+        '<div class="row"><span class="row-label">PnL</span><span class="row-value '+mPnlColor+'">'+(mPnl>=0?'+':'')+'$'+mPnl.toFixed(4)+'</span></div>'+
+        '<div class="row"><span class="row-label">Сделок</span><span class="row-value">'+(m.tradeCount||0)+'</span></div>'+
+        '<div class="row"><span class="row-label">Позиций</span><span class="row-value">'+(m.positionCount||0)+'</span></div>'+
+        '<div class="row"><span class="row-label">Стратегия</span><span class="row-value" style="color:#f59e0b;">Follow trend</span></div>'+
+        '<div class="row"><span class="row-label">TP/SL</span><span class="row-value">Trailing 10% / 5%</span></div>'+
+      '</div>'+
+    '</div>'+
+    '<div style="margin-top:10px;font-size:12px;color:#71717a;text-align:center;">'+
+      'Momentum дашборд: <a href="http://'+window.location.hostname+':3003/dashboard" target="_blank" style="color:#f59e0b;">http://'+window.location.hostname+':3003/dashboard</a>'+
+    '</div>';
+  }catch(e){
+    document.getElementById('comparison').innerHTML='<div class="empty">Momentum сервис недоступен: '+(e.message||e)+'</div>';
+  }
+}
 async function sendCommand(cmd){try{await fetch(API+'/'+cmd,{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
-fetchStatus();fetchTrades();fetchAnalytics();fetchTradeAnalysis();
-setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);setInterval(fetchTradeAnalysis,30000);
+fetchStatus();fetchTrades();fetchAnalytics();fetchComparison();
+setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);setInterval(fetchComparison,5000);
 </script>
 </body>
 </html>`;
