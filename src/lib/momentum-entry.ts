@@ -23,15 +23,16 @@ export type { L2Level, L2DepthAnalysis, MarketLike, BtcLike, SmartEntrySignal } 
 
 // ─── Trailing TP constants ────────────────────────────────
 // TRAILING_TP_DROP_PCT: sell when price drops this % from peak
-// Example: 0.10 = 10% drop from peak triggers sell
-//   entry=$0.50, peak=$0.80, current=$0.72 → 10% drop → SELL (lock +44%)
-//   entry=$0.50, peak=$0.55, current=$0.495 → 10% drop → SELL (lock -1%)
+// CHANGED (2026-06-22): was 10%, now 8% — lock profit faster, less giveback.
+// Example: 0.08 = 8% drop from peak triggers sell
+//   entry=$0.50, peak=$0.80, current=$0.736 → 8% drop → SELL (lock +47%)
+//   entry=$0.50, peak=$0.55, current=$0.506 → 8% drop → SELL (lock +1%)
 //
 // No upper limit — position can grow indefinitely.
 // The bigger the trend, the bigger the profit captured.
-export const TRAILING_TP_DROP_PCT = 0.10;  // 10% drop from peak → sell
+export const TRAILING_TP_DROP_PCT = 0.08;  // 8% drop from peak → sell (was 10%)
 
-// Stop-loss: 5% fixed (same as contrarian, tight)
+// Stop-loss: 5% fixed (BTC-strike based, see mm-engine.ts markToMarket)
 export const MOMENTUM_SL_PCT = 0.05;
 
 export function momentumSlThreshold(entryPrice: number): number {
@@ -102,18 +103,22 @@ export function momentumEntrySignal(
   }
 
   // ── 3. Price filter — avoid extremes ──
-  if (upMid < 0.20 || upMid > 0.80) {
+  // CHANGED (2026-06-22): was 0.20-0.80, now 0.10-0.92.
+  // Analysis: 49% of skips were "UP mid too extreme" because when BTC 5m > 1%,
+  // UP token already at $0.85-0.95. Now allows entry up to $0.92 (TP 8% = $0.99 still possible).
+  if (upMid < 0.10 || upMid > 0.92) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`🚫 UP mid $${upMid.toFixed(2)} too extreme (need 0.20-0.80)`],
+      reasons: [`🚫 UP mid $${upMid.toFixed(2)} too extreme (need 0.10-0.92)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
 
   // ── 4. Momentum signal — BTC 5m movement (FOLLOW trend) ──
-  // BTC 5m > 1.0% rally → BUY UP (momentum continuing)
-  // BTC 5m < -1.0% drop → BUY DOWN (momentum continuing)
-  const MIN_BTC_5M = 0.010;  // 1.0%
+  // BTC 5m > 0.5% rally → BUY UP (momentum continuing)
+  // BTC 5m < -0.5% drop → BUY DOWN (momentum continuing)
+  // CHANGED (2026-06-22): was 1.0%, now 0.5% — enter earlier before market prices it in.
+  const MIN_BTC_5M = 0.005;  // 0.5% (was 1.0%)
   const MAX_BTC_5M = 0.05;   // 5.0%
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
