@@ -135,16 +135,20 @@ export function smartEntrySignal(
   const upL2 = analyzeL2Depth(market.upBids, market.upAsks, 5);
   const downL2 = analyzeL2Depth(market.downBids, market.downAsks, 5);
 
-  // ── 1. Time window — 10-13 min (late enough for price discovery, early enough for TP) ──
+  // ── 1. Time window — 7-14 min (wide enough for multiple entries) ──
+  // EXPANDED (2026-06-21): was 10-13min (3min = 20% of market life),
+  // bot made 0 trades in 9h because window too narrow.
+  // Now 7-14min (7min = 47% of market life) → 2.3x more entry opportunities.
+  // Still avoids first 7min (price discovery noise) and last 1min (settlement risk).
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 10 || tau > 13) {
+  if (tau < 7 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 10-13min for price ~0.50)`],
+      reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 7-14min for price discovery)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
-  reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (10-13min)`);
+  reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (7-14min)`);
 
   // ── 2. Hard volatility filter — skip if |1m| > 3% (adverse selection) ──
   if (Math.abs(change1m) > 0.03) {
@@ -167,9 +171,10 @@ export function smartEntrySignal(
   // ── 4. Contrarian signal — BTC 5m movement ──
   // BTC 5m > 1.5% rally → expect mean reversion → BUY DOWN
   // BTC 5m < -1.5% drop → expect bounce → BUY UP
-  // Hard cutoff at 4% (extreme moves may continue, don't fade)
-  const MIN_BTC_5M = 0.015;  // 1.5%
-  const MAX_BTC_5M = 0.04;   // 4%
+  // EXPANDED (2026-06-21): was [1.5%, 4%], now [1.0%, 5%] for more entries.
+  // Hard cutoff at 5% (extreme moves may continue, don't fade)
+  const MIN_BTC_5M = 0.010;  // 1.0% (was 1.5%)
+  const MAX_BTC_5M = 0.05;   // 5% (was 4%)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     downConfidence += 30;
@@ -225,9 +230,11 @@ export function smartEntrySignal(
     reasons.push(`💰 UP mid $${upMid.toFixed(2)} outside sweet spot 0.40-0.60 (no bonus)`);
   }
 
-  // ── 8. Decision — need >= 50 confidence AND 20+ gap ──
-  // Lower threshold than before because contrarian signals are stronger
-  const MIN_CONFIDENCE = 50;
+  // ── 8. Decision — need >= 40 confidence AND 20+ gap ──
+  // LOWERED (2026-06-21): was 50, now 40 — contrarian signals are strong
+  // enough at 40+ (BTC 5m 1% move + L2 confirmation = 50+).
+  // Gap stays at 20 to ensure clear direction.
+  const MIN_CONFIDENCE = 40;
   const MIN_GAP = 20;
 
   let side: "UP" | "DOWN" = "UP";
