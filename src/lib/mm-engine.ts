@@ -45,6 +45,11 @@ import {
 import {
   smartMoneyEntrySignal,
 } from "./smart-money-entry";
+import {
+  holdTpEntrySignal,
+  HOLD_TP_PCT,
+  getHoldSlForTau,
+} from "./hold-tp-entry";
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
@@ -217,7 +222,7 @@ export interface BotConfig {
   quoteSize: number;
   inventorySkewFactor: number;
   cycleIntervalMs: number;
-  strategy: "contrarian" | "momentum" | "smart-money";  // strategy mode selector
+  strategy: "contrarian" | "momentum" | "smart-money" | "hold-tp";  // strategy mode selector
   // ── Inventory management (v2 — anti adverse selection) ──
   rebalanceThreshold: number;    // |inv| above this → enter rebalance-only mode
   adverseSelectionFactor: number; // multiplier on skew when price moves against us
@@ -1088,6 +1093,8 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
         ? momentumEntrySignal(market, assetPriceData)
         : config.strategy === "smart-money"
         ? smartMoneyEntrySignal(market, assetPriceData)
+        : config.strategy === "hold-tp"
+        ? holdTpEntrySignal(market, assetPriceData)
         : smartEntrySignal(market, assetPriceData, calcUpProbability(market, assetPriceData));
 
       // Log signal every cycle for debugging (shows WHY bot entered or skipped)
@@ -1705,15 +1712,41 @@ function markToMarket(_btc: BtcPriceData): void {
         const MIN_HOLD_MS = 30_000;     // 30s normal hold
         const SL_DROP_PCT = config.strategy === "contrarian" ? 0.08 : 0.10;  // 8% contrarian, 10% momentum/smart-money
 
-        // Emergency SL: 25%+ drop → trigger immediately (no hold time check)
-        if (dropPct >= EMERGENCY_SL_PCT) {
+        // ── HOLD-TP: dynamic SL by tau, no emergency 25% ──
+        // tau > 8min: SL 85% (hold, даем время восстановиться)
+        // tau 4-8min: SL 60%
+        // tau 2-4min: SL 30%
+        // tau < 2min: taker exit (последний шанс до settlement)
+        if (config.strategy === "hold-tp") {
+          const dynSl = getHoldSlForTau(tau);
+          // tau < 2 min → taker exit (close regardless of PnL)
+          if (tau < 2) {
+            console.log(
+              `[HOLD-TP] ⏰ TAKER EXIT on ${posId}: tau=${tau.toFixed(1)}min < 2min (last chance before settlement) ` +
+              `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}%)`
+            );
+            stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_taker_exit_2min` });
+          }
+          // Dynamic SL hit → exit (only after 30s hold to avoid panic on entry)
+          else if (dynSl.slPct > 0 && dropPct >= dynSl.slPct && holdTime >= MIN_HOLD_MS) {
+            console.log(
+              `[HOLD-TP] 🛑 DYNAMIC SL on ${posId}: tau=${tau.toFixed(1)}min SL=${(dynSl.slPct * 100).toFixed(0)}% ` +
+              `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${dynSl.slPct * 100}%)`
+            );
+            tpTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_dyn_sl_${(dynSl.slPct * 100).toFixed(0)}pct` });
+          }
+          // Otherwise: HOLD — позиция реабилитируется, ждём TP 8% или settlement
+          // (TP 8% обрабатывается в takerTakeProfit через tpTriggers)
+        }
+        // Emergency SL: 25%+ drop → trigger immediately (no hold time check) — для старых стратегий
+        else if (dropPct >= EMERGENCY_SL_PCT) {
           console.log(
             `[SL] 🚨 EMERGENCY SL on ${posId}: side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} ` +
             `mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${EMERGENCY_SL_PCT * 100}%, hold=${(holdTime/1000).toFixed(0)}s)`
           );
           tpTriggers.push({ posId, marketId: pos.marketId, reason: `emergency_sl_${(EMERGENCY_SL_PCT * 100).toFixed(0)}pct` });
         }
-        // Normal SL: drop >= threshold AND hold >= 30s
+        // Normal SL: drop >= threshold AND hold >= 30s — для старых стратегий
         else if (dropPct >= SL_DROP_PCT && holdTime >= MIN_HOLD_MS) {
           console.log(
             `[SL] ${config.strategy.toUpperCase()} SL on ${posId}: side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} ` +
@@ -1721,7 +1754,7 @@ function markToMarket(_btc: BtcPriceData): void {
           );
           tpTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_maker_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct` });
         }
-        // SL pending: drop >= threshold but hold < 30s
+        // SL pending: drop >= threshold but hold < 30s — для старых стратегий
         else if (dropPct >= SL_DROP_PCT && dropPct < EMERGENCY_SL_PCT && holdTime < MIN_HOLD_MS) {
           if (tradeCycleCount % 10 === 0) {
             console.log(
@@ -1730,8 +1763,8 @@ function markToMarket(_btc: BtcPriceData): void {
             );
           }
         }
-        // 1 min to expiry — close regardless
-        else if (tau < 1) {
+        // 1 min to expiry — close regardless (для старых стратегий, hold-tp уже обработан выше)
+        else if (tau < 1 && config.strategy !== "hold-tp") {
           stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `stop_loss_1min_to_expiry` });
         }
       }
@@ -1948,6 +1981,9 @@ function takerTakeProfit(): void {
     } else if (config.strategy === "momentum") {
       // Momentum: fixed TP 8% backup (trailing TP handled in markToMarket)
       tpThreshold = pos.entryPrice * (1 + 0.08);
+    } else if (config.strategy === "hold-tp") {
+      // Hold-TP: TP 8% maker exit (0 fee) — ждём пока цена дойдёт
+      tpThreshold = pos.entryPrice * (1 + HOLD_TP_PCT);
     } else {
       tpThreshold = smartTpThreshold(pos.entryPrice);
     }
@@ -2540,7 +2576,7 @@ function getFunderAddress(): `0x${string}` | undefined {
 }
 
 // ─── Public API ───────────────────────────────────────────
-export function setStrategy(strategy: "contrarian" | "momentum"): void {
+export function setStrategy(strategy: "contrarian" | "momentum" | "smart-money" | "hold-tp"): void {
   config.strategy = strategy;
   console.log(`[MM] Strategy set to: ${strategy}`);
 }
@@ -2693,6 +2729,8 @@ export async function getMarkets(btc: BtcPriceData) {
       ? momentumEntrySignal(m, assetPriceData)
       : config.strategy === "smart-money"
       ? smartMoneyEntrySignal(m, assetPriceData)
+      : config.strategy === "hold-tp"
+      ? holdTpEntrySignal(m, assetPriceData)
       : smartEntrySignal(m, assetPriceData, calcUpProbability(m, assetPriceData));
     result.push({
       id: m.id,
