@@ -92,7 +92,8 @@ export function smartMoneyEntrySignal(
 
   // ── 2. Low volatility filter — |BTC 1m| < 2% ──
   // Stricter than momentum (3%) — avoid adverse selection entirely
-  if (Math.abs(change1m) > 0.03) {
+  // FREQ FIX: volatility filter 3% → 5%
+  if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±2% (adverse selection risk)`],
@@ -114,8 +115,9 @@ export function smartMoneyEntrySignal(
   // ── 4. BTC 5m trend signal — [0.5%, 3%] (early trend, not exhausted) ──
   // 0.5% minimum: enough movement to confirm direction
   // 3% maximum: beyond this, trend likely exhausted (mean reversion risk)
-  const MIN_BTC_5M = 0.005;  // 0.5%
-  const MAX_BTC_5M = 0.05;   // 5.0% (relaxed to match momentum)
+  // FREQ FIX: MIN_BTC_5M 0.005 → 0.003, MAX 5% → 6%
+  const MIN_BTC_5M = 0.003;  // 0.3% (was 0.5%)
+  const MAX_BTC_5M = 0.06;   // 6% (was 5%)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     upConfidence += 30;
@@ -158,8 +160,9 @@ export function smartMoneyEntrySignal(
   // UP entry: UP L2 bid pressure > 65% AND depth > $200
   // DOWN entry: DOWN L2 bid pressure > 65% AND depth > $200
   // Stricter depth ($200 vs $100) for higher quality entries
-  const MIN_L2_DEPTH_REQUIRED = 100;  // $100 (relaxed, was $200)
-  const MIN_L2_BID_PRESSURE = 0.65;   // 65%
+  // FREQ FIX: L2 depth $100 → $50, bid pressure 0.65 → 0.55
+  const MIN_L2_DEPTH_REQUIRED = 50;  // $50 (was $100)
+  const MIN_L2_BID_PRESSURE = 0.55;   // 55% (was 65%)
 
   const smartMoneySide = change5m > 0 ? "UP" : "DOWN";
   const l2ForSide = smartMoneySide === "UP" ? upL2 : downL2;

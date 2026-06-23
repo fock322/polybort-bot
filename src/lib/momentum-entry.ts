@@ -93,8 +93,8 @@ export function momentumEntrySignal(
   }
   reasons.push(`⏰ tau=${tau.toFixed(1)}min — trading full market`);
 
-  // ── 2. Hard volatility filter — skip if |1m| > 3% ──
-  if (Math.abs(change1m) > 0.03) {
+  // FREQ FIX: volatility filter 3% → 5% (was causing 64% of all skips)
+  if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±3% (adverse selection)`],
@@ -118,8 +118,9 @@ export function momentumEntrySignal(
   // BTC 5m > 0.5% rally → BUY UP (momentum continuing)
   // BTC 5m < -0.5% drop → BUY DOWN (momentum continuing)
   // CHANGED (2026-06-22): was 1.0%, now 0.5% — enter earlier before market prices it in.
-  const MIN_BTC_5M = 0.005;  // 0.5% (was 1.0%)
-  const MAX_BTC_5M = 0.05;   // 5.0%
+  // FREQ FIX: MIN_BTC_5M 0.005 → 0.003 (catch smaller moves)
+  const MIN_BTC_5M = 0.003;  // 0.3% (was 0.5%)
+  const MAX_BTC_5M = 0.06;   // 6% (was 5%)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     upConfidence += 30;
@@ -158,8 +159,9 @@ export function momentumEntrySignal(
   // - UP entry: requires UP L2 bid pressure > 60% AND depth > $100
   // - DOWN entry: requires DOWN L2 bid pressure > 60% AND depth > $100
   // This prevents entering on thin/noisy books.
-  const MIN_L2_DEPTH_REQUIRED = 100;  // $100 minimum depth (was $50)
-  const MIN_L2_BID_PRESSURE = 0.60;   // 60% bid pressure (was 65%)
+  // FREQ FIX: L2 bid pressure 0.60 → 0.55, depth $100 → $50
+  const MIN_L2_DEPTH_REQUIRED = 50;   // $50 (was $100)
+  const MIN_L2_BID_PRESSURE = 0.55;   // 55% (was 60%)
 
   // Determine which side L2 should confirm based on 5m direction
   const momentumSide = change5m > 0 ? "UP" : "DOWN";

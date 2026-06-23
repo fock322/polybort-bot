@@ -135,13 +135,10 @@ export function smartEntrySignal(
   const upL2 = analyzeL2Depth(market.upBids, market.upAsks, 5);
   const downL2 = analyzeL2Depth(market.downBids, market.downAsks, 5);
 
-  // ── 1. Time window — 7-14 min (wide enough for multiple entries) ──
-  // EXPANDED (2026-06-21): was 10-13min (3min = 20% of market life),
-  // bot made 0 trades in 9h because window too narrow.
-  // Now 7-14min (7min = 47% of market life) → 2.3x more entry opportunities.
-  // Still avoids first 7min (price discovery noise) and last 1min (settlement risk).
+  // ── 1. Time window — 3-14 min (expanded for more entries) ──
+  // FREQ FIX (2026-06-23): was 7-14min (57% skips), now 3-14min (73% of market life).
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 7 || tau > 14) {
+  if (tau < 3 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 7-14min for price discovery)`],
@@ -150,8 +147,9 @@ export function smartEntrySignal(
   }
   reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (7-14min)`);
 
-  // ── 2. Hard volatility filter — skip if |1m| > 3% (adverse selection) ──
-  if (Math.abs(change1m) > 0.03) {
+  // ── 2. Hard volatility filter — skip if |1m| > 5% (was 3%) ──
+  // FREQ FIX: was 3% (caused 32% of all skips), now 5%.
+  if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±3% (adverse selection)`],
@@ -173,8 +171,9 @@ export function smartEntrySignal(
   // BTC 5m < -1.5% drop → expect bounce → BUY UP
   // EXPANDED (2026-06-21): was [1.5%, 4%], now [1.0%, 5%] for more entries.
   // Hard cutoff at 5% (extreme moves may continue, don't fade)
-  const MIN_BTC_5M = 0.010;  // 1.0% (was 1.5%)
-  const MAX_BTC_5M = 0.05;   // 5% (was 4%)
+  // FREQ FIX: MIN_BTC_5M 0.010 → 0.003 (catch smaller moves)
+  const MIN_BTC_5M = 0.003;  // 0.3% (was 1.0%)
+  const MAX_BTC_5M = 0.06;   // 6% (was 5%)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     downConfidence += 30;
@@ -211,10 +210,11 @@ export function smartEntrySignal(
   // High UP bid pressure = retail buying UP at top = fade them → BUY DOWN
   // High DOWN bid pressure = retail buying DOWN at bottom = fade them → BUY UP
   const MIN_L2_DEPTH = 50;
-  if (upL2.totalDepth >= MIN_L2_DEPTH && upL2.bidPressure > 0.65) {
+  // FREQ FIX: L2 bid pressure threshold 0.65 → 0.55 (was causing 20% skips)
+  if (upL2.totalDepth >= MIN_L2_DEPTH && upL2.bidPressure > 0.55) {
     downConfidence += 20;
     reasons.push(`📚 UP L2 bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian DOWN (+20)`);
-  } else if (downL2.totalDepth >= MIN_L2_DEPTH && downL2.bidPressure > 0.65) {
+  } else if (downL2.totalDepth >= MIN_L2_DEPTH && downL2.bidPressure > 0.55) {
     upConfidence += 20;
     reasons.push(`📚 DOWN L2 bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian UP (+20)`);
   } else {

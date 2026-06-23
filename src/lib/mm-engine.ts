@@ -479,9 +479,14 @@ function generateSlug(slotTs: number): string {
   return `btc-updown-15m-${slotTs}`;
 }
 
+// FREQ FIX: Added ETH and SOL markets (3x more entry opportunities)
 const SLUG_PATTERNS = [
   (ts: number) => `btc-updown-15m-${ts}`,
   (ts: number) => `btc-up-or-down-15m-${ts}`,
+  (ts: number) => `eth-updown-15m-${ts}`,
+  (ts: number) => `eth-up-or-down-15m-${ts}`,
+  (ts: number) => `sol-updown-15m-${ts}`,
+  (ts: number) => `sol-up-or-down-15m-${ts}`,
 ];
 
 // ─── Order Book Fetcher ───────────────────────────────────
