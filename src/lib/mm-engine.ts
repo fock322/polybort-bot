@@ -720,11 +720,11 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
 
           discovered.push(existing);
           foundMarket = true;
-          break; // Found with this pattern, skip others
+          // FREQ FIX: DON'T break — continue checking ETH/SOL for same slot
         } catch {
           discovered.push(existing);
           foundMarket = true;
-          break;
+          // FREQ FIX: DON'T break — continue checking ETH/SOL
         }
       }
 
@@ -734,7 +734,7 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
           discovered.push(market);
           knownSlugs.add(slug);
           foundMarket = true;
-          break; // Found with this pattern, skip others
+          // FREQ FIX: DON'T break — continue checking ETH/SOL for same slot
         }
       } catch { /* skip */ }
     } // end slug pattern loop
@@ -970,10 +970,12 @@ function generateQuotes(btc: BtcPriceData): void {
     if (!upBookValid && !downBookValid) continue;  // both sides broken → skip market
 
     // Filter 2: Minimum volume — need real traders to fill our quotes
-    // CONTRARIAN: $3000 (tighter, less trades but higher quality)
-    // MOMENTUM: $2000 (per user request, more entry opportunities on full market)
-    // SMART-MONEY: $2000 (same as momentum)
-    const MIN_VOLUME_USD = config.strategy === "contrarian" ? 3000 : 2000;
+    // FREQ FIX: asset-dependent volume filter
+    // BTC: $2000-3000 (high liquidity), ETH/SOL: $50 (lower liquidity, but still tradeable)
+    const isBtcMarket = market.slug.startsWith("btc-");
+    const MIN_VOLUME_USD = config.strategy === "contrarian"
+      ? (isBtcMarket ? 3000 : 50)
+      : (isBtcMarket ? 2000 : 50);
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
