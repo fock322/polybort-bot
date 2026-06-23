@@ -995,12 +995,13 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     const MIN_VOLUME_USD = config.strategy === "contrarian"
       ? (isBtcMarket ? 3000 : 200)
       : config.strategy === "hold-tp"
-      ? (isBtcMarket ? 500 : 100)   // снижено для hold-tp (ранний вход при нормальных ценах)
+      ? (isBtcMarket ? 100 : 30)   // минимальный порог — hold-tp держит до TP/settlement, не зависит от ликвидности выхода
       : (isBtcMarket ? 2000 : 200);
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
-    const MIN_LIQUIDITY_USD = 200;
+    // HOLD-TP: снижено (держим до TP/settlement, не зависит от немедленной ликвидности)
+    const MIN_LIQUIDITY_USD = config.strategy === "hold-tp" ? 50 : 200;
     if (market.liquidity < MIN_LIQUIDITY_USD) continue;
 
     const inv = inventory.get(marketId) || 0;
