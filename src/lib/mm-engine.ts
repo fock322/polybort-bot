@@ -18,7 +18,7 @@
 // 5. Honest PnL: MtM uses real mid, settlement uses real resolution
 // 6. Daemon loop via setInterval (not API-triggered)
 
-import { getBtcPrice, type BtcPriceData } from "./btc-feed";
+import { getBtcPrice, getAssetPrice, slugToAsset, type BtcPriceData } from "./btc-feed";
 import { getClobClient, initClobClient, destroyClobClient, type ClobClientConfig } from "./clob-client";
 import {
   submitOrder as clobSubmit,
@@ -1069,11 +1069,15 @@ function generateQuotes(btc: BtcPriceData): void {
     //   After first fill on market+side, cancel that BID quote to prevent
     //   further maker fills adding to position
     if (!rebalanceOnly) {
+      // BUG FIX (2026-06-23): Use asset-specific price data for each market.
+      // BTC markets use BTC price feed, ETH markets use ETH, SOL use SOL.
+      const assetSymbol = slugToAsset(market.slug);
+      const assetPriceData = assetSymbol === "BTC" ? btc : (await getAssetPrice(assetSymbol));
       const signal = config.strategy === "momentum"
-        ? momentumEntrySignal(market, btc)
+        ? momentumEntrySignal(market, assetPriceData)
         : config.strategy === "smart-money"
-        ? smartMoneyEntrySignal(market, btc)
-        : smartEntrySignal(market, btc, calcUpProbability(market, btc));
+        ? smartMoneyEntrySignal(market, assetPriceData)
+        : smartEntrySignal(market, assetPriceData, calcUpProbability(market, assetPriceData));
 
       // Log signal every cycle for debugging (shows WHY bot entered or skipped)
       if (signal.should) {
@@ -2676,15 +2680,18 @@ export function getStatus(btc: BtcPriceData): BotStatus {
   };
 }
 
-export function getMarkets(btc: BtcPriceData) {
-  return Array.from(markets.values()).map(m => {
-    // Compute smart entry signal for each market (for dashboard display)
+export async function getMarkets(btc: BtcPriceData) {
+  const result = [];
+  for (const m of Array.from(markets.values())) {
+    // BUG FIX (2026-06-23): Use asset-specific price data for each market
+    const assetSymbol = slugToAsset(m.slug);
+    const assetPriceData = assetSymbol === "BTC" ? btc : (await getAssetPrice(assetSymbol));
     const signal = config.strategy === "momentum"
-      ? momentumEntrySignal(m, btc)
+      ? momentumEntrySignal(m, assetPriceData)
       : config.strategy === "smart-money"
-      ? smartMoneyEntrySignal(m, btc)
-      : smartEntrySignal(m, btc, calcUpProbability(m, btc));
-    return {
+      ? smartMoneyEntrySignal(m, assetPriceData)
+      : smartEntrySignal(m, assetPriceData, calcUpProbability(m, assetPriceData));
+    result.push({
       id: m.id,
       question: m.question,
       slug: m.slug,
@@ -2712,8 +2719,7 @@ export function getMarkets(btc: BtcPriceData) {
       realSpreadDown: m.realSpreadDown,
       timeToExpiry: Math.max(0, (m.expiresAt - Date.now()) / 60000).toFixed(1),
       inventory: inventory.get(m.id) || 0,
-      ourUpPrice: calcUpProbability(m, btc),
-      // Smart entry signal (for dashboard display)
+      ourUpPrice: calcUpProbability(m, assetPriceData),
       smartSignal: {
         should: signal.should,
         side: signal.side,
@@ -2729,8 +2735,9 @@ export function getMarkets(btc: BtcPriceData) {
         upL2Depth: signal.details.upL2.totalDepth,
         downL2Depth: signal.details.downL2.totalDepth,
       },
-    };
-  });
+    });
+  }
+  return result;
 }
 
 export function getPositions() {

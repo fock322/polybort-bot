@@ -35,7 +35,7 @@ const server = Bun.serve({
       if (path === "/" && method === "GET") {
         const btc = await getBtcPrice();
         const status = getStatus(btc);
-        const markets = getMarkets(btc);
+        const markets = await getMarkets(btc);
         const positions = getPositions();
         return Response.json({ ...status, markets: markets.slice(0, 5), positions: positions.slice(0, 10) }, { headers: corsHeaders });
       }
@@ -64,7 +64,7 @@ const server = Bun.serve({
 
       if (path === "/markets" && method === "GET") {
         const btc = await getBtcPrice();
-        return Response.json({ markets: getMarkets(btc) }, { headers: corsHeaders });
+        return Response.json({ markets: await getMarkets(btc) }, { headers: corsHeaders });
       }
 
       if (path === "/positions" && method === "GET") {

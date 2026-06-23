@@ -20,7 +20,7 @@ export async function GET(req: Request) {
     case "status":
       return NextResponse.json(getStatus(btc));
     case "markets":
-      return NextResponse.json(getMarkets(btc));
+      return NextResponse.json(await getMarkets(btc));
     case "positions":
       return NextResponse.json(getPositions());
     case "trades": {
@@ -40,7 +40,7 @@ export async function GET(req: Request) {
     case "all": {
       return NextResponse.json({
         status: getStatus(btc),
-        markets: getMarkets(btc),
+        markets: await getMarkets(btc),
         positions: getPositions(),
         trades: getTrades(10),
         quotes: getQuotes(),

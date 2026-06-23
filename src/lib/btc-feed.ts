@@ -34,6 +34,13 @@ const FETCH_INTERVAL = 3000; // fetch every 3 seconds
 let cached: BtcPriceData | null = null;
 let fetchPromise: Promise<BtcPriceData> | null = null;
 
+// BUG FIX (2026-06-23): Multi-asset price feeds
+// Each asset (BTC, ETH, SOL) has its own cache, EMA, and fetch cycle.
+const assetCache: Map<string, BtcPriceData> = new Map();
+const assetEma: Map<string, number | null> = new Map();
+const assetFetchPromise: Map<string, Promise<BtcPriceData>> = new Map();
+const assetLastFetch: Map<string, number> = new Map();
+
 const defaultData: BtcPriceData = {
   price: 0, atr1m: 0, atr5m: 0, atr15m: 0,
   volatilityPct: 0, change1m: 0, change5m: 0,
@@ -70,17 +77,18 @@ function detectTrend(price: number): "up" | "down" | "neutral" {
 }
 
 // ─── REST API ────────────────────────────────────────────────
-async function fetchPrice(): Promise<number | null> {
+// BUG FIX (2026-06-23): Was hardcoded BTCUSDT. Now supports BTC, ETH, SOL.
+async function fetchPrice(symbol: string = "BTCUSDT"): Promise<number | null> {
   try {
-    const r = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return null;
     return parseFloat((await r.json()).price);
   } catch { return null; }
 }
 
-async function fetchKlines(): Promise<Kline[] | null> {
+async function fetchKlines(symbol: string = "BTCUSDT"): Promise<Kline[] | null> {
   try {
-    const r = await fetch("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=15", { signal: AbortSignal.timeout(5000) });
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=15`, { signal: AbortSignal.timeout(5000) });
     if (!r.ok) return null;
     const data = await r.json();
     return data.map((k: (string | number)[]) => ({
@@ -154,4 +162,100 @@ export async function getBtcPrice(): Promise<BtcPriceData> {
   })();
 
   return fetchPromise;
+}
+
+// ─── Multi-Asset Price Feed (2026-06-23) ──────────────────
+// Independent price feeds for BTC, ETH, SOL.
+// Each asset has its own EMA, ATR, change1m, change5m.
+// This ensures ETH markets use ETH price data, SOL use SOL data.
+//
+// Usage: getAssetPrice("BTC"), getAssetPrice("ETH"), getAssetPrice("SOL")
+// Map market slug → asset: "btc-updown-15m-*" → "BTC", "eth-*" → "ETH", etc.
+export async function getAssetPrice(asset: string = "BTC"): Promise<BtcPriceData> {
+  const symbol = `${asset}USDT`;
+  const now = Date.now();
+
+  // Return cached if fresh
+  const cachedAsset = assetCache.get(asset);
+  const lastFetchAsset = assetLastFetch.get(asset) || 0;
+  if (cachedAsset && now - lastFetchAsset < FETCH_INTERVAL) return cachedAsset;
+
+  // Deduplicate concurrent calls
+  const existing = assetFetchPromise.get(asset);
+  if (existing) return existing;
+
+  const promise = (async () => {
+    try {
+      const [price, klines] = await Promise.all([fetchPrice(symbol), fetchKlines(symbol)]);
+
+      const data: BtcPriceData = { ...defaultData };
+
+      // Asset-specific EMA
+      let aEma = assetEma.get(asset) ?? null;
+      function updateAssetEMA(p: number): void {
+        if (aEma === null) { aEma = p; return; }
+        aEma = (p - aEma) * (2 / 6) + aEma;
+      }
+      function detectAssetTrend(p: number): "up" | "down" | "neutral" {
+        if (aEma === null) return "neutral";
+        if (p > aEma * 1.0002) return "up";
+        if (p < aEma * 0.9998) return "down";
+        return "neutral";
+      }
+
+      if (price !== null) {
+        data.price = price;
+        data.timestamp = now;
+        updateAssetEMA(price);
+        data.connected = true;
+      } else if (cachedAsset) {
+        data.price = cachedAsset.price;
+        data.timestamp = cachedAsset.timestamp;
+      }
+
+      if (klines && klines.length > 0) {
+        data.klines = klines;
+        if (aEma === null) for (const k of klines) updateAssetEMA(k.close);
+      } else if (cachedAsset) {
+        data.klines = cachedAsset.klines;
+      }
+
+      // Calculate metrics
+      if (data.klines.length >= 2) {
+        data.atr1m = atr(data.klines, 1);
+        data.atr5m = atr(data.klines, 5);
+        data.atr15m = atr(data.klines, 14);
+        data.volatilityPct = data.price > 0 ? (data.atr15m / data.price) * Math.sqrt(525600) * 100 : 0;
+
+        const len = data.klines.length;
+        data.change1m = len >= 2 && data.klines[len - 2].close > 0
+          ? ((data.klines[len - 1].close - data.klines[len - 2].close) / data.klines[len - 2].close) * 100 : 0;
+        data.change5m = len >= 6 && data.klines[len - 6].close > 0
+          ? ((data.klines[len - 1].close - data.klines[len - 6].close) / data.klines[len - 6].close) * 100 : 0;
+      }
+
+      data.trend = detectAssetTrend(data.price);
+      data.lastUpdate = now;
+
+      assetEma.set(asset, aEma);
+      assetCache.set(asset, data);
+      assetLastFetch.set(asset, now);
+      return data;
+    } catch {
+      return assetCache.get(asset) || defaultData;
+    } finally {
+      assetFetchPromise.delete(asset);
+    }
+  })();
+
+  assetFetchPromise.set(asset, promise);
+  return promise;
+}
+
+// Helper: map market slug to asset symbol
+export function slugToAsset(slug: string): string {
+  if (slug.startsWith("btc-")) return "BTC";
+  if (slug.startsWith("eth-")) return "ETH";
+  if (slug.startsWith("sol-")) return "SOL";
+  return "BTC";  // default
 }

@@ -10,7 +10,7 @@ export async function GET() {
   try {
     const btc = await getBtcPrice();
     const status = getStatus(btc);
-    const markets = getMarkets(btc);
+    const markets = await getMarkets(btc);
     const positions = getPositions();
     return NextResponse.json({
       ...status,
