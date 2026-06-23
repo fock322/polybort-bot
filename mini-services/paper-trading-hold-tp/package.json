@@ -1,0 +1,8 @@
+{
+  "name": "paper-trading-hold-tp-service",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  }
+}
