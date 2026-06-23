@@ -87,14 +87,14 @@ export function holdTpEntrySignal(
   const upL2 = analyzeL2Depth(market.upBids, market.upAsks, 5);
   const downL2 = analyzeL2Depth(market.downBids, market.downAsks, 5);
 
-  // ── 1. Time window — 4-12 min ──
-  // Нужно минимум 4 мин чтобы TP 8% успел сработать.
-  // Max 12 мин — оставляем 3 мин до settlement на recovery если что.
+  // ── 1. Time window — 2-14.5 min (как momentum — раньше входим) ──
+  // Раньше входим → цена ещё 0.40-0.60 → TP 8% реален.
+  // При tau 4-12 цена уже extreme (рынок решил кто победит).
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 4 || tau > 12) {
+  if (tau < 2 || tau > 14.5) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⏰ Outside hold-tp window: tau=${tau.toFixed(1)}min (need 4-12min)`],
+      reasons: [`⏰ Outside hold-tp window: tau=${tau.toFixed(1)}min (need 2-14.5min)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
@@ -110,15 +110,16 @@ export function holdTpEntrySignal(
     };
   }
 
-  // ── 3. Price filter — UP mid 0.25-0.75 (надо место для +8% TP и для recovery) ──
-  // Если входим на $0.90, TP = $0.972 — почти $1.00, мало шансов.
-  // Если входим на $0.15, TP = $0.162 — тоже узко, и settlement риск выше.
-  if (upMid < 0.25 || upMid > 0.75) {
-    return {
-      should: false, side: "UP", confidence: 0,
-      reasons: [`🚫 UP mid $${upMid.toFixed(2)} outside 0.25-0.75 (нужно место для TP 8%)`],
-      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
-    };
+  // ── 3. Price filter — DYNAMIC по стороне входа ──
+  // UP вход: UP mid должен быть 0.25-0.75 (место для +8% TP = entry*1.08 ≤ $0.81)
+  // DOWN вход: DOWN mid должен быть 0.25-0.75 (место для +8% TP = entry*1.08 ≤ $0.81)
+  // Раньше проверяли только UP mid — блокировало DOWN входы на падающем рынке.
+  const MIN_MID = 0.25;
+  const MAX_MID = 0.75;
+  if (upMid < MIN_MID || upMid > MAX_MID) {
+    // UP mid вне диапазона — но если DOWN mid в диапазоне, DOWN вход возможен
+    // (проверяется ниже после определения стороны по 5m тренду)
+    reasons.push(`⚠️ UP mid $${upMid.toFixed(2)} вне 0.25-0.75 — DOWN вход возможен если DOWN mid в диапазоне`);
   }
 
   // ── 4. Trend signal — 5m в [0.3%, 6%] ──
@@ -160,11 +161,23 @@ export function holdTpEntrySignal(
     };
   }
 
-  // ── 6. L2 HARD FILTER ──
+  // ── 6. L2 HARD FILTER + side-specific MID price check ──
   const MIN_L2_DEPTH = 30;
   const MIN_L2_BID_PRESSURE = 0.50;
   const holdSide = change5m > 0 ? "UP" : "DOWN";
   const l2ForSide = holdSide === "UP" ? upL2 : downL2;
+  const midForSide = holdSide === "UP" ? upMid : downMid;
+
+  // MID price check по стороне входа: нужно 0.25-0.75 чтобы TP 8% был достижим
+  // (entry*1.08 ≤ $0.81, иначе TP почти $1.00 = нереалистично)
+  if (midForSide < MIN_MID || midForSide > MAX_MID) {
+    return {
+      should: false, side: holdSide, confidence: 0,
+      reasons: [`🚫 ${holdSide} mid $${midForSide.toFixed(2)} вне 0.25-0.75 (TP 8% недостижим, нужно место)`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  reasons.push(`💰 ${holdSide} mid $${midForSide.toFixed(2)} в диапазоне 0.25-0.75 (TP 8% = $${(midForSide * 1.08).toFixed(3)} достижим)`);
 
   if (l2ForSide.totalDepth < MIN_L2_DEPTH) {
     return {
