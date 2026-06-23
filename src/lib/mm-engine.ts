@@ -918,7 +918,7 @@ function calcSpread(market: Market, inv: number, btc: BtcPriceData): number {
 // which is exactly what a real MM does on a CLOB. If the market spread is
 // already 1 tick (locked), we skip that side — no edge to capture.
 //
-function generateQuotes(btc: BtcPriceData): void {
+async function generateQuotes(btc: BtcPriceData): Promise<void> {
   // ── Quote lifecycle ──
   // Old code cancelled ALL active quotes every cycle, which prevented maker
   // fills: simulateFills() requires a quote to age MIN_MAKER_FILL_DELAY_MS
@@ -2281,7 +2281,7 @@ export async function runTradingCycle(): Promise<void> {
     }
   }
   
-  generateQuotes(btc);
+  await generateQuotes(btc);
 
   if (config.liveMode) {
     await liveTradingCycle(btc);
