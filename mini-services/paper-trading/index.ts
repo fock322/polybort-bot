@@ -424,8 +424,14 @@ async function fetchComparison(){
   }
 }
 async function sendCommand(cmd){try{await fetch(API+'/'+cmd,{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
-fetchStatus();fetchTrades();fetchAnalytics();fetchComparison();
+// FIX: браузеры троттлят setInterval в фоновых вкладках → дашборд "зависал" со старыми данными.
+// При возврате на вкладку (visibilitychange) — мгновенно обновляем все панели.
 setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);setInterval(fetchComparison,5000);
+document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible'){console.log('[Dashboard] Tab visible — force refresh');fetchStatus();fetchTrades();fetchAnalytics();fetchComparison();}});
+// Доп. защита: авто-reload каждые 5 мин (на случай утечки памяти / зависшего state)
+setInterval(function(){if(document.visibilityState==='visible'){location.reload();}},300000);
+// Первый fetch сразу при загрузке
+fetchStatus();fetchTrades();fetchAnalytics();fetchComparison();
 </script>
 </body>
 </html>`;
