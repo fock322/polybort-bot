@@ -1653,6 +1653,9 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 function markToMarket(_btc: BtcPriceData): void {
   let totalUnrealized = 0;
   const stopLossTriggers: Array<{ posId: string; marketId: string; reason: string }> = [];
+  // FIX 1 (2026-06-22): Separate TP triggers for MAKER exit (0 fee)
+  // TP triggers (trailing TP, smart-money TP) go through maker ASK exit, not taker
+  const tpTriggers: Array<{ posId: string; marketId: string; reason: string }> = [];
 
   for (const [posId, pos] of positions) {
     const market = markets.get(pos.marketId);
@@ -1682,7 +1685,8 @@ function markToMarket(_btc: BtcPriceData): void {
         // Порог: 10 тиков = $100 = ~0.16% от BTC price
         // Если BTC ушёл от strike против позиции на 10 тиков → стоп
         const BTC_TICK_SIZE = 10;       // $10 per tick
-        const STOP_TICKS = 10;          // 10 ticks = $100
+        const STOP_TICKS = 5;           // FIX 2: 5 ticks = $50 (was 10 = $100)
+                                        // Tighter SL: avg loss $0.75 instead of $1.53
         const strike = pos.entryStrikePrice > 0 ? pos.entryStrikePrice : market.strikePrice;
 
         if (strike > 0) {
@@ -1761,7 +1765,7 @@ function markToMarket(_btc: BtcPriceData): void {
           `current=$${pos.currentValue.toFixed(4)} (drop ${dropFromPeak.toFixed(1)}% from peak, ` +
           `peak profit was ${profitPct.toFixed(1)}%)`
         );
-        stopLossTriggers.push({
+        tpTriggers.push({
           posId,
           marketId: pos.marketId,
           reason: `momentum_trailing_tp_drop${(TRAILING_TP_DROP_PCT * 100).toFixed(0)}pct`,
@@ -1781,7 +1785,7 @@ function markToMarket(_btc: BtcPriceData): void {
           `[SMART-MONEY] Maker TP triggered on ${posId}: entry=$${pos.entryPrice.toFixed(4)} ` +
           `mid=$${currentMid.toFixed(4)} (+${profitPct.toFixed(1)}% ≥ ${(SMART_MONEY_TP_PCT * 100).toFixed(0)}% TP)`
         );
-        stopLossTriggers.push({
+        tpTriggers.push({
           posId,
           marketId: pos.marketId,
           reason: `smart_money_maker_tp_${(SMART_MONEY_TP_PCT * 100).toFixed(0)}pct`,
@@ -1790,13 +1794,64 @@ function markToMarket(_btc: BtcPriceData): void {
     }
   }
 
-  // Execute stop-loss closures (after MtM loop, so we don't mutate positions mid-iteration)
+  // Execute stop-loss closures (taker exit, with fee)
   for (const t of stopLossTriggers) {
     console.warn(
       `[MM] STOP-LOSS triggered on ${t.posId}: ${t.reason}. ` +
       `Closing at market bid.`
     );
     closePositionById(t.posId, t.reason);
+  }
+
+  // FIX 1: Execute TP closures via MAKER exit (0 fee!)
+  // Trailing TP and smart-money TP go through maker ASK, not taker
+  for (const t of tpTriggers) {
+    const pos = positions.get(t.posId);
+    if (!pos) continue;
+    const mkt = markets.get(t.marketId);
+    if (!mkt) { closePositionById(t.posId, t.reason); continue; }
+
+    const realAsk = pos.side === "UP" ? mkt.realUpBestAsk : mkt.realDownBestAsk;
+    const realBid = pos.side === "UP" ? mkt.realUpBestBid : mkt.realDownBestBid;
+    const sellQty = pos.quantity;
+    const gasFee = GAS_FEE_ORDER;
+
+    // Maker sell price: best_ask - 1 tick (maker status, 0 fee)
+    let makerSellPrice = 0;
+    if (realAsk > 0) makerSellPrice = tickFloor(realAsk - TICK_SIZE);
+    else if (realBid > 0) makerSellPrice = tickFloor(realBid);
+
+    if (makerSellPrice > 0) {
+      const makerFee = 0;  // MAKER FEE = 0!
+      const closeValue = makerSellPrice * sellQty - makerFee - gasFee;
+      const tpPnl = closeValue - pos.costBasis;
+
+      cashBalance += closeValue;
+      realizedPnl += tpPnl;
+      recordTradeAnalytics(tpPnl, makerFee, gasFee);
+
+      const feeSaved = calcTakerFee(sellQty, makerSellPrice, mkt.feeRate || DEFAULT_TAKER_FEE_RATE);
+      console.log(
+        `[TP] ✅ MAKER TP (0 fee!): ${pos.side} ${sellQty}@$${makerSellPrice.toFixed(2)} ` +
+        `PnL=${tpPnl >= 0 ? '+' : ''}$${tpPnl.toFixed(4)} (fee=$0.0000 saved $${feeSaved.toFixed(4)}!, gas=$${gasFee}) [${t.reason}]`
+      );
+
+      trades.push({
+        id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+        price: makerSellPrice, quantity: sellQty, totalCost: closeValue,
+        fee: makerFee, slippage: 0, reason: t.reason, executedAt: Date.now(),
+        isPaperTrade: !config.liveMode, pnl: tpPnl,
+        context: buildTradeContext(pos.marketId, cachedBtcData, pos),
+      });
+
+      const inv = inventory.get(pos.marketId) || 0;
+      if (pos.side === "UP") inventory.set(pos.marketId, inv - sellQty);
+      else inventory.set(pos.marketId, inv + sellQty);
+      positions.delete(t.posId);
+    } else {
+      // Fallback: taker exit if no ask/bid
+      closePositionById(t.posId, t.reason);
+    }
   }
 
   // BUG FIX: totalPnl was (cash - starting) + unrealized, which double-counts

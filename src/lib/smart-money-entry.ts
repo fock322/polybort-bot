@@ -81,7 +81,7 @@ export function smartMoneyEntrySignal(
   // 5min: price discovery done, market stabilized
   // 13min: still have room for 8% TP before settlement
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 5 || tau > 13) {
+  if (tau < 3 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⏰ Outside smart-money window: tau=${tau.toFixed(1)}min (need 5-13min)`],
@@ -92,7 +92,7 @@ export function smartMoneyEntrySignal(
 
   // ── 2. Low volatility filter — |BTC 1m| < 2% ──
   // Stricter than momentum (3%) — avoid adverse selection entirely
-  if (Math.abs(change1m) > 0.02) {
+  if (Math.abs(change1m) > 0.03) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±2% (adverse selection risk)`],
@@ -103,7 +103,7 @@ export function smartMoneyEntrySignal(
   // ── 3. Price filter — UP mid 0.30-0.70 ──
   // Need room for 8% TP: entry $0.65 → TP $0.70 (OK)
   // entry $0.80 → TP $0.86 (close to cap $1.00, risky)
-  if (upMid < 0.30 || upMid > 0.70) {
+  if (upMid < 0.15 || upMid > 0.85) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`🚫 UP mid $${upMid.toFixed(2)} outside 0.30-0.70 (need room for 8% TP)`],
@@ -115,7 +115,7 @@ export function smartMoneyEntrySignal(
   // 0.5% minimum: enough movement to confirm direction
   // 3% maximum: beyond this, trend likely exhausted (mean reversion risk)
   const MIN_BTC_5M = 0.005;  // 0.5%
-  const MAX_BTC_5M = 0.03;   // 3.0% (stricter than momentum's 5%)
+  const MAX_BTC_5M = 0.05;   // 5.0% (relaxed to match momentum)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     upConfidence += 30;
@@ -158,7 +158,7 @@ export function smartMoneyEntrySignal(
   // UP entry: UP L2 bid pressure > 65% AND depth > $200
   // DOWN entry: DOWN L2 bid pressure > 65% AND depth > $200
   // Stricter depth ($200 vs $100) for higher quality entries
-  const MIN_L2_DEPTH_REQUIRED = 200;  // $200 (stricter)
+  const MIN_L2_DEPTH_REQUIRED = 100;  // $100 (relaxed, was $200)
   const MIN_L2_BID_PRESSURE = 0.65;   // 65%
 
   const smartMoneySide = change5m > 0 ? "UP" : "DOWN";
@@ -191,8 +191,8 @@ export function smartMoneyEntrySignal(
 
   // ── 7. Decision — all filters passed, high conviction ──
   // Confidence should be 80+ (30+25+25=80) if all signals align
-  const MIN_CONFIDENCE = 70;
-  const MIN_GAP = 30;  // strict gap for clear direction
+  const MIN_CONFIDENCE = 50;  // relaxed (was 70)
+  const MIN_GAP = 20;  // relaxed (was 30)
 
   let side: "UP" | "DOWN" = "UP";
   let confidence = 0;
