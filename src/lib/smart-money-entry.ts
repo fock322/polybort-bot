@@ -81,7 +81,8 @@ export function smartMoneyEntrySignal(
   // 5min: price discovery done, market stabilized
   // 13min: still have room for 8% TP before settlement
   const tau = (market.expiresAt - Date.now()) / 60000;
-  if (tau < 3 || tau > 14) {
+  // SMART MONEY v3: tau 2-14 (enter early, hold to settlement)
+  if (tau < 2 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`⏰ Outside smart-money window: tau=${tau.toFixed(1)}min (need 5-13min)`],
@@ -116,8 +117,9 @@ export function smartMoneyEntrySignal(
   // 0.5% minimum: enough movement to confirm direction
   // 3% maximum: beyond this, trend likely exhausted (mean reversion risk)
   // FREQ FIX: MIN_BTC_5M 0.005 → 0.003, MAX 5% → 6%
-  const MIN_BTC_5M = 0.003;  // 0.3% (was 0.5%)
-  const MAX_BTC_5M = 0.06;   // 6% (was 5%)
+  // SMART MONEY v3: MIN_BTC_5M 0.002 (catch very small movements)
+  const MIN_BTC_5M = 0.002;  // 0.2% (was 0.3%)
+  const MAX_BTC_5M = 0.08;   // 8% (was 6%, allow bigger trends)
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     upConfidence += 30;
@@ -161,8 +163,9 @@ export function smartMoneyEntrySignal(
   // DOWN entry: DOWN L2 bid pressure > 65% AND depth > $200
   // Stricter depth ($200 vs $100) for higher quality entries
   // FREQ FIX: L2 depth $100 → $50, bid pressure 0.65 → 0.55
-  const MIN_L2_DEPTH_REQUIRED = 50;  // $50 (was $100)
-  const MIN_L2_BID_PRESSURE = 0.55;   // 55% (was 65%)
+  // SMART MONEY v3: L2 depth $30, bid pressure 50% (relaxed for more entries)
+  const MIN_L2_DEPTH_REQUIRED = 30;  // $30 (was $50)
+  const MIN_L2_BID_PRESSURE = 0.50;   // 50% (was 55%, just needs to be above balanced)
 
   const smartMoneySide = change5m > 0 ? "UP" : "DOWN";
   const l2ForSide = smartMoneySide === "UP" ? upL2 : downL2;
@@ -194,8 +197,9 @@ export function smartMoneyEntrySignal(
 
   // ── 7. Decision — all filters passed, high conviction ──
   // Confidence should be 80+ (30+25+25=80) if all signals align
-  const MIN_CONFIDENCE = 50;  // relaxed (was 70)
-  const MIN_GAP = 20;  // relaxed (was 30)
+  // SMART MONEY v3: lower confidence threshold (hold to settlement = bigger profit potential)
+  const MIN_CONFIDENCE = 40;  // relaxed (was 50)
+  const MIN_GAP = 15;  // relaxed (was 20)
 
   let side: "UP" | "DOWN" = "UP";
   let confidence = 0;

@@ -769,13 +769,12 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
 
 // ─── Settlement ───────────────────────────────────────────
 function settleMarket(marketId: string, market: Market): void {
-  const btcPrice = cachedBtcPrice;
-  if (btcPrice <= 0) {
-    closePositionsForMarket(marketId, "expiry_no_price");
-    return;
-  }
-
-  const upWins = btcPrice > market.strikePrice;
+  // BUG FIX (2026-06-23): Was using BTC price for ALL markets.
+  // For ETH/SOL markets, use token mid price as proxy for asset vs strike.
+  // UP mid > 0.50 → market expects asset > strike → UP wins
+  // UP mid < 0.50 → market expects asset < strike → DOWN wins
+  const upMid = market.realUpMid;
+  const upWins = upMid > 0.50;
   // FIX 5: use cachedBtcData (has real change1m/change5m) instead of mocked data
   const btcData = cachedBtcData;
 
@@ -1687,46 +1686,28 @@ function markToMarket(_btc: BtcPriceData): void {
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
 
       if (config.strategy === "momentum" || config.strategy === "smart-money") {
-        // MOMENTUM + SMART-MONEY: BTC-strike stop loss
-        // 1 тик = $10 BTC (adjustable, для BTC $64000 это ~0.016%)
-        // Порог: 10 тиков = $100 = ~0.16% от BTC price
-        // Если BTC ушёл от strike против позиции на 10 тиков → стоп
-        const BTC_TICK_SIZE = 10;       // $10 per tick
-        const STOP_TICKS = 5;           // FIX 2: 5 ticks = $50 (was 10 = $100)
-                                        // Tighter SL: avg loss $0.75 instead of $1.53
-        const strike = pos.entryStrikePrice > 0 ? pos.entryStrikePrice : market.strikePrice;
+        // MOMENTUM + SMART-MONEY: Asset-strike stop loss
+        // BUG FIX (2026-06-23): Was using BTC price for ALL markets (BTC, ETH, SOL).
+        // For ETH/SOL markets, BTC price vs ETH strike = completely wrong!
+        // FIX: Use token mid price as proxy for whether asset is above/below strike.
+        //   - UP mid > 0.50 → market expects asset > strike (UP likely wins)
+        //   - UP mid < 0.50 → market expects asset < strike (DOWN likely wins)
+        //   - SL triggers when token mid drops 10% from entry (market reversed against us)
+        const SL_DROP_PCT = 0.10;  // 10% drop from entry price = SL
+        const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
 
-        if (strike > 0) {
-          const btcDelta = btcPrice - strike;  // positive = BTC above strike
-          let shouldStop = false;
-          let stopReason = "";
-
-          if (pos.side === "UP") {
-            // Bot expects BTC > strike. If BTC < strike - STOP_TICKS*tickSize → stop
-            const stopThreshold = strike - (STOP_TICKS * BTC_TICK_SIZE);
-            if (btcPrice < stopThreshold) {
-              shouldStop = true;
-              stopReason = `momentum_btc_strike_sl_${STOP_TICKS}ticks_down`;
-            }
-          } else if (pos.side === "DOWN") {
-            // Bot expects BTC < strike. If BTC > strike + STOP_TICKS*tickSize → stop
-            const stopThreshold = strike + (STOP_TICKS * BTC_TICK_SIZE);
-            if (btcPrice > stopThreshold) {
-              shouldStop = true;
-              stopReason = `momentum_btc_strike_sl_${STOP_TICKS}ticks_up`;
-            }
-          }
-
-          if (shouldStop) {
+        if (currentMid > 0 && pos.entryPrice > 0) {
+          const dropPct = (pos.entryPrice - currentMid) / pos.entryPrice;
+          if (dropPct >= SL_DROP_PCT) {
             console.log(
-              `[MOMENTUM] BTC-strike SL triggered on ${posId}: side=${pos.side} ` +
-              `btc=$${btcPrice.toFixed(2)} strike=$${strike.toFixed(2)} ` +
-              `delta=${btcDelta >= 0 ? '+' : ''}$${btcDelta.toFixed(2)} (threshold ${STOP_TICKS} ticks = $${STOP_TICKS * BTC_TICK_SIZE})`
+              `[SL] ${config.strategy.toUpperCase()} SL triggered on ${posId}: ` +
+              `side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} ` +
+              `(drop ${(dropPct * 100).toFixed(1)}% ≥ ${(SL_DROP_PCT * 100).toFixed(0)}%)`
             );
             stopLossTriggers.push({
               posId,
               marketId: pos.marketId,
-              reason: stopReason,
+              reason: `${config.strategy}_token_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct`,
             });
           } else if (tau < 1) {
             stopLossTriggers.push({
@@ -1780,25 +1761,10 @@ function markToMarket(_btc: BtcPriceData): void {
       }
     }
 
-    // ── SMART MONEY: Maker TP exit (0 fee) ──
-    // When price reaches TP threshold → trigger maker TP (taker fallback if needed).
-    // The actual maker ASK placement happens in simulateFills/liveTradingCycle.
-    // Here we just flag the position for TP exit.
-    if (config.strategy === "smart-money" && pos.costBasis > 0) {
-      const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
-      if (shouldMakerTpTrigger(pos.entryPrice, currentMid)) {
-        const profitPct = (currentMid - pos.entryPrice) / pos.entryPrice * 100;
-        console.log(
-          `[SMART-MONEY] Maker TP triggered on ${posId}: entry=$${pos.entryPrice.toFixed(4)} ` +
-          `mid=$${currentMid.toFixed(4)} (+${profitPct.toFixed(1)}% ≥ ${(SMART_MONEY_TP_PCT * 100).toFixed(0)}% TP)`
-        );
-        tpTriggers.push({
-          posId,
-          marketId: pos.marketId,
-          reason: `smart_money_maker_tp_${(SMART_MONEY_TP_PCT * 100).toFixed(0)}pct`,
-        });
-      }
-    }
+    // ── SMART MONEY v3: NO TP — hold to settlement for max profit ──
+    // If trend is correctly identified, market resolves at $1.00 (100%+ profit).
+    // SL (10% token drop) protects against wrong direction.
+    // Settlement handled by settleMarket() when market expires.
   }
 
   // Execute stop-loss closures (taker exit, with fee)
@@ -2301,13 +2267,13 @@ export async function runTradingCycle(): Promise<void> {
 
   await scanMarkets(btc);
   
-  // ── Set strike for markets that don't have it (BTC Up/Down) ──
-  // Polymarket doesn't provide priceToBeat for active markets.
-  // Use BTC price as strike on first cycle (approximation of slot-start price).
+  // ── Set strike for markets that don't have it ──
+  // BUG FIX (2026-06-23): Was using BTC price for ALL markets including ETH/SOL.
+  // Now: strike = -1 sentinel (means "use token mid price as proxy at settlement")
   for (const [id, m] of markets) {
-    if (m.strikePrice <= 0 && btc.price > 0) {
-      m.strikePrice = btc.price;
-      console.log(`[MM] Set strike for ${m.slug}: $${btc.price.toFixed(2)} (BTC price fallback)`);
+    if (m.strikePrice <= 0) {
+      m.strikePrice = -1;  // sentinel: use token mid price for settlement
+      console.log(`[MM] Strike for ${m.slug}: using token mid price proxy (no BTC fallback)`);
     }
   }
   
