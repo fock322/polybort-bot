@@ -2,11 +2,10 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 
-type StrategyKey = 'contrarian' | 'momentum' | 'smart-money' | 'hold-tp'
+type StrategyKey = 'momentum' | 'smart-money' | 'hold-tp'
 
 const STRATEGIES: { key: StrategyKey; port: number; label: string; color: string; emoji: string }[] = [
-  { key: 'contrarian', port: 3002, label: 'Contrarian', color: '#3b82f6', emoji: '🔄' },
-  { key: 'momentum', port: 3003, label: 'Momentum', color: '#f59e0b', emoji: '📈' },
+  { key: 'momentum', port: 3003, label: 'Momentum v4', color: '#f59e0b', emoji: '📈' },
   { key: 'smart-money', port: 3004, label: 'Smart Money', color: '#22c55e', emoji: '🐋' },
   { key: 'hold-tp', port: 3005, label: 'Hold-TP', color: '#a855f7', emoji: '🎯' },
 ]
@@ -27,7 +26,7 @@ interface BotStatus {
 export default function Home() {
   const [active, setActive] = useState<StrategyKey>('momentum')
   const [statuses, setStatuses] = useState<Record<string, BotStatus | null>>({
-    'contrarian': null, 'momentum': null, 'smart-money': null, 'hold-tp': null,
+    'momentum': null, 'smart-money': null, 'hold-tp': null,
   })
   const [lastUpdate, setLastUpdate] = useState<number>(0)
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -38,7 +37,7 @@ export default function Home() {
       if (!r.ok) return
       const data = await r.json()
       const results: Record<string, BotStatus | null> = {
-        'contrarian': null, 'momentum': null, 'smart-money': null, 'hold-tp': null,
+        'momentum': null, 'smart-money': null, 'hold-tp': null,
       }
       for (const s of STRATEGIES) {
         const d = data.bots?.[s.port]

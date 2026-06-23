@@ -41,6 +41,7 @@ import {
   momentumEntrySignal,
   shouldTrailingTpTrigger,
   TRAILING_TP_DROP_PCT,
+  getMomentumSlForTau,
 } from "./momentum-entry";
 import {
   smartMoneyEntrySignal,
@@ -996,12 +997,14 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
       ? (isBtcMarket ? 3000 : 200)
       : config.strategy === "hold-tp"
       ? (isBtcMarket ? 100 : 30)   // минимальный порог — hold-tp держит до TP/settlement, не зависит от ликвидности выхода
+      : config.strategy === "momentum"
+      ? (isBtcMarket ? 500 : 100)  // momentum v4: hold to settlement, можно ниже
       : (isBtcMarket ? 2000 : 200);
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
-    // HOLD-TP: снижено (держим до TP/settlement, не зависит от немедленной ликвидности)
-    const MIN_LIQUIDITY_USD = config.strategy === "hold-tp" ? 50 : 200;
+    // HOLD-TP + MOMENTUM v4: снижено (держим до settlement, не зависит от немедленной ликвидности)
+    const MIN_LIQUIDITY_USD = (config.strategy === "hold-tp" || config.strategy === "momentum") ? 50 : 200;
     if (market.liquidity < MIN_LIQUIDITY_USD) continue;
 
     const inv = inventory.get(marketId) || 0;
@@ -1724,26 +1727,28 @@ function markToMarket(_btc: BtcPriceData): void {
         // tau 4-8min: SL 60%
         // tau 2-4min: SL 30%
         // tau < 2min: taker exit (последний шанс до settlement)
-        if (config.strategy === "hold-tp") {
-          const dynSl = getHoldSlForTau(tau);
+        if (config.strategy === "hold-tp" || config.strategy === "momentum") {
+          // momentum v4: тоже dynamic SL, но пороги свои (60%/30%/taker<2min)
+          const dynSl = config.strategy === "hold-tp"
+            ? getHoldSlForTau(tau)
+            : getMomentumSlForTau(tau);
           // tau < 2 min → taker exit (close regardless of PnL)
           if (tau < 2) {
             console.log(
-              `[HOLD-TP] ⏰ TAKER EXIT on ${posId}: tau=${tau.toFixed(1)}min < 2min (last chance before settlement) ` +
+              `[${config.strategy.toUpperCase()}] ⏰ TAKER EXIT on ${posId}: tau=${tau.toFixed(1)}min < 2min (last chance before settlement) ` +
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}%)`
             );
-            stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_taker_exit_2min` });
+            stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_taker_exit_2min` });
           }
           // Dynamic SL hit → exit (only after 30s hold to avoid panic on entry)
           else if (dynSl.slPct > 0 && dropPct >= dynSl.slPct && holdTime >= MIN_HOLD_MS) {
             console.log(
-              `[HOLD-TP] 🛑 DYNAMIC SL on ${posId}: tau=${tau.toFixed(1)}min SL=${(dynSl.slPct * 100).toFixed(0)}% ` +
+              `[${config.strategy.toUpperCase()}] 🛑 DYNAMIC SL on ${posId}: tau=${tau.toFixed(1)}min SL=${(dynSl.slPct * 100).toFixed(0)}% ` +
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${dynSl.slPct * 100}%)`
             );
-            tpTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_dyn_sl_${(dynSl.slPct * 100).toFixed(0)}pct` });
+            tpTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_dyn_sl_${(dynSl.slPct * 100).toFixed(0)}pct` });
           }
-          // Otherwise: HOLD — позиция реабилитируется, ждём TP 8% или settlement
-          // (TP 8% обрабатывается в takerTakeProfit через tpTriggers)
+          // Otherwise: HOLD — позиция реабилитируется, ждём TP/settlement
         }
         // Emergency SL: 25%+ drop → trigger immediately (no hold time check) — для старых стратегий
         else if (dropPct >= EMERGENCY_SL_PCT) {
@@ -1770,16 +1775,17 @@ function markToMarket(_btc: BtcPriceData): void {
             );
           }
         }
-        // 1 min to expiry — close regardless (для старых стратегий, hold-tp уже обработан выше)
-        else if (tau < 1 && config.strategy !== "hold-tp") {
+        // 1 min to expiry — close regardless (для contrarian/smart-money, hold-tp+momentum уже обработаны выше)
+        else if (tau < 1 && config.strategy !== "hold-tp" && config.strategy !== "momentum") {
           stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `stop_loss_1min_to_expiry` });
         }
       }
     }
 
-    // ── MOMENTUM: Trailing Take-Profit ──
-    // No fixed TP ceiling. Track peak value, sell when drops 10% from peak.
-    // Let winners run as long as possible, lock profit on reversal.
+    // ── MOMENTUM v4: NO trailing TP — hold to settlement (как smart-money) ──
+    // Раньше был trailing TP (drop 8% from peak → sell). v4 держит до settlement
+    // для максимальной прибыли ($1.00). SL обрабатывается в блоке выше (dynamic by tau).
+    // shouldTrailingTpTrigger всегда возвращает false в v4 — этот блок пропускается.
     if (config.strategy === "momentum" && pos.peakValue > pos.costBasis && pos.currentValue > 0) {
       // Only trigger trailing TP if we've been in profit (peak > cost basis)
       if (shouldTrailingTpTrigger(pos.peakValue, pos.currentValue)) {
@@ -1986,8 +1992,9 @@ function takerTakeProfit(): void {
       // Smart Money v3: no fixed TP (hold to settlement) — skip takerTakeProfit
       continue;
     } else if (config.strategy === "momentum") {
-      // Momentum: fixed TP 8% backup (trailing TP handled in markToMarket)
-      tpThreshold = pos.entryPrice * (1 + 0.08);
+      // Momentum v4: NO fixed TP — hold to settlement (как smart-money)
+      // SL обрабатывается в markToMarket (dynamic by tau)
+      continue;
     } else if (config.strategy === "hold-tp") {
       // Hold-TP: TP 8% maker exit (0 fee) — ждём пока цена дойдёт
       tpThreshold = pos.entryPrice * (1 + HOLD_TP_PCT);
