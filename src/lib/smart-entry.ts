@@ -81,6 +81,14 @@ export interface BtcLike {
   change1m: number;
   change5m: number;
   trend: string;
+  // ─── Coinbase WebSocket real-time flow (per-asset, optional for backtest) ───
+  // volumeFlowRatio: -1..+1 USD-weighted taker aggression (primary signal)
+  //   +1 = all taker-buys (very bullish), -1 = all taker-sells (very bearish)
+  // flowRatio: -1..+1 tick-based (secondary, less meaningful)
+  // wsTickCount: trades in last 60s (confidence weighting — low count = noise)
+  volumeFlowRatio?: number;
+  flowRatio?: number;
+  wsTickCount?: number;
 }
 
 export interface SmartEntrySignal {
@@ -242,6 +250,34 @@ export function smartEntrySignal(
       upConfidence += 10;
       reasons.push(`📚 DOWN L2 no FOMO (bid ${(downL2.bidPressure * 100).toFixed(0)}%), weak contrarian signal (+10)`);
     }
+  }
+
+  // ── 6.5. WebSocket order flow — CONTRARIAN FADE signal ──
+  // Coinbase WS gives real taker buy/sell volume (per-asset, instant).
+  // Contrarian logic: strong buy pressure (FOMO) → fade → BUY DOWN.
+  //                   strong sell pressure (panic) → fade → BUY UP.
+  // This is the SAME thesis as L2 FOMO but measured from ACTUAL executed
+  // trades (taker aggression) rather than resting limit orders.
+  // Require wsTickCount >= 8 to avoid noise from low-volume periods.
+  const wsVolFlow = btc.volumeFlowRatio ?? 0;
+  const wsTicks = btc.wsTickCount ?? 0;
+  const WS_MIN_TICKS = 8;
+  const WS_FADE_THRESHOLD = 0.25;  // |flow| >= 0.25 = strong imbalance
+
+  if (wsTicks >= WS_MIN_TICKS) {
+    if (contrarianSide === "DOWN" && wsVolFlow > WS_FADE_THRESHOLD) {
+      // Fading a rally + strong taker-buy FOMO → contrarian DOWN confirmed
+      downConfidence += 15;
+      reasons.push(`🌊 WS taker-buy flow ${(wsVolFlow * 100).toFixed(0)}% (FOMO) → fade DOWN (+15)`);
+    } else if (contrarianSide === "UP" && wsVolFlow < -WS_FADE_THRESHOLD) {
+      // Fading a drop + strong taker-sell panic → contrarian UP confirmed
+      upConfidence += 15;
+      reasons.push(`🌊 WS taker-sell flow ${(wsVolFlow * 100).toFixed(0)}% (panic) → fade UP (+15)`);
+    } else {
+      reasons.push(`🌊 WS flow ${(wsVolFlow * 100).toFixed(0)}% (${wsTicks} ticks) — no fade signal`);
+    }
+  } else {
+    reasons.push(`🌊 WS flow: only ${wsTicks} ticks in 60s (need ${WS_MIN_TICKS}+) — skip flow signal`);
   }
 
   // ── 7. Price room bonus — prefer 0.40-0.60 (true coin flip, max room) ──

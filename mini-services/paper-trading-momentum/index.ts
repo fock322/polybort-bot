@@ -10,11 +10,17 @@
 
 import { startEngine, stopEngine, resetEngine, getStatus, getMarkets, getPositions, getTrades, getAnalytics, getTradeAnalysis, setStrategy } from "../../src/lib/mm-engine";
 import { getBtcPrice } from "../../src/lib/btc-feed";
+import { initCoinbaseWs, getWsStatus } from "../../src/lib/coinbase-ws";
 
 // Set strategy to MOMENTUM before any engine operations
 setStrategy("momentum");
 
 const PORT = 3003;
+
+// ── Start Coinbase WebSocket on boot (real-time BTC/ETH/SOL price + flow) ──
+// Each asset gets its OWN independent data stream (BTC-USD, ETH-USD, SOL-USD).
+initCoinbaseWs();
+console.log(`[paper-trading-momentum:${PORT}] Coinbase WebSocket initialized (BTC-USD, ETH-USD, SOL-USD)`);
 
 const server = Bun.serve({
   port: PORT,
@@ -85,6 +91,10 @@ const server = Bun.serve({
 
       if (path === "/health" && method === "GET") {
         return Response.json({ status: "ok", service: "paper-trading-momentum", port: PORT, strategy: "momentum", uptime: process.uptime() }, { headers: corsHeaders });
+      }
+
+      if (path === "/ws-status" && method === "GET") {
+        return Response.json(getWsStatus(), { headers: corsHeaders });
       }
 
       return Response.json({ error: "Not found", path }, { status: 404, headers: corsHeaders });

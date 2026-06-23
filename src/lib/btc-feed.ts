@@ -1,6 +1,18 @@
-// ─── Binance BTC Price Feed ──────────────────────────────────
-// Fetches BTC/USDT price and klines from Binance REST API
-// Calculates ATR, volatility, and trend metrics
+// ─── Multi-Asset Price Feed (Binance REST + Coinbase WebSocket) ──
+// Primary: Coinbase WebSocket (instant ticks, buy/sell flow)
+// Fallback: Binance REST API (every 3s, klines for ATR/5m change)
+//
+// The WebSocket provides:
+// - Instant price (sub-100ms vs 3000ms REST)
+// - Buy/sell flow ratio (real order flow, not just close price)
+// - Best bid/ask from Coinbase order book
+//
+// REST still needed for:
+// - 5-minute change (WS buffer only 60s)
+// - ATR calculation (needs kline high/low data)
+// - Fallback when WS disconnects
+
+import { getWsPrice, getWsFlowRatio, getWsVolumeFlowRatio, getWsChange1m, getWsTickCount, getWsBestBidAsk, isWsConnected } from "./coinbase-ws";
 
 interface Kline {
   openTime: number;
@@ -25,6 +37,16 @@ export interface BtcPriceData {
   klines: Kline[];
   lastUpdate: number;
   connected: boolean;
+  // ─── Coinbase WebSocket real-time fields (per-asset) ───
+  // flowRatio: -1..+1 tick-based taker aggression (+1 = all buys = very bullish)
+  // volumeFlowRatio: -1..+1 USD-weighted (big orders weighted more)
+  // wsTickCount: number of trades in last 60s (confidence weighting)
+  // wsBestBid/wsBestAsk: from Coinbase L2 order book (instant, no polling)
+  flowRatio: number;
+  volumeFlowRatio: number;
+  wsTickCount: number;
+  wsBestBid: number;
+  wsBestAsk: number;
 }
 
 // ─── State ───────────────────────────────────────────────────
@@ -46,6 +68,7 @@ const defaultData: BtcPriceData = {
   volatilityPct: 0, change1m: 0, change5m: 0,
   trend: "neutral", timestamp: 0, klines: [],
   lastUpdate: 0, connected: false,
+  flowRatio: 0, volumeFlowRatio: 0, wsTickCount: 0, wsBestBid: 0, wsBestAsk: 0,
 };
 
 // ─── ATR ─────────────────────────────────────────────────────
@@ -142,11 +165,34 @@ export async function getBtcPrice(): Promise<BtcPriceData> {
         data.volatilityPct = data.price > 0 ? (data.atr15m / data.price) * Math.sqrt(525600) * 100 : 0;
 
         const len = data.klines.length;
-        data.change1m = len >= 2 && data.klines[len - 2].close > 0
-          ? ((data.klines[len - 1].close - data.klines[len - 2].close) / data.klines[len - 2].close) * 100 : 0;
         data.change5m = len >= 6 && data.klines[len - 6].close > 0
           ? ((data.klines[len - 1].close - data.klines[len - 6].close) / data.klines[len - 6].close) * 100 : 0;
       }
+
+      // ─── WebSocket override (BTC): real-time price + flow ───
+      const wsPrice = getWsPrice("BTC");
+      const wsChange1m = getWsChange1m("BTC");
+      const wsConnectedNow = isWsConnected();
+
+      if (wsConnectedNow && wsPrice > 0) {
+        data.price = wsPrice;
+        data.timestamp = Date.now();
+        data.connected = true;
+        if (wsChange1m !== 0) data.change1m = wsChange1m * 100;
+        updateEMA(wsPrice);
+      } else if (data.klines.length >= 2) {
+        const len = data.klines.length;
+        data.change1m = len >= 2 && data.klines[len - 2].close > 0
+          ? ((data.klines[len - 1].close - data.klines[len - 2].close) / data.klines[len - 2].close) * 100 : 0;
+      }
+
+      // Always populate WS flow fields (per-asset, from Coinbase WS)
+      data.flowRatio = getWsFlowRatio("BTC");
+      data.volumeFlowRatio = getWsVolumeFlowRatio("BTC");
+      data.wsTickCount = getWsTickCount("BTC");
+      const bb = getWsBestBidAsk("BTC");
+      data.wsBestBid = bb.bid;
+      data.wsBestAsk = bb.ask;
 
       data.trend = detectTrend(data.price);
       data.lastUpdate = now;
@@ -220,19 +266,52 @@ export async function getAssetPrice(asset: string = "BTC"): Promise<BtcPriceData
         data.klines = cachedAsset.klines;
       }
 
-      // Calculate metrics
+      // Calculate metrics from klines (REST)
       if (data.klines.length >= 2) {
         data.atr1m = atr(data.klines, 1);
         data.atr5m = atr(data.klines, 5);
         data.atr15m = atr(data.klines, 14);
         data.volatilityPct = data.price > 0 ? (data.atr15m / data.price) * Math.sqrt(525600) * 100 : 0;
 
+        // 5m change always from REST (WS only has 60s buffer)
         const len = data.klines.length;
-        data.change1m = len >= 2 && data.klines[len - 2].close > 0
-          ? ((data.klines[len - 1].close - data.klines[len - 2].close) / data.klines[len - 2].close) * 100 : 0;
         data.change5m = len >= 6 && data.klines[len - 6].close > 0
           ? ((data.klines[len - 1].close - data.klines[len - 6].close) / data.klines[len - 6].close) * 100 : 0;
       }
+
+      // ─── WebSocket override: use real-time data when available ───
+      const wsPrice = getWsPrice(asset);
+      const wsChange1m = getWsChange1m(asset);
+      const wsConnectedNow = isWsConnected();
+
+      if (wsConnectedNow && wsPrice > 0) {
+        // Override price with instant WS price (sub-100ms vs 3000ms REST)
+        data.price = wsPrice;
+        data.timestamp = Date.now();
+        data.connected = true;
+
+        // Override 1m change with WS-based (more accurate — real ticks)
+        if (wsChange1m !== 0) {
+          data.change1m = wsChange1m * 100;  // WS returns fractional, BtcPriceData uses *100
+        }
+
+        // Update EMA with real-time price
+        updateAssetEMA(wsPrice);
+      } else if (data.klines.length >= 2) {
+        // Fallback: 1m change from klines
+        const len = data.klines.length;
+        data.change1m = len >= 2 && data.klines[len - 2].close > 0
+          ? ((data.klines[len - 1].close - data.klines[len - 2].close) / data.klines[len - 2].close) * 100 : 0;
+      }
+
+      // Always populate WS flow fields (per-asset, never mixed)
+      // These are the KEY advantage of WebSocket: real taker buy/sell aggression.
+      data.flowRatio = getWsFlowRatio(asset);
+      data.volumeFlowRatio = getWsVolumeFlowRatio(asset);
+      data.wsTickCount = getWsTickCount(asset);
+      const bb = getWsBestBidAsk(asset);
+      data.wsBestBid = bb.bid;
+      data.wsBestAsk = bb.ask;
 
       data.trend = detectAssetTrend(data.price);
       data.lastUpdate = now;

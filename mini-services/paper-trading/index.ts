@@ -7,8 +7,15 @@
 
 import { startEngine, stopEngine, resetEngine, getStatus, getMarkets, getPositions, getTrades, getAnalytics, getTradeAnalysis } from "../../src/lib/mm-engine";
 import { getBtcPrice } from "../../src/lib/btc-feed";
+import { initCoinbaseWs, getWsStatus } from "../../src/lib/coinbase-ws";
 
 const PORT = 3002;
+
+// ── Start Coinbase WebSocket on boot (real-time BTC/ETH/SOL price + flow) ──
+// Each asset gets its OWN independent data stream (BTC-USD, ETH-USD, SOL-USD).
+// This provides instant prices + real taker buy/sell flow for all strategies.
+initCoinbaseWs();
+console.log(`[paper-trading:${PORT}] Coinbase WebSocket initialized (BTC-USD, ETH-USD, SOL-USD)`);
 
 const server = Bun.serve({
   port: PORT,
@@ -78,6 +85,10 @@ const server = Bun.serve({
 
       if (path === "/health" && method === "GET") {
         return Response.json({ status: "ok", service: "paper-trading", port: PORT, uptime: process.uptime() }, { headers: corsHeaders });
+      }
+
+      if (path === "/ws-status" && method === "GET") {
+        return Response.json(getWsStatus(), { headers: corsHeaders });
       }
 
       return Response.json({ error: "Not found", path }, { status: 404, headers: corsHeaders });

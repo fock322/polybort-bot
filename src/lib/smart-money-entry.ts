@@ -158,6 +158,31 @@ export function smartMoneyEntrySignal(
     reasons.push(`📚 DOWN L2 CONFIRMED: bid ${(downL2.bidPressure * 100).toFixed(0)}% depth $${downL2.totalDepth.toFixed(0)} (+25)`);
   }
 
+  // ── 6.5. WebSocket order flow — SMART MONEY CONFIRMATION (pro-cyclical) ──
+  // Coinbase WS gives real taker buy/sell volume (per-asset, instant).
+  // Smart money follows trend: strong taker-buy flow confirms UP.
+  //                         strong taker-sell flow confirms DOWN.
+  // REAL executed aggression — stronger than resting L2 bids.
+  // Require wsTickCount >= 8 to avoid noise from low-volume periods.
+  const wsVolFlow = btc.volumeFlowRatio ?? 0;
+  const wsTicks = btc.wsTickCount ?? 0;
+  const WS_MIN_TICKS = 8;
+  const WS_CONFIRM_THRESHOLD = 0.20;  // |flow| >= 0.20 = directional conviction
+
+  if (wsTicks >= WS_MIN_TICKS) {
+    if (smartMoneySide === "UP" && wsVolFlow > WS_CONFIRM_THRESHOLD) {
+      upConfidence += 15;
+      reasons.push(`🌊 WS taker-buy flow ${(wsVolFlow * 100).toFixed(0)}% confirms UP (+15)`);
+    } else if (smartMoneySide === "DOWN" && wsVolFlow < -WS_CONFIRM_THRESHOLD) {
+      downConfidence += 15;
+      reasons.push(`🌊 WS taker-sell flow ${(wsVolFlow * 100).toFixed(0)}% confirms DOWN (+15)`);
+    } else {
+      reasons.push(`🌊 WS flow ${(wsVolFlow * 100).toFixed(0)}% (${wsTicks} ticks) — no confirmation`);
+    }
+  } else {
+    reasons.push(`🌊 WS flow: only ${wsTicks} ticks in 60s (need ${WS_MIN_TICKS}+) — skip flow signal`);
+  }
+
   // ── 7. Decision — all filters passed, high conviction ──
   // Confidence should be 80+ (30+25+25=80) if all signals align
   // SMART MONEY v3: lower confidence threshold (hold to settlement = bigger profit potential)
