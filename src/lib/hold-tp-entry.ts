@@ -111,20 +111,22 @@ export function holdTpEntrySignal(
   }
 
   // ── 3. Price filter — DYNAMIC по стороне входа ──
-  // UP вход: UP mid должен быть 0.25-0.75 (место для +8% TP = entry*1.08 ≤ $0.81)
-  // DOWN вход: DOWN mid должен быть 0.25-0.75 (место для +8% TP = entry*1.08 ≤ $0.81)
+  // UP вход: UP mid должен быть 0.20-0.80 (место для +8% TP = entry*1.08 ≤ $0.864)
+  // DOWN вход: DOWN mid должен быть 0.20-0.80 (место для +8% TP = entry*1.08 ≤ $0.864)
   // Раньше проверяли только UP mid — блокировало DOWN входы на падающем рынке.
-  const MIN_MID = 0.25;
-  const MAX_MID = 0.75;
+  // РАСШИРЕНО (2026-06-23): было 0.25-0.75, стало 0.20-0.80 — Polymarket 15m рынки
+  // быстро уходят от 0.50, к моменту tau<14 цена уже 0.75-0.85. 0.20-0.80 даёт больше входов.
+  const MIN_MID = 0.20;
+  const MAX_MID = 0.80;
   if (upMid < MIN_MID || upMid > MAX_MID) {
     // UP mid вне диапазона — но если DOWN mid в диапазоне, DOWN вход возможен
     // (проверяется ниже после определения стороны по 5m тренду)
     reasons.push(`⚠️ UP mid $${upMid.toFixed(2)} вне 0.25-0.75 — DOWN вход возможен если DOWN mid в диапазоне`);
   }
 
-  // ── 4. Trend signal — 5m в [0.3%, 6%] ──
+  // ── 4. Trend signal — 5m в [0.3%, 8%] (как smart-money — шире для раннего входа) ──
   const MIN_5M = 0.003;
-  const MAX_5M = 0.06;
+  const MAX_5M = 0.08;  // 8% (было 6% — расширили для раннего входа на трендовых рынках)
   if (change5m > MIN_5M && change5m < MAX_5M) {
     upConfidence += 30;
     reasons.push(`📈 5m +${(change5m * 100).toFixed(2)}% → UP trend (+30)`);
