@@ -971,10 +971,12 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     // Filter 2: Minimum volume — need real traders to fill our quotes
     // FREQ FIX: asset-dependent volume filter
     // BTC: $2000-3000 (high liquidity), ETH/SOL: $50 (lower liquidity, but still tradeable)
+    // FIX 2 (2026-06-23): Raise ETH/SOL vol minimum from $50 to $500
+    // $50 was too low — trade with vol=$346 had huge slippage and instant SL
     const isBtcMarket = market.slug.startsWith("btc-");
     const MIN_VOLUME_USD = config.strategy === "contrarian"
-      ? (isBtcMarket ? 3000 : 50)
-      : (isBtcMarket ? 2000 : 50);
+      ? (isBtcMarket ? 3000 : 500)
+      : (isBtcMarket ? 2000 : 500);
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
@@ -1690,29 +1692,40 @@ function markToMarket(_btc: BtcPriceData): void {
       const btcPrice = _btc.price > 0 ? _btc.price : 63000;
 
       if (config.strategy === "momentum" || config.strategy === "smart-money") {
-        // MOMENTUM + SMART-MONEY: Asset-strike stop loss
-        // BUG FIX (2026-06-23): Was using BTC price for ALL markets (BTC, ETH, SOL).
-        // For ETH/SOL markets, BTC price vs ETH strike = completely wrong!
-        // FIX: Use token mid price as proxy for whether asset is above/below strike.
-        //   - UP mid > 0.50 → market expects asset > strike (UP likely wins)
-        //   - UP mid < 0.50 → market expects asset < strike (DOWN likely wins)
-        //   - SL triggers when token mid drops 10% from entry (market reversed against us)
+        // MOMENTUM + SMART-MONEY: Token mid price SL
+        // SL triggers when token mid drops 10% from entry (market reversed against us)
         const SL_DROP_PCT = 0.10;  // 10% drop from entry price = SL
         const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
 
+        // FIX 4 (2026-06-23): Minimum hold time 30s before SL can trigger.
+        // The $2.16 loss had hold=7s — SL triggered instantly on noise.
+        // Give position 30s to develop before checking SL.
+        const MIN_HOLD_MS = 30_000;  // 30 seconds
+        const holdTime = Date.now() - pos.openedAt;
+
         if (currentMid > 0 && pos.entryPrice > 0) {
           const dropPct = (pos.entryPrice - currentMid) / pos.entryPrice;
-          if (dropPct >= SL_DROP_PCT) {
+          if (dropPct >= SL_DROP_PCT && holdTime >= MIN_HOLD_MS) {
             console.log(
               `[SL] ${config.strategy.toUpperCase()} SL triggered on ${posId}: ` +
               `side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} ` +
-              `(drop ${(dropPct * 100).toFixed(1)}% ≥ ${(SL_DROP_PCT * 100).toFixed(0)}%)`
+              `(drop ${(dropPct * 100).toFixed(1)}% ≥ ${(SL_DROP_PCT * 100).toFixed(0)}%, hold=${(holdTime/1000).toFixed(0)}s)`
             );
-            stopLossTriggers.push({
+            // FIX 3 (2026-06-23): SL goes to tpTriggers (maker exit, 0 fee) not stopLossTriggers (taker)
+            // This saves $0.47 fee on $10 position!
+            tpTriggers.push({
               posId,
               marketId: pos.marketId,
-              reason: `${config.strategy}_token_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct`,
+              reason: `${config.strategy}_maker_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct`,
             });
+          } else if (dropPct >= SL_DROP_PCT && holdTime < MIN_HOLD_MS) {
+            // SL condition met but too early — log but don't trigger
+            if (tradeCycleCount % 10 === 0) {
+              console.log(
+                `[SL] ${config.strategy.toUpperCase()} SL pending on ${posId}: ` +
+                `drop ${(dropPct * 100).toFixed(1)}% but hold=${(holdTime/1000).toFixed(0)}s < 30s (waiting)`
+              );
+            }
           } else if (tau < 1) {
             stopLossTriggers.push({
               posId,

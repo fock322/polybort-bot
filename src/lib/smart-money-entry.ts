@@ -113,47 +113,45 @@ export function smartMoneyEntrySignal(
     };
   }
 
-  // ── 4. BTC 5m trend signal — [0.5%, 3%] (early trend, not exhausted) ──
-  // 0.5% minimum: enough movement to confirm direction
-  // 3% maximum: beyond this, trend likely exhausted (mean reversion risk)
-  // FREQ FIX: MIN_BTC_5M 0.005 → 0.003, MAX 5% → 6%
-  // SMART MONEY v3: MIN_BTC_5M 0.002 (catch very small movements)
-  const MIN_BTC_5M = 0.002;  // 0.2% (was 0.3%)
-  const MAX_BTC_5M = 0.08;   // 8% (was 6%, allow bigger trends)
+  // ── 4. BTC 5m trend signal — [0.2%, 8%] (early trend, not exhausted) ──
+  const MIN_BTC_5M = 0.002;  // 0.2%
+  const MAX_BTC_5M = 0.08;   // 8%
 
   if (change5m > MIN_BTC_5M && change5m < MAX_BTC_5M) {
     upConfidence += 30;
-    reasons.push(`📈 BTC 5m +${(change5m * 100).toFixed(2)}% → early UP trend (+30)`);
+    reasons.push(`📈 5m +${(change5m * 100).toFixed(2)}% → early UP trend (+30)`);
   } else if (change5m < -MIN_BTC_5M && change5m > -MAX_BTC_5M) {
     downConfidence += 30;
-    reasons.push(`📉 BTC 5m ${(change5m * 100).toFixed(2)}% → early DOWN trend (+30)`);
+    reasons.push(`📉 5m ${(change5m * 100).toFixed(2)}% → early DOWN trend (+30)`);
   } else if (Math.abs(change5m) >= MAX_BTC_5M) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ BTC 5m ${(change5m * 100).toFixed(2)}% too extreme (>|3%|, exhausted)`],
+      reasons: [`⚡ 5m ${(change5m * 100).toFixed(2)}% too extreme (>|8%|, exhausted)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   } else {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`➡️ BTC 5m ${(change5m * 100).toFixed(3)}% too small (need ±0.5%)`],
+      reasons: [`➡️ 5m ${(change5m * 100).toFixed(3)}% too small (need ±0.2%)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
 
-  // ── 5. BTC 1m MUST confirm 5m direction (hard filter) ──
-  // If 5m is up but 1m is down → trend reversing, skip
+  // ── 5. 1m MUST confirm 5m direction (HARD FILTER — FIX 1) ──
+  // FIX 1 (2026-06-23): If 1m and 5m disagree → contradictory signal → SKIP
+  // This was the cause of the $2.16 loss: 1m=+4.46% but 5m=-5.79%
+  // Bot entered UP when 5m said DOWN → instant loss
   const MIN_1M_CONFIRM = 0.001;  // 0.1% minimum 1m confirmation
   if (change5m > 0 && change1m > MIN_1M_CONFIRM) {
     upConfidence += 25;
-    reasons.push(`📈 BTC 1m +${(change1m * 100).toFixed(2)}% confirms UP (+25)`);
+    reasons.push(`📈 1m +${(change1m * 100).toFixed(2)}% confirms UP (+25)`);
   } else if (change5m < 0 && change1m < -MIN_1M_CONFIRM) {
     downConfidence += 25;
-    reasons.push(`📉 BTC 1m ${(change1m * 100).toFixed(2)}% confirms DOWN (+25)`);
+    reasons.push(`📉 1m ${(change1m * 100).toFixed(2)}% confirms DOWN (+25)`);
   } else {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`🚫 BTC 1m ${(change1m * 100).toFixed(2)}% doesn't confirm 5m (trend uncertain)`],
+      reasons: [`🚫 CONTRADICTORY: 1m=${(change1m * 100).toFixed(2)}% vs 5m=${(change5m * 100).toFixed(2)}% — signals disagree, SKIP`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
