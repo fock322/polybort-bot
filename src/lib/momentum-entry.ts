@@ -97,7 +97,7 @@ export function momentumEntrySignal(
   if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±3% (adverse selection)`],
+      reasons: [`⚡ Too volatile: 1m ${(change1m * 100).toFixed(2)}% > ±5% (adverse selection)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
@@ -131,13 +131,13 @@ export function momentumEntrySignal(
   } else if (Math.abs(change5m) >= MAX_BTC_5M) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ BTC 5m ${(change5m * 100).toFixed(2)}% too extreme (>|5%|, may reverse)`],
+      reasons: [`⚡ 5m ${(change5m * 100).toFixed(2)}% too extreme (>|6%|, may reverse)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   } else {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`➡️ BTC 5m ${(change5m * 100).toFixed(3)}% too small (need ±1.0% for momentum)`],
+      reasons: [`➡️ 5m ${(change5m * 100).toFixed(3)}% too small (need ±0.3%)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }

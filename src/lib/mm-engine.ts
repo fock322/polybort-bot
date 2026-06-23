@@ -41,15 +41,9 @@ import {
   momentumEntrySignal,
   shouldTrailingTpTrigger,
   TRAILING_TP_DROP_PCT,
-  MOMENTUM_SL_PCT,
 } from "./momentum-entry";
 import {
   smartMoneyEntrySignal,
-  shouldMakerTpTrigger,
-  smartMoneyTpThreshold,
-  SMART_MONEY_TP_PCT,
-  SMART_MONEY_SL_PCT,
-  MAKER_TP_TIMEOUT_MS,
 } from "./smart-money-entry";
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
@@ -395,7 +389,14 @@ function parseStrikePrice(question: string): number {
 export function buildTradeContext(marketId: string, btc: BtcPriceData, pos?: Position): TradeContext {
   const market = markets.get(marketId);
   if (!market) {
-    return pos ? { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis } : {};
+    // BUG FIX #15 (2026-06-23): Add marketSlug from position for orphaned trades
+    return pos ? {
+      marketSlug: pos.marketQuestion ? `(expired) ${pos.marketId}` : pos.marketId,
+      marketQuestion: pos.marketQuestion || '(market expired)',
+      entryPrice: pos.entryPrice,
+      holdTimeMs: Date.now() - pos.openedAt,
+      peakPnl: pos.peakValue - pos.costBasis,
+    } : {};
   }
 
   // L2 depth analysis (top 5 levels)
@@ -773,10 +774,11 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
 
 // ─── Settlement ───────────────────────────────────────────
 function settleMarket(marketId: string, market: Market): void {
-  // BUG FIX (2026-06-23): Was using BTC price for ALL markets.
-  // For ETH/SOL markets, use token mid price as proxy for asset vs strike.
-  // UP mid > 0.50 → market expects asset > strike → UP wins
-  // UP mid < 0.50 → market expects asset < strike → DOWN wins
+  // BUG FIX #14 (2026-06-23): Settlement uses token mid price as proxy.
+  // Real Polymarket settlement uses Chainlink price vs priceToBeat.
+  // Token mid > 0.50 = market expects UP wins → approximate settlement.
+  // Limitation: token mid can be manipulated in last seconds before expiry.
+  // For paper trading this is acceptable; for live would need Chainlink feed.
   const upMid = market.realUpMid;
   const upWins = upMid > 0.50;
   // FIX 5: use cachedBtcData (has real change1m/change5m) instead of mocked data
@@ -843,12 +845,14 @@ function calcUpProbability(market: Market, btc: BtcPriceData): number {
   const { price, atr5m, change1m, change5m, trend } = btc;
   if (price <= 0) return 0.5;
 
-  // Use strike from Chainlink priceToBeat, or fallback to BTC price
+  // BUG FIX #3 (2026-06-23): strikePrice = -1 (sentinel) was treated as <=0
+  // → fallback to current price as strike → P(UP) always ~50% → model useless.
+  // Now: if strike = -1 (no Chainlink data), use market mid price as probability.
   let strike = market.strikePrice;
   if (strike <= 0) {
-    // strike = -1 means "first time seeing this market" → use current BTC price
-    // This approximates the slot-start price (we don't have Chainlink data for active markets)
-    strike = price;
+    // No strike data — use market mid price as probability proxy
+    // Market price IS the probability (efficient market hypothesis)
+    return clamp(market.realUpMid > 0 ? market.realUpMid : 0.5, 0.01, 0.99);
   }
 
   if (strike > 0) {
@@ -1686,78 +1690,49 @@ function markToMarket(_btc: BtcPriceData): void {
     if (pos.currentValue > pos.peakValue) pos.peakValue = pos.currentValue;
     totalUnrealized += pos.unrealizedPnl;
 
-    // ── DYNAMIC STOP-LOSS ──
-    // CONTRARIAN: ATR-based % SL (5-10%)
-    // MOMENTUM: BTC-strike based SL — стоп по тикам от target, не по %
-    //   - Если bot купил UP (ожидает BTC > strike) и BTC упал ниже strike на N тиков → стоп
-    //   - Если bot купил DOWN (ожидает BTC < strike) и BTC вырос выше strike на N тиков → стоп
-    //   - Неважно какой % от entry price — стопается по BTC movement против позиции
+    // ── STOP-LOSS (unified for ALL strategies + ALL assets) ──
+    // BUG FIX #1 (2026-06-23): Contrarian used BTC ATR for ETH/SOL — now token mid drop
+    // BUG FIX #4 (2026-06-23): Emergency SL at 25% drop (ignores 30s hold)
+    // All strategies use token mid price drop from entry — works for BTC, ETH, SOL
     if (pos.costBasis > 0) {
       const tau = (market.expiresAt - Date.now()) / 60000;
-      const btcPrice = _btc.price > 0 ? _btc.price : 63000;
+      const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
+      const holdTime = Date.now() - pos.openedAt;
 
-      if (config.strategy === "momentum" || config.strategy === "smart-money") {
-        // MOMENTUM + SMART-MONEY: Token mid price SL
-        // SL triggers when token mid drops 10% from entry (market reversed against us)
-        const SL_DROP_PCT = 0.10;  // 10% drop from entry price = SL
-        const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
+      if (currentMid > 0 && pos.entryPrice > 0) {
+        const dropPct = (pos.entryPrice - currentMid) / pos.entryPrice;
+        const EMERGENCY_SL_PCT = 0.25;  // 25% drop = emergency, ignore hold time
+        const MIN_HOLD_MS = 30_000;     // 30s normal hold
+        const SL_DROP_PCT = config.strategy === "contrarian" ? 0.08 : 0.10;  // 8% contrarian, 10% momentum/smart-money
 
-        // FIX 4 (2026-06-23): Minimum hold time 30s before SL can trigger.
-        // The $2.16 loss had hold=7s — SL triggered instantly on noise.
-        // Give position 30s to develop before checking SL.
-        const MIN_HOLD_MS = 30_000;  // 30 seconds
-        const holdTime = Date.now() - pos.openedAt;
-
-        if (currentMid > 0 && pos.entryPrice > 0) {
-          const dropPct = (pos.entryPrice - currentMid) / pos.entryPrice;
-          if (dropPct >= SL_DROP_PCT && holdTime >= MIN_HOLD_MS) {
+        // Emergency SL: 25%+ drop → trigger immediately (no hold time check)
+        if (dropPct >= EMERGENCY_SL_PCT) {
+          console.log(
+            `[SL] 🚨 EMERGENCY SL on ${posId}: side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} ` +
+            `mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${EMERGENCY_SL_PCT * 100}%, hold=${(holdTime/1000).toFixed(0)}s)`
+          );
+          tpTriggers.push({ posId, marketId: pos.marketId, reason: `emergency_sl_${(EMERGENCY_SL_PCT * 100).toFixed(0)}pct` });
+        }
+        // Normal SL: drop >= threshold AND hold >= 30s
+        else if (dropPct >= SL_DROP_PCT && holdTime >= MIN_HOLD_MS) {
+          console.log(
+            `[SL] ${config.strategy.toUpperCase()} SL on ${posId}: side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} ` +
+            `mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${SL_DROP_PCT * 100}%, hold=${(holdTime/1000).toFixed(0)}s)`
+          );
+          tpTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_maker_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct` });
+        }
+        // SL pending: drop >= threshold but hold < 30s
+        else if (dropPct >= SL_DROP_PCT && dropPct < EMERGENCY_SL_PCT && holdTime < MIN_HOLD_MS) {
+          if (tradeCycleCount % 10 === 0) {
             console.log(
-              `[SL] ${config.strategy.toUpperCase()} SL triggered on ${posId}: ` +
-              `side=${pos.side} entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} ` +
-              `(drop ${(dropPct * 100).toFixed(1)}% ≥ ${(SL_DROP_PCT * 100).toFixed(0)}%, hold=${(holdTime/1000).toFixed(0)}s)`
+              `[SL] ${config.strategy.toUpperCase()} SL pending on ${posId}: ` +
+              `drop ${(dropPct * 100).toFixed(1)}% but hold=${(holdTime/1000).toFixed(0)}s < 30s (waiting)`
             );
-            // FIX 3 (2026-06-23): SL goes to tpTriggers (maker exit, 0 fee) not stopLossTriggers (taker)
-            // This saves $0.47 fee on $10 position!
-            tpTriggers.push({
-              posId,
-              marketId: pos.marketId,
-              reason: `${config.strategy}_maker_sl_${(SL_DROP_PCT * 100).toFixed(0)}pct`,
-            });
-          } else if (dropPct >= SL_DROP_PCT && holdTime < MIN_HOLD_MS) {
-            // SL condition met but too early — log but don't trigger
-            if (tradeCycleCount % 10 === 0) {
-              console.log(
-                `[SL] ${config.strategy.toUpperCase()} SL pending on ${posId}: ` +
-                `drop ${(dropPct * 100).toFixed(1)}% but hold=${(holdTime/1000).toFixed(0)}s < 30s (waiting)`
-              );
-            }
-          } else if (tau < 1) {
-            stopLossTriggers.push({
-              posId,
-              marketId: pos.marketId,
-              reason: `stop_loss_1min_to_expiry`,
-            });
           }
         }
-      } else {
-        // CONTRARIAN: ATR-based % SL (5-10%)
-        if (pos.unrealizedPnl < 0) {
-          const atrPct = _btc.atr5m > 0 ? (_btc.atr5m / btcPrice) : 0.001;
-          const dynSlPct = Math.max(SMART_SL_PCT, Math.min(0.10, atrPct * 12));  // 5-10%
-          const lossPct = -pos.unrealizedPnl / pos.costBasis;
-          if (lossPct >= dynSlPct) {
-            stopLossTriggers.push({
-              posId,
-              marketId: pos.marketId,
-              reason: `contrarian_stop_loss_${(dynSlPct * 100).toFixed(0)}pct`,
-            });
-          } else if (tau < 1) {
-            stopLossTriggers.push({
-              posId,
-              marketId: pos.marketId,
-              reason: `stop_loss_1min_to_expiry`,
-            });
-          }
+        // 1 min to expiry — close regardless
+        else if (tau < 1) {
+          stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `stop_loss_1min_to_expiry` });
         }
       }
     }
@@ -1798,8 +1773,9 @@ function markToMarket(_btc: BtcPriceData): void {
     closePositionById(t.posId, t.reason);
   }
 
-  // FIX 1: Execute TP closures via MAKER exit (0 fee!)
-  // Trailing TP and smart-money TP go through maker ASK, not taker
+  // FIX 1 + FIX #5 (2026-06-23): Execute TP/SL closures via MAKER exit (0 fee!)
+  // Trailing TP, smart-money TP, and SL all go through maker ASK.
+  // BUG FIX #5: If makerSellPrice < realBid (market crashed), fallback to taker.
   for (const t of tpTriggers) {
     const pos = positions.get(t.posId);
     if (!pos) continue;
@@ -1816,7 +1792,11 @@ function markToMarket(_btc: BtcPriceData): void {
     if (realAsk > 0) makerSellPrice = tickFloor(realAsk - TICK_SIZE);
     else if (realBid > 0) makerSellPrice = tickFloor(realBid);
 
-    if (makerSellPrice > 0) {
+    // BUG FIX #5: If maker price too far below bid (market crashing),
+    // maker ASK won't fill → fallback to taker sell at bid
+    const useMaker = makerSellPrice > 0 && (realBid <= 0 || makerSellPrice >= tickFloor(realBid));
+
+    if (useMaker) {
       const makerFee = 0;  // MAKER FEE = 0!
       const closeValue = makerSellPrice * sellQty - makerFee - gasFee;
       const tpPnl = closeValue - pos.costBasis;
@@ -1827,12 +1807,12 @@ function markToMarket(_btc: BtcPriceData): void {
 
       const feeSaved = calcTakerFee(sellQty, makerSellPrice, mkt.feeRate || DEFAULT_TAKER_FEE_RATE);
       console.log(
-        `[TP] ✅ MAKER TP (0 fee!): ${pos.side} ${sellQty}@$${makerSellPrice.toFixed(2)} ` +
-        `PnL=${tpPnl >= 0 ? '+' : ''}$${tpPnl.toFixed(4)} (fee=$0.0000 saved $${feeSaved.toFixed(4)}!, gas=$${gasFee}) [${t.reason}]`
+        `[TP/SL] ✅ MAKER exit (0 fee): ${pos.side} ${sellQty}@$${makerSellPrice.toFixed(2)} ` +
+        `PnL=${tpPnl >= 0 ? '+' : ''}$${tpPnl.toFixed(4)} (saved $${feeSaved.toFixed(4)}, gas=$${gasFee}) [${t.reason}]`
       );
 
       trades.push({
-        id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
+        id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
         price: makerSellPrice, quantity: sellQty, totalCost: closeValue,
         fee: makerFee, slippage: 0, reason: t.reason, executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: tpPnl,
@@ -1844,7 +1824,8 @@ function markToMarket(_btc: BtcPriceData): void {
       else inventory.set(pos.marketId, inv + sellQty);
       positions.delete(t.posId);
     } else {
-      // Fallback: taker exit if no ask/bid
+      // BUG FIX #5: Taker fallback — market crashing, maker won't fill
+      console.log(`[TP/SL] ⚠️ Taker fallback for ${t.posId}: maker=$${makerSellPrice.toFixed(2)} bid=$${realBid.toFixed(2)} [${t.reason}]`);
       closePositionById(t.posId, t.reason);
     }
   }
@@ -1962,11 +1943,11 @@ function takerTakeProfit(): void {
     // Determine TP threshold based on strategy
     let tpThreshold: number;
     if (config.strategy === "smart-money") {
-      tpThreshold = smartMoneyTpThreshold(pos.entryPrice);
+      // Smart Money v3: no fixed TP (hold to settlement) — skip takerTakeProfit
+      continue;
     } else if (config.strategy === "momentum") {
-      // Momentum: use trailing TP (8% drop from peak) handled in markToMarket.
-      // Also use fixed TP 8% as backup (in case peak not tracked yet but price spiked up)
-      tpThreshold = pos.entryPrice * (1 + 0.08);  // 8% fixed TP backup
+      // Momentum: fixed TP 8% backup (trailing TP handled in markToMarket)
+      tpThreshold = pos.entryPrice * (1 + 0.08);
     } else {
       tpThreshold = smartTpThreshold(pos.entryPrice);
     }
@@ -2216,10 +2197,14 @@ function cleanupOrphanedPositions(): void {
       continue;
     }
 
-    // Нет strike price — используем entry price как approximation
-    // (если рынок истёк, а strike не был установлен)
-    const strike = pos.entryStrikePrice > 0 ? pos.entryStrikePrice : btc;
-    const upWins = btc > strike;
+    // BUG FIX #2 (2026-06-23): Was using BTC price vs entryStrikePrice for ALL assets.
+    // entryStrikePrice = -1 (sentinel) → fallback to BTC price → wrong for ETH/SOL.
+    // Now: use token mid price at settlement time as proxy for asset vs strike.
+    // UP mid > 0.50 = market expects UP wins → UP wins
+    const currentMid = pos.side === "UP" ? 0.5 : 0.5;  // default 50/50
+    const market = markets.get(pos.marketId);
+    const upMid = market ? market.realUpMid : 0;
+    const upWins = upMid > 0 ? upMid > 0.50 : false;  // if no market data, DOWN wins (conservative)
     const wins = (pos.side === "UP" && upWins) || (pos.side === "DOWN" && !upWins);
     const resolvedPrice = wins ? 1.0 : 0.0;
     const settleValue = pos.quantity * resolvedPrice;

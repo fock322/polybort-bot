@@ -141,18 +141,18 @@ export function smartEntrySignal(
   if (tau < 3 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 7-14min for price discovery)`],
+      reasons: [`⏰ Outside contrarian window: tau=${tau.toFixed(1)}min (need 3-14min)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
-  reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (7-14min)`);
+  reasons.push(`⏰ tau=${tau.toFixed(1)}min in contrarian window (3-14min)`);
 
   // ── 2. Hard volatility filter — skip if |1m| > 5% (was 3%) ──
   // FREQ FIX: was 3% (caused 32% of all skips), now 5%.
   if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±3% (adverse selection)`],
+      reasons: [`⚡ Too volatile: 1m ${(change1m * 100).toFixed(2)}% > ±5% (adverse selection)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
@@ -184,13 +184,13 @@ export function smartEntrySignal(
   } else if (Math.abs(change5m) >= MAX_BTC_5M) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ BTC 5m ${(change5m * 100).toFixed(2)}% too extreme (>|4%|, may continue, don't fade)`],
+      reasons: [`⚡ 5m ${(change5m * 100).toFixed(2)}% too extreme (>|6%|, may continue, don't fade)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   } else {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`➡️ BTC 5m ${(change5m * 100).toFixed(3)}% too small (need ±1.5% to fade)`],
+      reasons: [`➡️ 5m ${(change5m * 100).toFixed(3)}% too small (need ±0.3%)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
@@ -206,19 +206,42 @@ export function smartEntrySignal(
     reasons.push(`➡️ BTC 1m ${(change1m * 100).toFixed(2)}% doesn't confirm 5m (no bonus)`);
   }
 
-  // ── 6. L2 CONTRARIAN signal — fade retail FOMO ──
+  // ── 6. L2 CONTRARIAN — HARD FILTER (BUG FIX #13: was soft) ──
   // High UP bid pressure = retail buying UP at top = fade them → BUY DOWN
   // High DOWN bid pressure = retail buying DOWN at bottom = fade them → BUY UP
+  // BUG FIX #13 (2026-06-23): Was soft (optional) — now HARD like momentum/smart-money.
   const MIN_L2_DEPTH = 50;
-  // FREQ FIX: L2 bid pressure threshold 0.65 → 0.55 (was causing 20% skips)
-  if (upL2.totalDepth >= MIN_L2_DEPTH && upL2.bidPressure > 0.55) {
-    downConfidence += 20;
-    reasons.push(`📚 UP L2 bid pressure ${(upL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian DOWN (+20)`);
-  } else if (downL2.totalDepth >= MIN_L2_DEPTH && downL2.bidPressure > 0.55) {
-    upConfidence += 20;
-    reasons.push(`📚 DOWN L2 bid pressure ${(downL2.bidPressure * 100).toFixed(0)}% (retail FOMO) → contrarian UP (+20)`);
+  const MIN_L2_BID_PRESSURE = 0.55;
+  const contrarianSide = change5m > 0 ? "DOWN" : "UP";  // opposite of trend
+  const l2ForFade = contrarianSide === "UP" ? upL2 : downL2;
+
+  if (l2ForFade.totalDepth < MIN_L2_DEPTH) {
+    return {
+      should: false, side: contrarianSide, confidence: 0,
+      reasons: [`🚫 ${contrarianSide} L2 too thin: $${l2ForFade.totalDepth.toFixed(0)} < $${MIN_L2_DEPTH}`],
+      details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+
+  // Contrarian: check if OPPOSITE side has high bid pressure (FOMO to fade)
+  const l2Opposite = change5m > 0 ? upL2 : downL2;
+  if (l2Opposite.totalDepth >= MIN_L2_DEPTH && l2Opposite.bidPressure > MIN_L2_BID_PRESSURE) {
+    if (contrarianSide === "DOWN") {
+      downConfidence += 20;
+      reasons.push(`📚 UP L2 bid ${(upL2.bidPressure * 100).toFixed(0)}% (FOMO) → contrarian DOWN (+20)`);
+    } else {
+      upConfidence += 20;
+      reasons.push(`📚 DOWN L2 bid ${(downL2.bidPressure * 100).toFixed(0)}% (FOMO) → contrarian UP (+20)`);
+    }
   } else {
-    reasons.push(`📚 L2 balanced (UP bid ${(upL2.bidPressure * 100).toFixed(0)}% / DOWN bid ${(downL2.bidPressure * 100).toFixed(0)}%)`);
+    // No FOMO to fade — but still allow entry if our side has depth (less strict for contrarian)
+    if (contrarianSide === "DOWN") {
+      downConfidence += 10;
+      reasons.push(`📚 UP L2 no FOMO (bid ${(upL2.bidPressure * 100).toFixed(0)}%), weak contrarian signal (+10)`);
+    } else {
+      upConfidence += 10;
+      reasons.push(`📚 DOWN L2 no FOMO (bid ${(downL2.bidPressure * 100).toFixed(0)}%), weak contrarian signal (+10)`);
+    }
   }
 
   // ── 7. Price room bonus — prefer 0.40-0.60 (true coin flip, max room) ──

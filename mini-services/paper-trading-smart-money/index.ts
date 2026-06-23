@@ -153,7 +153,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
 <div class="container">
   <h1>💎 Polymarket MM Bot — SMART MONEY v2 <span class="strategy-badge">MAKER TP</span></h1>
-  <p class="subtitle">TP 8% maker (0 fee) • SL 3% BTC-strike • Position $10 • Target 90% WR</p>
+  <p class="subtitle">No TP (hold to settlement) • SL 10% token drop (maker, 0 fee) • Position $10 • Target 90% WR</p>
   <div class="status-bar"><div class="status-dot" id="statusDot"></div><span class="status-text" id="statusText">Загрузка...</span></div>
   <div class="controls">
     <button class="btn btn-start" onclick="sendCommand('start')">▶ Старт</button>

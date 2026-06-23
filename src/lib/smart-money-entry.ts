@@ -1,26 +1,12 @@
-// ─── Smart Money v2 Strategy (2026-06-22) ────────────────
-// Goal: 90% win rate via strict multi-signal confirmation + maker exit.
+// ─── Smart Money v3 Strategy ─────────────────────────────
+// Goal: 90% win rate via trend-following + hold to settlement.
 //
-// KEY INSIGHT from fee analysis:
-// - Taker exit fee = $0.36 on $10 position (3.6%!)
-// - Maker exit fee = $0 (ASK limit order, wait for fill)
-// - Solution: TP via maker (0 fee), SL via taker (fast exit)
+// KEY: No TP — hold to settlement for max profit (up to +100%).
+// SL: 10% token mid drop (30s min hold, emergency 25% immediate).
+// Maker exit for SL (0 fee), settlement = $1.00 or $0.00.
 //
-// R:R after fees:
-//   TP 8% maker exit: net win = +$0.77
-//   SL 3% taker exit: net loss = -$0.69
-//   Break-even WR = 47%
-//   At 90% WR: EV = +$0.62/trade
-//   Daily @ 3 trades/h = +$44.6
-//
-// STRATEGY: Trend-following with strict confirmation
-// - BTC 5m in [0.5%, 3%] (early trend, not exhausted)
-// - BTC 1m confirms 5m direction
-// - L2 bid pressure > 65% (hard filter, market confirms)
-// - tau 5-13min (price discovery done, room for TP)
-// - |BTC 1m| < 2% (low volatility, no adverse selection)
-// - UP mid 0.30-0.70 (room for 8% TP)
-// - ALL signals must align → high conviction → 90% WR
+// Entry: trend-following with strict multi-signal confirmation.
+// All filters are HARD (early return). ALL must pass to enter.
 
 import { analyzeL2Depth } from "./smart-entry";
 import type { MarketLike, BtcLike, SmartEntrySignal, L2Level, L2DepthAnalysis } from "./smart-entry";
@@ -28,29 +14,9 @@ import type { MarketLike, BtcLike, SmartEntrySignal, L2Level, L2DepthAnalysis } 
 export { analyzeL2Depth } from "./smart-entry";
 export type { L2Level, L2DepthAnalysis, MarketLike, BtcLike, SmartEntrySignal } from "./smart-entry";
 
-// ─── TP/SL constants ──────────────────────────────────────
-// TP = 8% via MAKER exit (ASK limit order, 0 fee)
-// SL = 3% via TAKER exit (instant sell at bid, $0.36 fee)
-// Asymmetric R:R favorable after fees
-export const SMART_MONEY_TP_PCT = 0.08;  // 8% take-profit (maker exit)
-export const SMART_MONEY_SL_PCT = 0.03;  // 3% stop-loss (taker exit)
-
-// Maker TP timeout: if ASK limit order not filled in 30s → fallback to taker
-export const MAKER_TP_TIMEOUT_MS = 30_000;
-
-export function smartMoneyTpThreshold(entryPrice: number): number {
-  return entryPrice * (1 + SMART_MONEY_TP_PCT);
-}
-
-export function smartMoneySlThreshold(entryPrice: number): number {
-  return entryPrice * (1 - SMART_MONEY_SL_PCT);
-}
-
-// Check if maker TP should trigger (price reached TP threshold)
-export function shouldMakerTpTrigger(entryPrice: number, currentMid: number): boolean {
-  if (entryPrice <= 0 || currentMid <= 0) return false;
-  return currentMid >= smartMoneyTpThreshold(entryPrice);
-}
+// NOTE: TP/SL constants in smart-money-entry.ts are NOT used.
+// SL is defined in mm-engine.ts markToMarket (SL_DROP_PCT = 0.10).
+// No TP — hold to settlement.
 
 // ─── MAIN SMART MONEY SIGNAL ──────────────────────────────
 // Strict trend-following with multi-signal confirmation.
@@ -85,19 +51,17 @@ export function smartMoneyEntrySignal(
   if (tau < 2 || tau > 14) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⏰ Outside smart-money window: tau=${tau.toFixed(1)}min (need 5-13min)`],
+      reasons: [`⏰ Outside smart-money window: tau=${tau.toFixed(1)}min (need 2-14min)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
-  reasons.push(`⏰ tau=${tau.toFixed(1)}min in smart-money window (5-13min)`);
+  reasons.push(`⏰ tau=${tau.toFixed(1)}min in smart-money window (2-14min)`);
 
-  // ── 2. Low volatility filter — |BTC 1m| < 2% ──
-  // Stricter than momentum (3%) — avoid adverse selection entirely
-  // FREQ FIX: volatility filter 3% → 5%
+  // ── 2. Volatility filter — |1m| < 5% ──
   if (Math.abs(change1m) > 0.05) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`⚡ Too volatile: BTC 1m ${(change1m * 100).toFixed(2)}% > ±2% (adverse selection risk)`],
+      reasons: [`⚡ Too volatile: 1m ${(change1m * 100).toFixed(2)}% > ±5% (adverse selection)`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
@@ -109,7 +73,7 @@ export function smartMoneyEntrySignal(
   if (upMid < 0.20 || upMid > 0.85) {
     return {
       should: false, side: "UP", confidence: 0,
-      reasons: [`🚫 UP mid $${upMid.toFixed(2)} outside 0.30-0.70 (need room for 8% TP)`],
+      reasons: [`🚫 UP mid $${upMid.toFixed(2)} outside 0.20-0.85`],
       details: { tau, pUp: 0.5, btcChange1m: change1m, btcChange5m: change5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
   }
