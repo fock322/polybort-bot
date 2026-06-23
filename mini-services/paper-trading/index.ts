@@ -183,7 +183,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 <script>
 const API=window.location.origin;
-async function fetchStatus(){try{const r=await fetch(API+'/');const d=await r.json();window.__lastContrarian=d;updateUI(d);}catch(e){document.getElementById('statusText').textContent='❌ Нет связи';document.getElementById('statusDot').className='status-dot stopped';}}
+// FIX: detect if we're behind gateway (XTransformPort in query) and use it for all fetches.
+const urlParams=new URLSearchParams(window.location.search);
+const XT_PORT=urlParams.get('XTransformPort');
+function api(path){return XT_PORT?API+path+'?XTransformPort='+XT_PORT:API+path;}
+async function fetchStatus(){try{const r=await fetch(api('/'));const d=await r.json();window.__lastContrarian=d;updateUI(d);}catch(e){document.getElementById('statusText').textContent='❌ Нет связи';document.getElementById('statusDot').className='status-dot stopped';}}
 function updateUI(d){
   const running=d.running;
   document.getElementById('statusDot').className='status-dot '+(running?'running':'stopped');
@@ -257,10 +261,10 @@ function updateUI(d){
     '</div>';
   }).join('');}else{mktEl.innerHTML='<div class="empty">Нет рынков</div>';}
 }
-async function fetchTrades(){try{const r=await fetch(API+'/trades');const d=await r.json();const t=d.trades||[];const el=document.getElementById('tradesList');if(t.length===0){el.innerHTML='<div class="empty">Нет сделок</div>';return;}el.innerHTML=t.slice(0,15).map(t=>{const s=t.side||'?';const p=(t.price||0).toFixed(2);const q=t.quantity||0;const rs=t.reason||'?';const pnl=t.pnl||0;const ps=pnl!==0?(pnl>0?'+':'')+'$'+pnl.toFixed(4):'—';const pc=pnl>0?'pnl-positive':pnl<0?'pnl-negative':'';const ts=new Date(t.executedAt||0).toLocaleTimeString('ru-RU');const ctx=t.context||{};const slug=ctx.marketSlug||'?';const entry=ctx.entryPrice?(ctx.entryPrice).toFixed(3):'?';const hold=ctx.holdTimeMs?(ctx.holdTimeMs/1000).toFixed(0)+'s':'?';const vol=ctx.marketVolume?'$'+ctx.marketVolume.toFixed(0):'?';const a1m=ctx.btcChange1m?(ctx.btcChange1m*100).toFixed(2)+'%':'?';const a5m=ctx.btcChange5m?(ctx.btcChange5m*100).toFixed(2)+'%':'?';const pnlSym=pnl>0?'🟢':pnl<0?'🔴':'⚪';return '<div class="row" style="flex-direction:column;align-items:stretch;padding:10px 0;">'+'<div style="display:flex;justify-content:space-between;">'+'<span class="row-label">'+pnlSym+' '+ts+' • '+s+' '+q+'@$'+p+' <small>('+rs+')</small></span>'+'<span class="row-value '+pc+'">'+ps+'</span>'+'</div>'+'<small style="color:#71717a;margin-top:3px;display:block;">'+slug.substring(0,40)+' | entry=$'+entry+' hold='+hold+' vol='+vol+' 1m='+a1m+' 5m='+a5m+'</small>'+'</div>';}).join('');}catch(e){}}
+async function fetchTrades(){try{const r=await fetch(api('/trades'));const d=await r.json();const t=d.trades||[];const el=document.getElementById('tradesList');if(t.length===0){el.innerHTML='<div class="empty">Нет сделок</div>';return;}el.innerHTML=t.slice(0,15).map(t=>{const s=t.side||'?';const p=(t.price||0).toFixed(2);const q=t.quantity||0;const rs=t.reason||'?';const pnl=t.pnl||0;const ps=pnl!==0?(pnl>0?'+':'')+'$'+pnl.toFixed(4):'—';const pc=pnl>0?'pnl-positive':pnl<0?'pnl-negative':'';const ts=new Date(t.executedAt||0).toLocaleTimeString('ru-RU');const ctx=t.context||{};const slug=ctx.marketSlug||'?';const entry=ctx.entryPrice?(ctx.entryPrice).toFixed(3):'?';const hold=ctx.holdTimeMs?(ctx.holdTimeMs/1000).toFixed(0)+'s':'?';const vol=ctx.marketVolume?'$'+ctx.marketVolume.toFixed(0):'?';const a1m=ctx.btcChange1m?(ctx.btcChange1m*100).toFixed(2)+'%':'?';const a5m=ctx.btcChange5m?(ctx.btcChange5m*100).toFixed(2)+'%':'?';const pnlSym=pnl>0?'🟢':pnl<0?'🔴':'⚪';return '<div class="row" style="flex-direction:column;align-items:stretch;padding:10px 0;">'+'<div style="display:flex;justify-content:space-between;">'+'<span class="row-label">'+pnlSym+' '+ts+' • '+s+' '+q+'@$'+p+' <small>('+rs+')</small></span>'+'<span class="row-value '+pc+'">'+ps+'</span>'+'</div>'+'<small style="color:#71717a;margin-top:3px;display:block;">'+slug.substring(0,40)+' | entry=$'+entry+' hold='+hold+' vol='+vol+' 1m='+a1m+' 5m='+a5m+'</small>'+'</div>';}).join('');}catch(e){}}
 async function fetchAnalytics(){
   try{
-    const r=await fetch(API+'/analytics');
+    const r=await fetch(api('/analytics'));
     if(!r.ok){document.getElementById('analytics').innerHTML='<div class="empty">Ошибка аналитики: HTTP '+r.status+'</div>';return;}
     const a=await r.json();
     const el=document.getElementById('analytics');
@@ -296,7 +300,7 @@ async function fetchAnalytics(){
 }
 async function fetchTradeAnalysis(){
   try{
-    const r=await fetch(API+'/trade-analysis');
+    const r=await fetch(api('/trade-analysis'));
     if(!r.ok){document.getElementById('tradeAnalysis').innerHTML='<div class="empty">Ошибка анализа: HTTP '+r.status+'</div>';return;}
     const a=await r.json();
     const el=document.getElementById('tradeAnalysis');
@@ -379,8 +383,8 @@ async function fetchTradeAnalysis(){
 }
 async function fetchComparison(){
   try{
-    // Fetch momentum service (port 3003) via same hostname
-    const momentumUrl='http://'+window.location.hostname+':3003/';
+    // Fetch momentum service (port 3003) via gateway with XTransformPort (or direct if no gateway)
+    const momentumUrl=XT_PORT?API+'/?XTransformPort=3003':('http://'+window.location.hostname+':3003/');
     const r=await fetch(momentumUrl);
     if(!r.ok){document.getElementById('comparison').innerHTML='<div class="empty">Momentum сервис недоступен (порт 3003)</div>';return;}
     const m=await r.json();
@@ -423,7 +427,7 @@ async function fetchComparison(){
     document.getElementById('comparison').innerHTML='<div class="empty">Momentum сервис недоступен: '+(e.message||e)+'</div>';
   }
 }
-async function sendCommand(cmd){try{await fetch(API+'/'+cmd,{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
+async function sendCommand(cmd){try{await fetch(api('/'+cmd),{method:'POST'});setTimeout(fetchStatus,500);}catch(e){alert('Ошибка: '+e.message);}}
 // FIX: браузеры троттлят setInterval в фоновых вкладках → дашборд "зависал" со старыми данными.
 // При возврате на вкладку (visibilitychange) — мгновенно обновляем все панели.
 setInterval(fetchStatus,5000);setInterval(fetchTrades,10000);setInterval(fetchAnalytics,15000);setInterval(fetchComparison,5000);
