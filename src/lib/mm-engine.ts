@@ -142,32 +142,33 @@ export interface Position {
 }
 
 export interface TradeContext {
+  // Market identity (saved at trade time — survives market expiry)
+  marketSlug?: string;           // e.g. "btc-updown-15m-1782199800"
+  marketQuestion?: string;       // e.g. "Bitcoin Up or Down - June 23, 3:30AM-3:45AM ET"
   // Market state at trade execution
-  marketVolume?: number;        // total volume USD at trade time
-  marketLiquidity?: number;     // total liquidity USD at trade time
-  tauMin?: number;              // minutes to expiry at trade time
-  upMid?: number;               // UP token mid price
-  downMid?: number;             // DOWN token mid price
-  upBid?: number;               // UP best bid
-  upAsk?: number;               // UP best ask
+  marketVolume?: number;
+  marketLiquidity?: number;
+  tauMin?: number;
+  upMid?: number;
+  downMid?: number;
+  upBid?: number;
+  upAsk?: number;
   downBid?: number;
   downAsk?: number;
-  spreadUp?: number;            // UP spread (ask-bid)
+  spreadUp?: number;
   spreadDown?: number;
-  upL2Depth?: number;           // L2 depth USD (top 5 levels)
+  upL2Depth?: number;
   downL2Depth?: number;
-  upL2Imbalance?: number;       // (bidDepth - askDepth) / total (-1..+1)
+  upL2Imbalance?: number;
   downL2Imbalance?: number;
-  // BTC state at trade time
   btcPrice?: number;
-  btcChange1m?: number;         // fractional (0.001 = 0.1%)
+  btcChange1m?: number;
   btcChange5m?: number;
   btcAtr5m?: number;
   btcTrend?: string;
-  // Position info (for exit trades)
-  entryPrice?: number;          // position entry price (for SELL trades)
-  holdTimeMs?: number;          // how long position was held (exit - entry)
-  peakPnl?: number;             // peak unrealized PnL during hold
+  entryPrice?: number;
+  holdTimeMs?: number;
+  peakPnl?: number;
 }
 
 export interface Trade {
@@ -421,6 +422,8 @@ export function buildTradeContext(marketId: string, btc: BtcPriceData, pos?: Pos
   const tauMin = Math.max(0, (market.expiresAt - Date.now()) / 60000);
 
   return {
+    marketSlug: market.slug,
+    marketQuestion: market.question,
     marketVolume: market.volume,
     marketLiquidity: market.liquidity,
     tauMin,
