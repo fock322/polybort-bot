@@ -102,10 +102,11 @@ export function smartMoneyEntrySignal(
     };
   }
 
-  // ── 3. Price filter — UP mid 0.30-0.70 ──
-  // Need room for 8% TP: entry $0.65 → TP $0.70 (OK)
-  // entry $0.80 → TP $0.86 (close to cap $1.00, risky)
-  if (upMid < 0.15 || upMid > 0.85) {
+  // ── 3. Price filter — UP mid 0.20-0.85 (soft, preserves winning trades) ──
+  // SOFT FIX (2026-06-23): was 0.15-0.85, analysis showed W#7 had entry $0.22.
+  // Min $0.20 blocks L#8 ($0.19) but keeps W#7 ($0.22).
+  // Max $0.85 keeps W#4 ($0.76).
+  if (upMid < 0.20 || upMid > 0.85) {
     return {
       should: false, side: "UP", confidence: 0,
       reasons: [`🚫 UP mid $${upMid.toFixed(2)} outside 0.30-0.70 (need room for 8% TP)`],

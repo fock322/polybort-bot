@@ -975,12 +975,13 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     // Filter 2: Minimum volume — need real traders to fill our quotes
     // FREQ FIX: asset-dependent volume filter
     // BTC: $2000-3000 (high liquidity), ETH/SOL: $50 (lower liquidity, but still tradeable)
-    // FIX 2 (2026-06-23): Raise ETH/SOL vol minimum from $50 to $500
-    // $50 was too low — trade with vol=$346 had huge slippage and instant SL
+    // SOFT FIX (2026-06-23): ETH/SOL vol $500 → $200 (ETH usually $50-200, rarely > $500)
+    // Analysis showed ETH vol=$737 today but usually $50-200 — $500 was too high.
+    // $200 allows more ETH/SOL entries while still filtering truly dead markets.
     const isBtcMarket = market.slug.startsWith("btc-");
     const MIN_VOLUME_USD = config.strategy === "contrarian"
-      ? (isBtcMarket ? 3000 : 500)
-      : (isBtcMarket ? 2000 : 500);
+      ? (isBtcMarket ? 3000 : 200)
+      : (isBtcMarket ? 2000 : 200);
     if (market.volume < MIN_VOLUME_USD) continue;
 
     // Filter 3: Minimum liquidity — thin books have high slippage
