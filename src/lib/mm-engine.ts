@@ -987,9 +987,15 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     // SOFT FIX (2026-06-23): ETH/SOL vol $500 → $200 (ETH usually $50-200, rarely > $500)
     // Analysis showed ETH vol=$737 today but usually $50-200 — $500 was too high.
     // $200 allows more ETH/SOL entries while still filtering truly dead markets.
+    // HOLD-TP FIX (2026-06-23): hold-tp держит до TP/settlement, не зависит от немедленной
+    // ликвидности для выхода. Снижаем порог чтобы входить на ранних рынках (tau 13-14m, vol низкий
+    // но цены нормальные 0.50-0.60). Без этого hold-tp попадает в "мёртвую зону":
+    // tau>14 — вне окна; tau 4-12 — цены уже extreme.
     const isBtcMarket = market.slug.startsWith("btc-");
     const MIN_VOLUME_USD = config.strategy === "contrarian"
       ? (isBtcMarket ? 3000 : 200)
+      : config.strategy === "hold-tp"
+      ? (isBtcMarket ? 500 : 100)   // снижено для hold-tp (ранний вход при нормальных ценах)
       : (isBtcMarket ? 2000 : 200);
     if (market.volume < MIN_VOLUME_USD) continue;
 
