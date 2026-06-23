@@ -173,6 +173,7 @@ export interface TradeContext {
 export interface Trade {
   id: string;
   marketId: string;
+  marketSlug?: string;  // FIX (2026-06-23): store slug for dashboard display after market expires
   side: string;
   price: number;
   quantity: number;
@@ -793,7 +794,7 @@ function settleMarket(marketId: string, market: Market): void {
     recordTradeAnalytics(settlePnl, fee, 0);
 
     trades.push({
-      id: uid(), marketId, side: `SETTLE_${pos.side}`,
+      id: uid(), marketId, marketSlug: market.slug, side: `SETTLE_${pos.side}`,
       price: resolvedPrice, quantity: pos.quantity,
       totalCost: settleValue, fee,
       slippage: 0, reason: upWins ? "settle_up_wins" : "settle_down_wins",
@@ -1650,7 +1651,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
   // For SELL trades, find the position to capture entry context
   const posForContext = side.startsWith("ASK") ? positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`) : undefined;
   trades.push({
-    id: uid(), marketId: quote.marketId, side,
+    id: uid(), marketId: quote.marketId, marketSlug: market.slug, side,
     price: fillPrice, quantity: fillQty,
     totalCost, fee, slippage: Math.abs(fillPrice - quote.price),
     reason: isTaker ? "taker_fill" : "maker_fill",
@@ -1827,7 +1828,7 @@ function markToMarket(_btc: BtcPriceData): void {
       );
 
       trades.push({
-        id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+        id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
         price: makerSellPrice, quantity: sellQty, totalCost: closeValue,
         fee: makerFee, slippage: 0, reason: t.reason, executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: tpPnl,
@@ -1890,7 +1891,7 @@ function closePositionById(posId: string, reason: string): void {
   recordTradeAnalytics(closePnl, fee, 0);
 
   trades.push({
-    id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+    id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
     price: closePrice, quantity: pos.quantity, totalCost: closeValue,
     fee, slippage: 0, reason, executedAt: Date.now(),
     isPaperTrade: !config.liveMode,
@@ -2023,7 +2024,7 @@ function takerTakeProfit(): void {
       );
 
       trades.push({
-        id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+        id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
         price: takerClosePrice, quantity: sellQty, totalCost: closeValue,
         fee, slippage: 0, reason: "taker_take_profit_fallback", executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: tpPnl,
@@ -2060,7 +2061,7 @@ function takerTakeProfit(): void {
     );
 
     trades.push({
-      id: uid(), marketId: pos.marketId, side: `SELL_${pos.side}`,
+      id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
       price: makerSellPrice, quantity: sellQty, totalCost: closeValue,
       fee: makerFee, slippage: 0, reason: "maker_take_profit", executedAt: Date.now(),
       isPaperTrade: !config.liveMode, pnl: tpPnl,
@@ -2201,7 +2202,7 @@ function cleanupOrphanedPositions(): void {
       realizedPnl += settlePnl;
       recordTradeAnalytics(settlePnl, 0, 0);
       trades.push({
-        id: uid(), marketId: pos.marketId, side: `SETTLE_${pos.side}`,
+        id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SETTLE_${pos.side}`,
         price: 0, quantity: pos.quantity, totalCost: 0, fee: 0,
         slippage: 0, reason: "orphaned_no_btc_price", executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: settlePnl,
@@ -2231,7 +2232,7 @@ function cleanupOrphanedPositions(): void {
     );
 
     trades.push({
-      id: uid(), marketId: pos.marketId, side: `SETTLE_${pos.side}`,
+      id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SETTLE_${pos.side}`,
       price: resolvedPrice, quantity: pos.quantity, totalCost: settleValue, fee: 0,
       slippage: 0, reason: wins ? "orphaned_settle_win" : "orphaned_settle_loss",
       executedAt: Date.now(), isPaperTrade: !config.liveMode, pnl: settlePnl,
@@ -2438,7 +2439,7 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
 
       matchingQuote.status = "filled";
       trades.push({
-        id: uid(), marketId: filled.marketId, side: filled.side,
+        id: uid(), marketId: filled.marketId, marketSlug: (markets.get(filled.marketId)?.slug || ""), side: filled.side,
         price: filled.fillPrice, quantity: filled.filledSize,
         totalCost, fee, slippage: Math.abs(filled.fillPrice - matchingQuote.price),
         reason: isTaker ? "live_taker_fill" : "live_maker_fill",
