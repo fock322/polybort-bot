@@ -1,9 +1,14 @@
-// ─── Smart Money v3 Strategy ─────────────────────────────
+// ─── Smart Money v4 Strategy ─────────────────────────────
 // Goal: 90% win rate via trend-following + hold to settlement.
 //
-// KEY: No TP — hold to settlement for max profit (up to +100%).
+// KEY: Trailing Take-Profit — фиксируем прибыль при просадке от пика.
+//   - Позиция держится до settlement (до +100% profit)
+//   - НО: если unrealized PnL вырос до пика, а потом упал на 20% от пика → закрываем
+//   - Пример: peak=+$15, drop 20% → current=+$12 → закрываем, фиксируем +$12
+//   - Это защищает от разворота: вместо -10% SL получаем +$12 profit
+//
 // SL: 10% token mid drop (30s min hold, emergency 25% immediate).
-// Maker exit for SL (0 fee), settlement = $1.00 or $0.00.
+// Maker exit for SL + trailing TP (0 fee), settlement = $1.00 or $0.00.
 //
 // Entry: trend-following with strict multi-signal confirmation.
 // All filters are HARD (early return). ALL must pass to enter.
@@ -14,9 +19,32 @@ import type { MarketLike, BtcLike, SmartEntrySignal, L2Level, L2DepthAnalysis } 
 export { analyzeL2Depth } from "./smart-entry";
 export type { L2Level, L2DepthAnalysis, MarketLike, BtcLike, SmartEntrySignal } from "./smart-entry";
 
-// NOTE: TP/SL constants in smart-money-entry.ts are NOT used.
-// SL is defined in mm-engine.ts markToMarket (SL_DROP_PCT = 0.10).
-// No TP — hold to settlement.
+// ─── Trailing TP constants ────────────────────────────────
+// SMART MONEY v4: trailing TP — закрываем позицию когда unrealized PnL
+// упал на TRAILING_TP_DROP_PCT от пикового значения.
+//
+// Логика:
+//   - bot отслеживает peakPnl (максимальный unrealized PnL за время удержания)
+//   - если currentPnl <= peakPnl * (1 - TRAILING_TP_DROP_PCT) → закрываем
+//   - trailing TP срабатывает ТОЛЬКО когда позиция в плюсе (peakPnl > 0)
+//   - если позиция сразу в минусе — trailing TP не работает, ждём SL/settlement
+//
+// Пример (TRAILING_TP_DROP_PCT = 0.20):
+//   entry=$0.50, peak mid=$0.80 → peakPnl=+$3.00 (на 10 токенов)
+//   current mid=$0.74 → currentPnl=+$2.40 (drop 20% от $3.00)
+//   → ЗАКРЫВАЕМ, фиксируем +$2.40 вместо риска -10% SL
+export const TRAILING_TP_DROP_PCT = 0.20;  // 20% drop from peak PnL → close
+
+export function shouldSmartMoneyTrailingTpTrigger(peakPnl: number, currentPnl: number): boolean {
+  // Только если позиция была в плюсе (peakPnl > 0)
+  if (peakPnl <= 0) return false;
+  // Drop % = (peak - current) / peak
+  const dropPct = (peakPnl - currentPnl) / peakPnl;
+  return dropPct >= TRAILING_TP_DROP_PCT;
+}
+
+// NOTE: SL is defined in mm-engine.ts markToMarket (SL_DROP_PCT = 0.10).
+
 
 // ─── MAIN SMART MONEY SIGNAL ──────────────────────────────
 // Strict trend-following with multi-signal confirmation.

@@ -45,6 +45,8 @@ import {
 } from "./momentum-entry";
 import {
   smartMoneyEntrySignal,
+  shouldSmartMoneyTrailingTpTrigger,
+  TRAILING_TP_DROP_PCT as SMART_MONEY_TRAILING_TP_DROP_PCT,
 } from "./smart-money-entry";
 import {
   holdTpEntrySignal,
@@ -1831,9 +1833,34 @@ function markToMarket(_btc: BtcPriceData): void {
       }
     }
 
-    // ── SMART MONEY v3: NO TP — hold to settlement for max profit ──
-    // If trend is correctly identified, market resolves at $1.00 (100%+ profit).
-    // SL (10% token drop) protects against wrong direction.
+    // ── SMART MONEY v4: Trailing TP — фиксируем прибыль при просадке 20% от пика ──
+    // Логика: бот отслеживает peakPnl (макс unrealized PnL). Если currentPnl упал
+    // на 20% от peakPnl → закрываем (maker exit, 0 fee), фиксируем остаток прибыли.
+    // Пример: peakPnl=+$15, drop 20% → currentPnl=+$12 → закрываем, фиксируем +$12.
+    // Защищает от разворота: вместо риска -10% SL получаем +$12 profit.
+    // Срабатывает ТОЛЬКО когда позиция в плюсе (peakPnl > 0).
+    if (config.strategy === "smart-money" && pos.costBasis > 0) {
+      const peakPnl = pos.peakValue - pos.costBasis;  // max unrealized PnL
+      const currentPnl = pos.unrealizedPnl;            // current unrealized PnL
+      if (shouldSmartMoneyTrailingTpTrigger(peakPnl, currentPnl)) {
+        const dropFromPeakPct = peakPnl > 0 ? ((peakPnl - currentPnl) / peakPnl) * 100 : 0;
+        console.log(
+          `[SMART-MONEY] 📉 Trailing TP triggered on ${posId}: ` +
+          `peakPnl=$${peakPnl.toFixed(4)} currentPnl=$${currentPnl.toFixed(4)} ` +
+          `(drop ${dropFromPeakPct.toFixed(1)}% from peak ≥ ${(SMART_MONEY_TRAILING_TP_DROP_PCT * 100).toFixed(0)}%) → ` +
+          `closing to lock profit`
+        );
+        tpTriggers.push({
+          posId,
+          marketId: pos.marketId,
+          reason: `smart-money_trailing_tp_drop${(SMART_MONEY_TRAILING_TP_DROP_PCT * 100).toFixed(0)}pct`,
+        });
+      }
+    }
+
+    // ── SMART MONEY v4: Trailing TP handled above (20% drop from peak PnL) ──
+    // Если trailing TP не сработал — позиция держится до settlement ($1.00 or $0.00).
+    // SL (10% token drop) защищает от wrong direction (handled in SL block above).
     // Settlement handled by settleMarket() when market expires.
   }
 
