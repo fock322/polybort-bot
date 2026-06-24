@@ -78,7 +78,7 @@ const server = Bun.serve({
       }
 
       if (path === "/trades" && method === "GET") {
-        return Response.json({ trades: getTrades(20) }, { headers: corsHeaders });
+        return Response.json({ trades: getTrades(100) }, { headers: corsHeaders });
       }
 
       if (path === "/analytics" && method === "GET") {
