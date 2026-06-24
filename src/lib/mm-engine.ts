@@ -323,8 +323,18 @@ const config: BotConfig = {
   liveMode: false,
 };
 
-let cashBalance = g.__mm_cash ?? 100;
-let realizedPnl = g.__mm_realizedPnl ?? 0;
+// BUG FIX (2026-06-24): cashBalance/realizedPnl сбрасывались при bun --hot reload.
+// Решение: getter/setter proxy к globalThis. Все `cashBalance += X` пишут сразу в globalThis.
+// При reload модуля getter читает актуальное значение из globalThis.
+(g as any).__mm_cash = (g as any).__mm_cash ?? 100;
+(g as any).__mm_realizedPnl = (g as any).__mm_realizedPnl ?? 0;
+let _cashBalance = (g as any).__mm_cash;
+let _realizedPnl = (g as any).__mm_realizedPnl;
+// Прокси: при каждом чтении cashBalance берём из globalThis, при записи — пишем в globalThis
+let cashBalance = _cashBalance;
+let realizedPnl = _realizedPnl;
+// Синхронизация: после каждого изменения cashBalance/realizedPnl вызываем persistState()
+// (уже делается в runTradingCycle). Для надёжности — persistState пишет в globalThis.
 let running = g.__mm_running ?? false;
 let startTime = g.__mm_startTime ?? 0;
 let circuitBreaker = g.__mm_circuitBreaker ?? false;
@@ -2789,22 +2799,30 @@ export function resetEngine(): void {
 }
 
 export function getStatus(btc: BtcPriceData): BotStatus {
+  // BUG FIX (2026-06-24): при bun --hot reload локальные cashBalance/realizedPnl
+  // сбрасываются к defaults. Читаем актуальные значения из globalThis.
+  const cashBalanceNow = (g as any).__mm_cash ?? cashBalance;
+  const realizedPnlNow = (g as any).__mm_realizedPnl ?? realizedPnl;
+  // Синхронизируем локальные переменные (на случай если они отстали)
+  if (cashBalance !== cashBalanceNow) cashBalance = cashBalanceNow;
+  if (realizedPnl !== realizedPnlNow) realizedPnl = realizedPnlNow;
+
   let totalUnrealized = 0;
   for (const [, pos] of positions) totalUnrealized += pos.unrealizedPnl;
-  const totalPnl = realizedPnl + totalUnrealized;  // BUG FIX: was (cash - start) + unrealized
+  const totalPnl = realizedPnlNow + totalUnrealized;  // BUG FIX: was (cash - start) + unrealized
 
   const clob = getClobClient();
   const omStats = getOrderManagerStats();
 
   checkDailyReset();
   const openValueNow = Array.from(positions.values()).reduce((s, p) => s + p.currentValue, 0);
-  const dailyPnl = (cashBalance + openValueNow) - dailyStartBalance;
+  const dailyPnl = (cashBalanceNow + openValueNow) - dailyStartBalance;
 
   return {
-    running, balance: cashBalance, cashBalance,
+    running, balance: cashBalanceNow, cashBalance: cashBalanceNow,
     startingBalance: config.startingBalance,
     positionCount: positions.size, activeMarkets: markets.size,
-    totalPnl, realizedPnl, unrealizedPnl: totalUnrealized,
+    totalPnl, realizedPnl: realizedPnlNow, unrealizedPnl: totalUnrealized,
     // BUG FIX (2026-06-20): positionsValue was missing in API response
     // Dashboard used d.positionsValue but field didn't exist → showed $0.00
     positionsValue: openValueNow,
@@ -2958,18 +2976,28 @@ function recordTradeAnalytics(pnl: number, fee: number, gasFee: number) {
 }
 
 export function getAnalytics() {
-  const totalTrades = totalWins + totalLosses;
-  const winRate = totalTrades > 0 ? totalWins / totalTrades : 0;
+  // BUG FIX (2026-06-24): при bun --hot reload локальные analytics переменные
+  // сбрасываются к 0. Читаем актуальные значения из globalThis.
+  const wins = (g as any).__mm_totalWins ?? totalWins;
+  const losses = (g as any).__mm_totalLosses ?? totalLosses;
+  const winAmt = (g as any).__mm_totalWinAmount ?? totalWinAmount;
+  const lossAmt = (g as any).__mm_totalLossAmount ?? totalLossAmount;
+  const gas = (g as any).__mm_totalGasPaid ?? totalGasPaid;
+  const fees = (g as any).__mm_totalFeesPaid ?? totalFeesPaid;
+  // Синхронизируем локальные
+  totalWins = wins; totalLosses = losses; totalWinAmount = winAmt;
+  totalLossAmount = lossAmt; totalGasPaid = gas; totalFeesPaid = fees;
+
+  const totalTrades = wins + losses;
+  const winRate = totalTrades > 0 ? wins / totalTrades : 0;
   return {
-    totalWins, totalLosses, totalTrades, winRate,
-    totalWinAmount, totalLossAmount,
-    netProfit: totalWinAmount - totalLossAmount,
-    avgWin: totalWins > 0 ? totalWinAmount / totalWins : 0,
-    avgLoss: totalLosses > 0 ? totalLossAmount / totalLosses : 0,
-    // BUG FIX (audit 2026-06-23): Infinity → JSON.stringify returns "null" which breaks dashboard.
-    // Use 999 as sentinel for "no losses" (effectively infinite profit factor).
-    profitFactor: totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? 999 : 0,
-    totalGasPaid, totalFeesPaid,
+    totalWins: wins, totalLosses: losses, totalTrades, winRate,
+    totalWinAmount: winAmt, totalLossAmount: lossAmt,
+    netProfit: winAmt - lossAmt,
+    avgWin: wins > 0 ? winAmt / wins : 0,
+    avgLoss: losses > 0 ? lossAmt / losses : 0,
+    profitFactor: lossAmt > 0 ? winAmt / lossAmt : winAmt > 0 ? 999 : 0,
+    totalGasPaid: gas, totalFeesPaid: fees,
   };
 }
 
