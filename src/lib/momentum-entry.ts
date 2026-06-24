@@ -36,10 +36,11 @@ export type { L2Level, L2DepthAnalysis, MarketLike, BtcLike, SmartEntrySignal } 
 // Меняй эти значения и смотри как меняется результат на дашборде.
 
 // Минимальный mid для входа — шанс таргета > X%
-// 0.85 = шанс 85%+, win +17.6%, need WR 85% to break even
+// v4.1: 0.85 → 0.80 — раньше входить, больше profit potential (+25% вместо +18%)
 // 0.80 = шанс 80%+, win +25%, need WR 80% to break even (агрессивнее)
+// 0.85 = шанс 85%+, win +17.6%, need WR 85% to break even
 // 0.90 = шанс 90%+, win +11.1%, need WR 90% to break even (консервативнее)
-export const MIN_TARGET_MID = 0.85;
+export const MIN_TARGET_MID = 0.80;
 
 // tau окно (минут до settlement)
 export const MIN_TAU = 0.5;   // не входим в последнюю 30 сек (некогда исполнить)

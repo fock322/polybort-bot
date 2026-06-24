@@ -1313,7 +1313,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     // ── Sizes (inventory-aware) ──
     // Base quote size scaled to the side's mid price.
     // SMART-MONEY: position size $10 (vs $5 for others) — bigger profit per trade
-    const effectiveQuoteSize = (config.strategy === "smart-money" || config.strategy === "hold-tp") ? 10 : config.quoteSize;
+    const effectiveQuoteSize = (config.strategy === "smart-money" || config.strategy === "hold-tp" || config.strategy === "momentum") ? 10 : config.quoteSize;
     const baseQtyUp = Math.max(1, Math.round(effectiveQuoteSize / Math.max(upRealMid, TICK_SIZE)));
     const baseQtyDown = Math.max(1, Math.round(effectiveQuoteSize / Math.max(downRealMid, TICK_SIZE)));
 
@@ -2188,6 +2188,10 @@ function takerTakeProfit(): void {
 
 // ─── Auto-Exit ────────────────────────────────────────────
 function autoExit(): void {
+  // MOMENTUM v4.1: auto_exit ОТКЛЮЧЁН — держим до TP/SL/settlement.
+  // Раньше закрывал при tau < 3 мин → мелкая прибыль $0.04 вместо $1.00 settlement.
+  // Теперь 3 исхода: TP (maker), SL (dynamic), settlement ($0 или $1).
+  if (config.strategy === "momentum") return;
   for (const [marketId, market] of markets) {
     const tau = (market.expiresAt - Date.now()) / 60000;
     if (tau < config.autoExitMinutes && tau > -1) {
