@@ -1781,18 +1781,10 @@ function markToMarket(_btc: BtcPriceData): void {
             );
             stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_taker_exit_2min` });
           }
-          // ── BREAK-EVEN SL (v1.2): если позиция была в плюсе (peakPnl > 0),
-          // переносим SL на entry price. Если цена разворачивается и доходит до entry →
-          // закрываем с $0 убыток вместо -$6.48. Защищает от "был в плюсе, стал в минусе".
-          else if (config.strategy === "hold-tp" && pos.peakValue > pos.costBasis && currentMid > 0 && currentMid <= pos.entryPrice) {
-            const peakPnl = pos.peakValue - pos.costBasis;
-            console.log(
-              `[HOLD-TP] 🛡️ BREAK-EVEN SL on ${posId}: peakPnl=+$${peakPnl.toFixed(4)} ` +
-              `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (price returned to entry) → ` +
-              `closing at ~$0 to protect against larger loss`
-            );
-            tpTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_break_even_sl` });
-          }
+          // ── BREAK-EVEN SL — ОТКЛЮЧЕН (v1.2 → v1.2.1) ──
+          // Проблема: срабатывал слишком быстро (7 сек!) на шумовых пиках,
+          // и закрывал по maker ask < entry → убыток вместо $0.
+          // Теперь только dynamic SL (85%/60%/30%/taker<2min).
           // Dynamic SL hit → exit immediately (no 30s hold — SL works from market target only)
           // BUG FIX (2026-06-24): убран holdTime >= MIN_HOLD_MS — позиция может быть в минусе
           // 40 секунд и потом принесёт плюс. SL срабатывает только от target, не от времени.
