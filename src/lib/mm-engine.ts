@@ -358,6 +358,13 @@ function persistState() {
   (g as any).__mm_cachedBtcData = cachedBtcData;  // FIX 5
   g.__mm_dailyStartBalance = dailyStartBalance;
   g.__mm_dailyResetDate = dailyResetDate;
+  // BUG FIX (2026-06-23): analytics counters were NOT persisted → reset to 0 on bun --hot reload
+  (g as any).__mm_totalWins = totalWins;
+  (g as any).__mm_totalLosses = totalLosses;
+  (g as any).__mm_totalWinAmount = totalWinAmount;
+  (g as any).__mm_totalLossAmount = totalLossAmount;
+  (g as any).__mm_totalGasPaid = totalGasPaid;
+  (g as any).__mm_totalFeesPaid = totalFeesPaid;
 }
 
 // ─── Helpers ───────────────────────────────────────────────
@@ -1683,7 +1690,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
     executedAt: Date.now(),
     isPaperTrade: true,
     pnl: tradePnl,
-    context: buildTradeContext(quote.marketId, _btc, posForContext),
+    context: buildTradeContext(quote.marketId, cachedBtcData, posForContext),
   });
 }
 
