@@ -116,6 +116,7 @@ export function holdTpEntrySignal(
   // Раньше проверяли только UP mid — блокировало DOWN входы на падающем рынке.
   // РАСШИРЕНО (2026-06-23): было 0.25-0.75, стало 0.20-0.80 — Polymarket 15m рынки
   // быстро уходят от 0.50, к моменту tau<14 цена уже 0.75-0.85. 0.20-0.80 даёт больше входов.
+  // v1.2: оставлено 0.20-0.80
   const MIN_MID = 0.20;
   const MAX_MID = 0.80;
   if (upMid < MIN_MID || upMid > MAX_MID) {
@@ -124,9 +125,9 @@ export function holdTpEntrySignal(
     reasons.push(`⚠️ UP mid $${upMid.toFixed(2)} вне 0.25-0.75 — DOWN вход возможен если DOWN mid в диапазоне`);
   }
 
-  // ── 4. Trend signal — 5m в [0.3%, 8%] (как smart-money — шире для раннего входа) ──
-  const MIN_5M = 0.003;
-  const MAX_5M = 0.08;  // 8% (было 6% — расширили для раннего входа на трендовых рынках)
+  // ── 4. Trend signal — 5m в [0.2%, 8%] (v1.2: MIN снижен 0.3% → 0.2% для большего числа входов) ──
+  const MIN_5M = 0.002;  // 0.2% (было 0.3% — ловим меньшие движения)
+  const MAX_5M = 0.08;  // 8%
   if (change5m > MIN_5M && change5m < MAX_5M) {
     upConfidence += 30;
     reasons.push(`📈 5m +${(change5m * 100).toFixed(2)}% → UP trend (+30)`);
@@ -164,8 +165,9 @@ export function holdTpEntrySignal(
   }
 
   // ── 6. L2 HARD FILTER + side-specific MID price check ──
-  const MIN_L2_DEPTH = 30;
-  const MIN_L2_BID_PRESSURE = 0.50;
+  // v1.2: снижены thresholds для большего числа входов (depth $30→$20, bid 50%→45%)
+  const MIN_L2_DEPTH = 20;       // $20 (было $30)
+  const MIN_L2_BID_PRESSURE = 0.45;  // 45% (было 50%)
   const holdSide = change5m > 0 ? "UP" : "DOWN";
   const l2ForSide = holdSide === "UP" ? upL2 : downL2;
   const midForSide = holdSide === "UP" ? upMid : downMid;

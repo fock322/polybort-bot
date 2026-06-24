@@ -1194,8 +1194,9 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
         const bidSideToCheck = signal.side === "UP" ? "BID_UP" : "BID_DOWN";
 
         if (existingPos) {
-          if (config.strategy === "momentum") {
-            // MOMENTUM: allow partial fills up to MAX_PARTIAL_ENTRIES (3)
+          if (config.strategy === "momentum" || config.strategy === "hold-tp") {
+            // MOMENTUM + HOLD-TP: allow partial fills up to MAX_PARTIAL_ENTRIES (3)
+            // HOLD-TP v1.2: scaling in разрешён — докупаем если тренд продолжается
             const MAX_PARTIAL_ENTRIES = 3;
             const currentFillCount = Math.ceil(existingPos.quantity / 6);  // each fill ~6 tokens
             if (currentFillCount >= MAX_PARTIAL_ENTRIES) {
@@ -1208,7 +1209,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
               }
               if (tradeCycleCount % 15 === 0) {
                 console.log(
-                  `[MOMENTUM] ${market.slug}: ${signal.side} max partial entries (${MAX_PARTIAL_ENTRIES}) reached ` +
+                  `[${config.strategy.toUpperCase()}] ${market.slug}: ${signal.side} max partial entries (${MAX_PARTIAL_ENTRIES}) reached ` +
                   `(qty=${existingPos.quantity}) — stop adding`
                 );
               }
@@ -1216,7 +1217,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
               // Allow another partial entry — keep BID active
               if (tradeCycleCount % 15 === 0) {
                 console.log(
-                  `[MOMENTUM] ${market.slug}: ${signal.side} scaling in ` +
+                  `[${config.strategy.toUpperCase()}] ${market.slug}: ${signal.side} scaling in ` +
                   `fill ${currentFillCount}/${MAX_PARTIAL_ENTRIES} (qty=${existingPos.quantity}, entry=$${existingPos.entryPrice.toFixed(2)})`
                 );
               }
@@ -1693,9 +1694,9 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
   quote.status = "filled";
 
   // CONTRARIAN: cancel all BID quotes after fill (no accumulation)
-  // MOMENTUM: KEEP BID quotes active for partial fills (scaling in)
-  // The partial-fill logic in generateQuotes limits to 3 entries per market+side.
-  if (side.startsWith("BID") && config.strategy !== "momentum") {
+  // MOMENTUM + HOLD-TP: KEEP BID quotes active for partial fills (scaling in)
+  // HOLD-TP v1.2: scaling in разрешён — BID остаётся активным для докупки
+  if (side.startsWith("BID") && config.strategy !== "momentum" && config.strategy !== "hold-tp") {
     for (const [, q] of quotes) {
       if (q.status !== "active" || q.marketId !== quote.marketId) continue;
       if (q.side === side) {
@@ -1779,6 +1780,18 @@ function markToMarket(_btc: BtcPriceData): void {
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}%)`
             );
             stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_taker_exit_2min` });
+          }
+          // ── BREAK-EVEN SL (v1.2): если позиция была в плюсе (peakPnl > 0),
+          // переносим SL на entry price. Если цена разворачивается и доходит до entry →
+          // закрываем с $0 убыток вместо -$6.48. Защищает от "был в плюсе, стал в минусе".
+          else if (config.strategy === "hold-tp" && pos.peakValue > pos.costBasis && currentMid > 0 && currentMid <= pos.entryPrice) {
+            const peakPnl = pos.peakValue - pos.costBasis;
+            console.log(
+              `[HOLD-TP] 🛡️ BREAK-EVEN SL on ${posId}: peakPnl=+$${peakPnl.toFixed(4)} ` +
+              `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (price returned to entry) → ` +
+              `closing at ~$0 to protect against larger loss`
+            );
+            tpTriggers.push({ posId, marketId: pos.marketId, reason: `hold-tp_break_even_sl` });
           }
           // Dynamic SL hit → exit immediately (no 30s hold — SL works from market target only)
           // BUG FIX (2026-06-24): убран holdTime >= MIN_HOLD_MS — позиция может быть в минусе
