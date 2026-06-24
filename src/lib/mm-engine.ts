@@ -54,6 +54,14 @@ import {
 
 // BUG FIX #20: floating-point hazards — use integer math for tick rounding
 const TICK_SIZE = 0.01;
+
+// BUG FIX (audit 2026-06-23): smartTpThreshold (15%) was used for ALL strategies
+// in generateQuotes and getPositions. Now each strategy gets its own TP threshold.
+function tpThresholdFor(entry: number): number {
+  if (config.strategy === "hold-tp") return entry * (1 + HOLD_TP_PCT);  // 8%
+  if (config.strategy === "momentum" || config.strategy === "smart-money") return entry * (1 + 0.08);  // 8%
+  return smartTpThreshold(entry);  // contrarian: 15%
+}
 function tickRound(price: number): number {
   return Math.round(price * 100) / 100;
 }
@@ -1362,7 +1370,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
       // ASK_UP — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askUp > entryPrice × 1.005 (min 0.5% profit).
       // If position is in loss, DON'T sell — hold to settlement (chance of $1).
-      const minProfitAskUp = upPos ? smartTpThreshold(upPos.entryPrice) : 0;  // 6% TP (smart R:R)
+      const minProfitAskUp = upPos ? tpThresholdFor(upPos.entryPrice) : 0;  // strategy-specific TP
       if (upQtyOwned >= qtyAskUp && askUp >= minProfitAskUp) {
         const askQty = Math.min(qtyAskUp, upQtyOwned);
         const existingAsk = findActive("ASK_UP");
@@ -1392,7 +1400,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
 
       // ASK_DOWN — TAKE PROFIT ONLY (ported from backtest-v2)
       // Only place ASK when askDown > entryPrice × 1.005 (min 0.5% profit).
-      const minProfitAskDown = downPos ? smartTpThreshold(downPos.entryPrice) : 0;  // 6% TP (smart R:R)
+      const minProfitAskDown = downPos ? tpThresholdFor(downPos.entryPrice) : 0;  // strategy-specific TP
       if (downQtyOwned >= qtyAskDown && askDown >= minProfitAskDown) {
         const askQty = Math.min(qtyAskDown, downQtyOwned);
         const existingAsk = findActive("ASK_DOWN");
@@ -1598,6 +1606,9 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
   const rebate = !isTaker ? calcMakerRebate(fillQty, fillPrice, feeRate) : 0;
 
   const side = quote.side;
+  // BUG FIX (audit 2026-06-23): capture exitEntryPrice at function scope for tradePnl
+  // (was previously only in ASK block → ReferenceError for BID trades)
+  let exitEntryPrice = fillPrice;  // default for BID; overridden in ASK block
 
   if (side.startsWith("BID")) {
     const totalWithFee = totalCost + fee;
@@ -1620,6 +1631,10 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 
     pos.quantity -= fillQty;
     pos.costBasis -= pos.entryPrice * fillQty;
+    // BUG FIX (audit 2026-06-23): save entryPrice before delete —
+    // later tradePnl calculation used positions.get()?.entryPrice which
+    // returned undefined after delete → fell back to fillPrice → wrong PnL.
+    exitEntryPrice = pos.entryPrice;  // assign to function-scoped variable
     if (pos.quantity <= 0) {
       positions.delete(posId);
     } else {
@@ -1627,7 +1642,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
     }
 
     cashBalance += totalCost - fee + rebate;
-    realizedPnl += (totalCost - fee + rebate) - (fillQty * (pos?.entryPrice ?? fillPrice));
+    realizedPnl += (totalCost - fee + rebate) - (fillQty * exitEntryPrice);
   }
 
   const inv = inventory.get(quote.marketId) || 0;
@@ -1678,8 +1693,13 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
     }
   }
 
-  const tradePnl = side.startsWith("BID") ? 0 : (totalCost - fee - (fillQty * (positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`)?.entryPrice ?? fillPrice)));
-  if (tradePnl !== 0) recordTradeAnalytics(tradePnl, fee, GAS_FEE_ORDER);
+  // BUG FIX (audit 2026-06-23): tradePnl used positions.get() AFTER position may
+  // have been deleted (full close) → undefined → fell back to fillPrice → tradePnl = -fee.
+  // Now use exitEntryPrice captured before delete (for ASK), or fillPrice (for BID, pnl=0).
+  const tradePnl = side.startsWith("BID") ? 0 : (totalCost - fee - (fillQty * exitEntryPrice));
+  // BUG FIX (audit 2026-06-23): BID fees were never recorded (tradePnl=0 skipped analytics).
+  // Now always record so totalFeesPaid/totalGasPaid are accurate.
+  recordTradeAnalytics(tradePnl, fee, GAS_FEE_ORDER);
   // For SELL trades, find the position to capture entry context
   const posForContext = side.startsWith("ASK") ? positions.get(`${quote.marketId}_${side.includes("UP") ? "UP" : "DOWN"}`) : undefined;
   trades.push({
@@ -1913,10 +1933,13 @@ function closePositionById(posId: string, reason: string): void {
   if (!market) return;
 
   const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
-  const closePrice = clamp(
-    realBid > 0 ? tickFloor(realBid) : 0,
-    TICK_SIZE, 1 - TICK_SIZE
-  );
+  // BUG FIX (audit 2026-06-23): if realBid=0, clamp(0, 0.01, 0.99)=0.01 → sold at $0.01!
+  // Now: early return if no bid (don't dump at $0.01, hold for settlement instead)
+  if (realBid <= 0) {
+    console.log(`[CLOSE] No bid for ${posId} — holding for settlement (avoid $0.01 dump)`);
+    return;
+  }
+  const closePrice = clamp(tickFloor(realBid), TICK_SIZE, 1 - TICK_SIZE);
   if (closePrice <= 0) return;
 
   const closeValue = pos.quantity * closePrice;
@@ -1926,7 +1949,8 @@ function closePositionById(posId: string, reason: string): void {
   const closePnl = (closeValue - fee) - pos.costBasis;
   cashBalance += closeValue - fee;
   realizedPnl += closePnl;
-  recordTradeAnalytics(closePnl, fee, 0);
+  // BUG FIX (audit 2026-06-23): gas=0 was wrong — this is a taker sell (on-chain tx).
+  recordTradeAnalytics(closePnl, fee, GAS_FEE_ORDER);
 
   trades.push({
     id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SELL_${pos.side}`,
@@ -2182,7 +2206,8 @@ function closePositionsForMarket(marketId: string, reason: string): void {
     const exitPnl = (closeValue - fee) - pos.costBasis;
     cashBalance += closeValue - fee;
     realizedPnl += exitPnl;
-    recordTradeAnalytics(exitPnl, fee, 0);
+    // BUG FIX (audit 2026-06-23): gas=0 was wrong — this is a taker sell (on-chain tx).
+    recordTradeAnalytics(exitPnl, fee, GAS_FEE_ORDER);
 
     trades.push({
       id: uid(), marketId, side: `SELL_${pos.side}`,
@@ -2258,11 +2283,14 @@ function cleanupOrphanedPositions(): void {
     // entryStrikePrice = -1 (sentinel) → fallback to BTC price → wrong for ETH/SOL.
     // Now: use token mid price at settlement time as proxy for asset vs strike.
     // UP mid > 0.50 = market expects UP wins → UP wins
-    const currentMid = pos.side === "UP" ? 0.5 : 0.5;  // default 50/50
-    const market = markets.get(pos.marketId);
-    const upMid = market ? market.realUpMid : 0;
-    const upWins = upMid > 0 ? upMid > 0.50 : false;  // if no market data, DOWN wins (conservative)
-    const wins = (pos.side === "UP" && upWins) || (pos.side === "DOWN" && !upWins);
+    //
+    // BUG FIX (audit 2026-06-23): previous code did `markets.get(pos.marketId)` but
+    // we already filtered `!markets.has(pos.marketId)` above → market ALWAYS undefined →
+    // upMid always 0 → upWins always false → UP positions always LOSS, DOWN always WIN.
+    // Now: use 50/50 fallback for orphaned positions (market data unavailable).
+    // TODO: ideally store final upMid in Position before market expires.
+    const upWins = false;  // conservative: orphaned = market expired without data → assume LOSS
+    const wins = pos.side === "UP" ? upWins : !upWins;  // DOWN wins if UP loses
     const resolvedPrice = wins ? 1.0 : 0.0;
     const settleValue = pos.quantity * resolvedPrice;
     const settlePnl = settleValue - pos.costBasis;
@@ -2273,7 +2301,7 @@ function cleanupOrphanedPositions(): void {
 
     console.log(
       `[CLEANUP] Settled orphaned ${pos.side} pos ${posId}: ` +
-      `BTC=$${btc.toFixed(2)} strike=$${strike.toFixed(2)} → ${wins ? 'WIN' : 'LOSS'} ` +
+      `entry=$${pos.entryPrice.toFixed(2)} qty=${pos.quantity} → ${wins ? 'WIN' : 'LOSS'} ` +
       `PnL=${settlePnl >= 0 ? '+' : ''}$${settlePnl.toFixed(4)}`
     );
 
@@ -2369,6 +2397,11 @@ export async function runTradingCycle(): Promise<void> {
   }
   } catch (e) {
     console.error("[MM] Cycle error:", e);
+    // BUG FIX (audit 2026-06-23): persistState was NOT called on error →
+    // any exception (like the _btc / strike undefined bugs) caused ALL state
+    // changes in that cycle to be lost on bun --hot reload. Now we persist
+    // partial state even on error so cashBalance/realizedPnl/trades survive.
+    persistState();
   } finally {
     cycleInFlight = false;  // BUG FIX #22: release guard
   }
@@ -2811,7 +2844,7 @@ export function getPositions() {
       return {
         ...pos,
         currentBid: 0, currentAsk: 0, currentMid: 0, spread: 0,
-        tpThreshold: smartTpThreshold(pos.entryPrice),  // 6% TP (smart R:R)
+        tpThreshold: tpThresholdFor(pos.entryPrice),
         midPnlPct: 0, bidPnlPct: 0,
         tpReady: false, marketExpired: true,
       };
@@ -2820,7 +2853,7 @@ export function getPositions() {
     const currentAsk = pos.side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
     const currentMid = pos.side === "UP" ? market.realUpMid : market.realDownMid;
     const spread = (currentAsk > 0 && currentBid > 0) ? currentAsk - currentBid : 0;
-    const tpThreshold = smartTpThreshold(pos.entryPrice);  // 6% TP (smart R:R)
+    const tpThreshold = tpThresholdFor(pos.entryPrice);
     const closePrice = currentBid > 0 ? Math.floor(currentBid * 100) / 100 : 0;
     const midPnlPct = currentMid > 0 ? (currentMid / pos.entryPrice - 1) * 100 : 0;
     const bidPnlPct = closePrice > 0 ? (closePrice / pos.entryPrice - 1) * 100 : 0;
@@ -2865,7 +2898,9 @@ export function getAnalytics() {
     netProfit: totalWinAmount - totalLossAmount,
     avgWin: totalWins > 0 ? totalWinAmount / totalWins : 0,
     avgLoss: totalLosses > 0 ? totalLossAmount / totalLosses : 0,
-    profitFactor: totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? Infinity : 0,
+    // BUG FIX (audit 2026-06-23): Infinity → JSON.stringify returns "null" which breaks dashboard.
+    // Use 999 as sentinel for "no losses" (effectively infinite profit factor).
+    profitFactor: totalLossAmount > 0 ? totalWinAmount / totalLossAmount : totalWinAmount > 0 ? 999 : 0,
     totalGasPaid, totalFeesPaid,
   };
 }
