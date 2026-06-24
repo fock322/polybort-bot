@@ -986,6 +986,10 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     if (tau < config.autoExitMinutes) continue;
     if (!market.active) continue;
 
+    // HOLD-TP FIX (2026-06-24): SOL слишком волатильный для hold-tp.
+    // 1 трейд -$3.58 съел половину прибыли. Временно исключаем SOL.
+    if (config.strategy === "hold-tp" && market.slug.startsWith("sol-")) continue;
+
     // ═══ Market quality filters (realistic trading conditions) ═══
     // Skip markets that can't be traded realistically:
     //   1. Crossed or empty order book (bestBid=0 or bestAsk=0 or bid >= ask)
@@ -1304,7 +1308,7 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     // ── Sizes (inventory-aware) ──
     // Base quote size scaled to the side's mid price.
     // SMART-MONEY: position size $10 (vs $5 for others) — bigger profit per trade
-    const effectiveQuoteSize = config.strategy === "smart-money" ? 10 : config.quoteSize;
+    const effectiveQuoteSize = (config.strategy === "smart-money" || config.strategy === "hold-tp") ? 10 : config.quoteSize;
     const baseQtyUp = Math.max(1, Math.round(effectiveQuoteSize / Math.max(upRealMid, TICK_SIZE)));
     const baseQtyDown = Math.max(1, Math.round(effectiveQuoteSize / Math.max(downRealMid, TICK_SIZE)));
 
@@ -1769,8 +1773,10 @@ function markToMarket(_btc: BtcPriceData): void {
             );
             stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_taker_exit_2min` });
           }
-          // Dynamic SL hit → exit (only after 30s hold to avoid panic on entry)
-          else if (dynSl.slPct > 0 && dropPct >= dynSl.slPct && holdTime >= MIN_HOLD_MS) {
+          // Dynamic SL hit → exit immediately (no 30s hold — SL works from market target only)
+          // BUG FIX (2026-06-24): убран holdTime >= MIN_HOLD_MS — позиция может быть в минусе
+          // 40 секунд и потом принесёт плюс. SL срабатывает только от target, не от времени.
+          else if (dynSl.slPct > 0 && dropPct >= dynSl.slPct) {
             console.log(
               `[${config.strategy.toUpperCase()}] 🛑 DYNAMIC SL on ${posId}: tau=${tau.toFixed(1)}min SL=${(dynSl.slPct * 100).toFixed(0)}% ` +
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${dynSl.slPct * 100}%)`
