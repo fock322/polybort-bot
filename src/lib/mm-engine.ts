@@ -2402,6 +2402,8 @@ export async function runTradingCycle(): Promise<void> {
     await liveTradingCycle(btc);
   } else {
     simulateFills(btc);
+    // BUG FIX (2026-06-24): persist after simulateFills (fills change cashBalance/realizedPnl)
+    persistState();
   }
 
   markToMarket(btc);
@@ -2409,7 +2411,11 @@ export async function runTradingCycle(): Promise<void> {
   // Momentum trailing TP handled in markToMarket, but also call takerTakeProfit
   // for fixed TP fallback (in case trailing conditions not met but price spiked)
   takerTakeProfit();
+  // BUG FIX (2026-06-24): persist state after takerTakeProfit (fills change cashBalance/realizedPnl).
+  // If reload happened between takerTakeProfit and end-of-cycle persistState, state was lost.
+  persistState();
   autoExit();
+  persistState();
   cleanupOrphanedPositions();  // BUG FIX (2026-06-20): settle positions on expired/missing markets
   takePnLSnapshot();
 
@@ -2914,6 +2920,17 @@ function recordTradeAnalytics(pnl: number, fee: number, gasFee: number) {
   totalGasPaid += gasFee;
   if (pnl > 0) { totalWins++; totalWinAmount += pnl; }
   else if (pnl < 0) { totalLosses++; totalLossAmount += Math.abs(pnl); }
+  // BUG FIX (2026-06-24): persist analytics counters IMMEDIATELY after update.
+  // Previously only persistState() at end of cycle wrote them to globalThis.
+  // If bun --hot reload happened between recordTradeAnalytics and persistState,
+  // the counters were lost. Now we write directly to globalThis here.
+  const gg = globalThis as any;
+  gg.__mm_totalWins = totalWins;
+  gg.__mm_totalLosses = totalLosses;
+  gg.__mm_totalWinAmount = totalWinAmount;
+  gg.__mm_totalLossAmount = totalLossAmount;
+  gg.__mm_totalGasPaid = totalGasPaid;
+  gg.__mm_totalFeesPaid = totalFeesPaid;
 }
 
 export function getAnalytics() {

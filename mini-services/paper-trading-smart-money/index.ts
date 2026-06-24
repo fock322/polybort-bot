@@ -94,6 +94,21 @@ const server = Bun.serve({
         return Response.json({ status: "ok", service: "paper-trading-smart-money", port: PORT, strategy: "smart-money", uptime: process.uptime() }, { headers: corsHeaders });
       }
 
+      if (path === "/debug-state" && method === "GET") {
+        const g = globalThis as any;
+        return Response.json({
+          __mm_cash: g.__mm_cash,
+          __mm_realizedPnl: g.__mm_realizedPnl,
+          __mm_running: g.__mm_running,
+          __mm_trades_length: g.__mm_trades?.length,
+          __mm_totalWins: g.__mm_totalWins,
+          __mm_totalLosses: g.__mm_totalLosses,
+          __mm_totalWinAmount: g.__mm_totalWinAmount,
+          __mm_totalLossAmount: g.__mm_totalLossAmount,
+          __mm_positions_size: g.__mm_positions?.size,
+        }, { headers: corsHeaders });
+      }
+
       if (path === "/ws-status" && method === "GET") {
         return Response.json(getWsStatus(), { headers: corsHeaders });
       }
