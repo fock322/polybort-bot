@@ -1769,12 +1769,13 @@ function markToMarket(_btc: BtcPriceData): void {
         // tau 2-4min: SL 30%
         // tau < 2min: taker exit (последний шанс до settlement)
         if (config.strategy === "hold-tp" || config.strategy === "momentum") {
-          // momentum v4: тоже dynamic SL, но пороги свои (60%/30%/taker<2min)
+          // momentum v4.1: dynamic SL 85%/60%/40% (tau < 2 → SL 40%, не taker exit)
           const dynSl = config.strategy === "hold-tp"
             ? getHoldSlForTau(tau)
             : getMomentumSlForTau(tau);
-          // tau < 2 min → taker exit (close regardless of PnL)
-          if (tau < 2) {
+          // HOLD-TP: tau < 2 min → taker exit (close regardless of PnL)
+          // MOMENTUM v4.1: tau < 2 min → SL 40% (не taker exit, держим до settlement если < 40%)
+          if (config.strategy === "hold-tp" && tau < 2) {
             console.log(
               `[${config.strategy.toUpperCase()}] ⏰ TAKER EXIT on ${posId}: tau=${tau.toFixed(1)}min < 2min (last chance before settlement) ` +
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}%)`

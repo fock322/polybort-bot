@@ -50,7 +50,10 @@ export const MAX_TAU = 5.0;   // последние 5 минут
 export const MIN_L2_DEPTH = 30;       // минимальная глубина книги ($)
 export const MIN_L2_BID_PRESSURE = 0.50;  // bid pressure на нашей стороне
 
-// Динамический SL по tau (как hold-tp)
+// Динамический SL по tau (v4.1: мягкий SL — даём шанс на восстановление)
+//   tau 4-5:  SL 85% (держим, шанс восстановления высок)
+//   tau 2-4:  SL 60% (поменьше времени)
+//   tau < 2:  SL 40% (последний шанс, но не taker exit — держим до settlement если < 40%)
 export interface DynSl {
   tauMin: number;
   tauMax: number;
@@ -59,9 +62,9 @@ export interface DynSl {
 }
 
 export const DYNAMIC_SL: DynSl[] = [
-  { tauMin: 4, tauMax: 99, slPct: 0.60, label: "60% (tau>4min, есть время)" },
-  { tauMin: 2, tauMax: 4,  slPct: 0.30, label: "30% (tau 2-4min)" },
-  // tau < 2 min → taker exit (handled in markToMarket)
+  { tauMin: 4, tauMax: 99, slPct: 0.85, label: "85% (tau>4min, держим до восстановления)" },
+  { tauMin: 2, tauMax: 4,  slPct: 0.60, label: "60% (tau 2-4min)" },
+  { tauMin: 0, tauMax: 2,  slPct: 0.40, label: "40% (tau<2min, последний шанс)" },
 ];
 
 export function getMomentumSlForTau(tauMin: number): { slPct: number; label: string } {
@@ -70,7 +73,7 @@ export function getMomentumSlForTau(tauMin: number): { slPct: number; label: str
       return { slPct: tier.slPct, label: tier.label };
     }
   }
-  return { slPct: 0, label: "taker exit (<2min до settlement)" };
+  return { slPct: 0.40, label: "40% (default)" };
 }
 
 // Compatibility exports (для старого mm-engine кода, не используется в v4)
