@@ -148,6 +148,7 @@ export interface Position {
   // ── Inventory management v2 ──
   entryMid: number;  // market mid price at position open (for adverse selection detection)
   peakValue: number; // peak currentValue (for trailing stop in future)
+  minValue: number;  // min currentValue (max drawdown tracking)
   entryStrikePrice: number;  // strike price at position open (for orphaned position settlement)
 }
 
@@ -179,6 +180,7 @@ export interface TradeContext {
   entryPrice?: number;
   holdTimeMs?: number;
   peakPnl?: number;
+  minPnl?: number;              // min unrealized PnL (max drawdown, negative = was in loss)
 }
 
 export interface Trade {
@@ -419,6 +421,7 @@ export function buildTradeContext(marketId: string, btc: BtcPriceData, pos?: Pos
       entryPrice: pos.entryPrice,
       holdTimeMs: Date.now() - pos.openedAt,
       peakPnl: pos.peakValue - pos.costBasis,
+      minPnl: (pos.minValue || pos.costBasis) - pos.costBasis,
     } : {};
   }
 
@@ -471,6 +474,7 @@ export function buildTradeContext(marketId: string, btc: BtcPriceData, pos?: Pos
     entryPrice: pos?.entryPrice,
     holdTimeMs: pos ? Date.now() - pos.openedAt : undefined,
     peakPnl: pos ? pos.peakValue - pos.costBasis : undefined,
+    minPnl: pos ? (pos.minValue || pos.costBasis) - pos.costBasis : undefined,
   };
 }
 
@@ -1680,7 +1684,8 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
         isRealPosition: false,
         entryMid,
         peakValue: totalCost,
-        entryStrikePrice: market.strikePrice,  // for orphaned position settlement
+        minValue: totalCost,
+        entryStrikePrice: market.strikePrice,
       });
     }
   }
@@ -1738,6 +1743,8 @@ function markToMarket(_btc: BtcPriceData): void {
     pos.currentValue = pos.quantity * pToken;
     pos.unrealizedPnl = pos.currentValue - pos.costBasis;
     if (pos.currentValue > pos.peakValue) pos.peakValue = pos.currentValue;
+    // Track min value (max drawdown) — lowest point position reached
+    if (pos.minValue === 0 || pos.currentValue < pos.minValue) pos.minValue = pos.currentValue;
     totalUnrealized += pos.unrealizedPnl;
 
     // ── STOP-LOSS (unified for ALL strategies + ALL assets) ──
@@ -2306,7 +2313,7 @@ function cleanupOrphanedPositions(): void {
         price: 0, quantity: pos.quantity, totalCost: 0, fee: 0,
         slippage: 0, reason: "orphaned_no_btc_price", executedAt: Date.now(),
         isPaperTrade: !config.liveMode, pnl: settlePnl,
-        context: { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis },
+        context: { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis, minPnl: (pos.minValue || pos.costBasis) - pos.costBasis },
       });
       positions.delete(posId);
       continue;
@@ -2343,7 +2350,7 @@ function cleanupOrphanedPositions(): void {
       price: resolvedPrice, quantity: pos.quantity, totalCost: settleValue, fee: 0,
       slippage: 0, reason: wins ? "orphaned_settle_win" : "orphaned_settle_loss",
       executedAt: Date.now(), isPaperTrade: !config.liveMode, pnl: settlePnl,
-      context: { btcPrice: btc, entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis },
+      context: { btcPrice: btc, entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis, minPnl: (pos.minValue || pos.costBasis) - pos.costBasis },
     });
 
     positions.delete(posId);
@@ -2525,6 +2532,7 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
             isRealPosition: true,
             entryMid,
             peakValue: totalCost,
+            minValue: totalCost,
             entryStrikePrice: market.strikePrice,  // for orphaned position settlement
           });
         }
