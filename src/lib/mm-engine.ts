@@ -2032,13 +2032,20 @@ async function markToMarket(_btc: BtcPriceData): Promise<void> {
   // Live mode: daily loss check
   if (config.liveMode) {
     checkDailyReset();
-    // BUG FIX: dailyPnL was cash-only, ignoring open positions
-    // Now includes unrealized PnL to prevent false circuit breaker trips
-    const openValue = Array.from(positions.values()).reduce((s, p) => s + p.currentValue, 0);
+    // BUG FIX (2026-06-25): Circuit breaker was triggering FALSE POSITIVE when:
+    // 1. Position bought → cashBalance decreased by $9.46
+    // 2. Balance sync overwrote cashBalance with CLOB USDC (which excludes token value)
+    // 3. openValue was 0 because markToMarket hadn't updated currentValue yet
+    // 4. dailyPnl = (cashBalance + 0) - dailyStartBalance = -$9.56 → circuit breaker!
+    //
+    // Fix: use costBasis as fallback for currentValue if it's 0 (position just created)
+    const openValue = Array.from(positions.values()).reduce((s, p) => {
+      return s + (p.currentValue > 0 ? p.currentValue : p.costBasis);
+    }, 0);
     const dailyPnl = (cashBalance + openValue) - dailyStartBalance;
     if (dailyStartBalance > 0 && -dailyPnl / dailyStartBalance > LIVE_MAX_DAILY_LOSS_PCT) {
       circuitBreaker = true;
-      console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: dailyPnl=${dailyPnl.toFixed(2)}, maxLoss=${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}%`);
+      console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: dailyPnl=${dailyPnl.toFixed(2)}, maxLoss=${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}% (cash=$${cashBalance.toFixed(2)} openVal=$${openValue.toFixed(2)} start=$${dailyStartBalance.toFixed(2)})`);
     }
   }
 }
