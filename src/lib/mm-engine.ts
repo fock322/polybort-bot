@@ -1737,7 +1737,7 @@ function executeFill(quote: Quote, market: Market, fillPrice: number, fillQty: n
 }
 
 // ─── Mark to Market ───────────────────────────────────────
-function markToMarket(_btc: BtcPriceData): void {
+async function markToMarket(_btc: BtcPriceData): Promise<void> {
   let totalUnrealized = 0;
   const stopLossTriggers: Array<{ posId: string; marketId: string; reason: string }> = [];
   // FIX 1 (2026-06-22): Separate TP triggers for MAKER exit (0 fee)
@@ -1899,7 +1899,7 @@ function markToMarket(_btc: BtcPriceData): void {
       `[MM] STOP-LOSS triggered on ${t.posId}: ${t.reason}. ` +
       `Closing at market bid.`
     );
-    closePositionById(t.posId, t.reason);
+    await closePositionById(t.posId, t.reason);
   }
 
   // FIX 1 + FIX #5 (2026-06-23): Execute TP/SL closures via MAKER exit (0 fee!)
@@ -1909,8 +1909,40 @@ function markToMarket(_btc: BtcPriceData): void {
     const pos = positions.get(t.posId);
     if (!pos) continue;
     const mkt = markets.get(t.marketId);
-    if (!mkt) { closePositionById(t.posId, t.reason); continue; }
+    if (!mkt) { await closePositionById(t.posId, t.reason); continue; }
 
+    // ── LIVE MODE: send SELL order through CLOB ──
+    if (config.liveMode) {
+      const tokenId = pos.side === "UP" ? mkt.upTokenId : mkt.downTokenId;
+      const realAskLive = pos.side === "UP" ? mkt.realUpBestAsk : mkt.realDownBestAsk;
+      let sellPrice = 0;
+      if (realAskLive > 0) sellPrice = tickFloor(realAskLive - TICK_SIZE);
+      else if (mkt.realUpBestBid > 0) sellPrice = tickFloor(pos.side === "UP" ? mkt.realUpBestBid : mkt.realDownBestBid);
+      if (sellPrice <= 0) { console.log(`[LIVE-TP/SL] No price for ${t.posId} — hold for settlement`); continue; }
+
+      console.log(`[LIVE-TP/SL] Submitting SELL ${pos.side} ${pos.quantity}@$${sellPrice.toFixed(2)} (${t.reason})`);
+      try {
+        const result = await clobSubmit(mkt.conditionId, `ASK_${pos.side}`, tokenId, sellPrice, pos.quantity, mkt.negRisk);
+        if (!result || result.status === "rejected" || result.status === "error") {
+          console.error(`[LIVE-TP/SL] SELL failed: ${result?.error ?? "unknown"}. Holding.`);
+          continue;
+        }
+        const closeValue = pos.quantity * sellPrice;
+        const tpPnl = closeValue - pos.costBasis - GAS_FEE_ORDER;
+        cashBalance += closeValue - GAS_FEE_ORDER;
+        realizedPnl += tpPnl;
+        recordTradeAnalytics(tpPnl, 0, GAS_FEE_ORDER);
+        console.log(`[LIVE-TP/SL] ✅ SELL posted: ${pos.side} ${pos.quantity}@$${sellPrice.toFixed(2)} PnL=${tpPnl >= 0 ? "+" : ""}$${tpPnl.toFixed(4)} [${t.reason}]`);
+        trades.push({ id: uid(), marketId: pos.marketId, marketSlug: mkt.slug, side: `SELL_${pos.side}`, price: sellPrice, quantity: pos.quantity, totalCost: closeValue, fee: 0, slippage: 0, reason: t.reason, executedAt: Date.now(), isPaperTrade: false, pnl: tpPnl, context: buildTradeContext(pos.marketId, cachedBtcData, pos) });
+        const inv = inventory.get(pos.marketId) || 0;
+        if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
+        else inventory.set(pos.marketId, inv + pos.quantity);
+        positions.delete(t.posId);
+      } catch (err) { console.error(`[LIVE-TP/SL] Error: ${err}. Holding.`); }
+      continue;
+    }
+
+    // ── PAPER MODE: simulate maker exit ──
     const realAsk = pos.side === "UP" ? mkt.realUpBestAsk : mkt.realDownBestAsk;
     const realBid = pos.side === "UP" ? mkt.realUpBestBid : mkt.realDownBestBid;
     const sellQty = pos.quantity;
@@ -1955,7 +1987,7 @@ function markToMarket(_btc: BtcPriceData): void {
     } else {
       // BUG FIX #5: Taker fallback — market crashing, maker won't fill
       console.log(`[TP/SL] ⚠️ Taker fallback for ${t.posId}: maker=$${makerSellPrice.toFixed(2)} bid=$${realBid.toFixed(2)} [${t.reason}]`);
-      closePositionById(t.posId, t.reason);
+      await closePositionById(t.posId, t.reason);
     }
   }
 
@@ -1982,19 +2014,78 @@ function markToMarket(_btc: BtcPriceData): void {
 }
 
 // ─── Close a single position by ID (used by stop-loss) ────
-function closePositionById(posId: string, reason: string): void {
+// LIVE MODE: sends actual SELL order to CLOB
+// PAPER MODE: simulates the fill
+async function closePositionById(posId: string, reason: string): Promise<void> {
   const pos = positions.get(posId);
   if (!pos) return;
   const market = markets.get(pos.marketId);
   if (!market) return;
 
   const realBid = pos.side === "UP" ? market.realUpBestBid : market.realDownBestBid;
-  // BUG FIX (audit 2026-06-23): if realBid=0, clamp(0, 0.01, 0.99)=0.01 → sold at $0.01!
-  // Now: early return if no bid (don't dump at $0.01, hold for settlement instead)
+  // BUG FIX (audit 2026-06-23): if realBid=0 → hold for settlement
   if (realBid <= 0) {
     console.log(`[CLOSE] No bid for ${posId} — holding for settlement (avoid $0.01 dump)`);
     return;
   }
+
+  // ── LIVE MODE: send SELL order to CLOB ──
+  if (config.liveMode) {
+    const tokenId = pos.side === "UP" ? market.upTokenId : market.downTokenId;
+    const closePrice = clamp(tickFloor(realBid), TICK_SIZE, 1 - TICK_SIZE);
+    if (closePrice <= 0) return;
+
+    console.log(`[LIVE-CLOSE] Submitting SELL ${pos.side} ${pos.quantity}@$${closePrice.toFixed(2)} (${reason})`);
+
+    try {
+      const result = await clobSubmit(market.conditionId, `ASK_${pos.side}`, tokenId, closePrice, pos.quantity, market.negRisk);
+
+      if (!result || result.status === "rejected" || result.status === "error") {
+        console.error(`[LIVE-CLOSE] SELL order failed: ${result?.error ?? "unknown"}. Holding for settlement.`);
+        return;  // Don't close internally — position still on-chain
+      }
+
+      // SELL order submitted. In live mode, we mark position as "closing"
+      // and let reconcile handle the actual fill.
+      // For simplicity, assume fill at closePrice (will be corrected by reconcile).
+      const closeValue = pos.quantity * closePrice;
+      const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+      const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
+      const closePnl = (closeValue - fee) - pos.costBasis;
+
+      cashBalance += closeValue - fee;
+      realizedPnl += closePnl;
+      recordTradeAnalytics(closePnl, fee, GAS_FEE_ORDER);
+
+      trades.push({
+        id: uid(), marketId: pos.marketId, marketSlug: market.slug, side: `SELL_${pos.side}`,
+        price: closePrice, quantity: pos.quantity, totalCost: closeValue,
+        fee, slippage: 0, reason, executedAt: Date.now(),
+        isPaperTrade: false,
+        pnl: closePnl,
+        context: buildTradeContext(pos.marketId, cachedBtcData, pos),
+      });
+
+      console.log(`[LIVE-CLOSE] ✅ SELL order posted: ${pos.side} ${pos.quantity}@$${closePrice.toFixed(2)} PnL=${closePnl >= 0 ? "+" : ""}$${closePnl.toFixed(4)} [${reason}]`);
+
+      const inv = inventory.get(pos.marketId) || 0;
+      if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
+      else inventory.set(pos.marketId, inv + pos.quantity);
+      positions.delete(posId);
+
+      for (const [, q] of quotes) {
+        if (q.marketId === pos.marketId && q.status === "active") {
+          const qSide = q.side.includes("UP") ? "UP" : "DOWN";
+          if (qSide === pos.side) q.status = "cancelled";
+        }
+      }
+    } catch (err) {
+      console.error(`[LIVE-CLOSE] Error: ${err}. Holding for settlement.`);
+    }
+    return;
+  }
+
+  // ── PAPER MODE: simulate close (original logic) ──
   const closePrice = clamp(tickFloor(realBid), TICK_SIZE, 1 - TICK_SIZE);
   if (closePrice <= 0) return;
 
@@ -2005,7 +2096,6 @@ function closePositionById(posId: string, reason: string): void {
   const closePnl = (closeValue - fee) - pos.costBasis;
   cashBalance += closeValue - fee;
   realizedPnl += closePnl;
-  // BUG FIX (audit 2026-06-23): gas=0 was wrong — this is a taker sell (on-chain tx).
   recordTradeAnalytics(closePnl, fee, GAS_FEE_ORDER);
 
   trades.push({
@@ -2439,7 +2529,7 @@ export async function runTradingCycle(): Promise<void> {
     persistState();
   }
 
-  markToMarket(btc);
+  await markToMarket(btc);
   // Maker TP exit for ALL strategies (contrarian + smart-money fixed TP, momentum trailing)
   // Momentum trailing TP handled in markToMarket, but also call takerTakeProfit
   // for fixed TP fallback (in case trailing conditions not met but price spiked)
