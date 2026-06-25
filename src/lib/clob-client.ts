@@ -406,6 +406,7 @@ export class ClobClient {
       // BUG FIX (2026-06-25): delegate to official clob-client-v2
       // V2 signature: createAndPostOrder(userOrder, options, orderType, postOnly)
       // options includes negRisk — critical for BTC/ETH/SOL 15-min markets!
+      // FOK for BUY (instant taker fill), GTC for SELL (maker exit, 0 fee)
       if (this.official) {
         const options: any = {};
         if (order.negRisk) options.negRisk = true;

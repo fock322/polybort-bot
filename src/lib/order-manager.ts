@@ -122,7 +122,12 @@ export async function submitOrder(
   };
 
   // Submit to CLOB
-  const result: OrderResult = await client.submitOrder(clobOrder, "GTC", false);
+  // BUG FIX (2026-06-25): Use FOK (Fill-Or-Kill) for BUY orders — instant taker fill or cancel.
+  // GTC maker orders don't fill on last 5 min of market (no sellers at our price).
+  // FOK = fill immediately at market price or kill (cancel). No hanging orders.
+  // SELL orders (TP/SL exits) keep GTC — maker exit for 0 fee when possible.
+  const orderType = side.startsWith("BID") ? "FOK" : "GTC";
+  const result: OrderResult = await client.submitOrder(clobOrder, orderType as "GTC" | "FOK", false);
 
   if (result.status === "rejected" || result.status === "error") {
     managed.status = "rejected";

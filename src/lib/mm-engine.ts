@@ -2764,8 +2764,23 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
       }).filter(o => o.tokenId.length > 0);
 
       if (ordersToSubmit.length > 0) {
-        const submitted = await replaceOrders(ordersToSubmit);
-        console.log(`[MM] Submitted ${submitted.length}/${ordersToSubmit.length} orders to CLOB`);
+        // BUG FIX (2026-06-25): Don't submit new orders if we already have open positions
+        // or pending orders on these markets. FOK orders are instant — no need to spam.
+        const hasOpenPosition = ordersToSubmit.every(o => {
+          const posSide = o.side.includes("UP") ? "UP" : "DOWN";
+          const posId = `${o.marketId}_${posSide}`;
+          const pos = positions.get(posId);
+          // Skip if position exists and is not being closed
+          return !pos || pos.closing;
+        });
+        // Also check: don't submit if we already submitted in last 5 seconds (rate limit)
+        const recentSubmit = Array.from(quotes.values()).some(q =>
+          q.status === "active" && Date.now() - q.createdAt < 5000
+        );
+
+        if (hasOpenPosition && !recentSubmit) {
+          const submitted = await replaceOrders(ordersToSubmit);
+          console.log(`[MM] Submitted ${submitted.length}/${ordersToSubmit.length} orders to CLOB`);
 
         // BUG FIX (2026-06-25): Create positions for instantly matched (filled) orders.
         // CLOB v2 can return status="matched" immediately for taker orders.
@@ -2837,6 +2852,7 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
           }
         }
       }
+    }
     }
   }
 
