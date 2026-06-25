@@ -414,10 +414,13 @@ export class ClobClient {
           feeRateBps: order.feeRateBps ?? 0,
         }, orderType);
 
-        if (result.success === false || result.errorMsg) {
-          const errMsg = result.errorMsg || JSON.stringify(result);
-          console.error(`[CLOB] Order rejected: ${errMsg}`);
-          return { orderID: "", status: "rejected", error: errMsg };
+        // V2 returns {success, orderID, status, errorMsg} or {status: 400, ...}
+        const isSuccess = result.success === true || (result.orderID && result.status === "live");
+        const errorMsg = result.errorMsg || (result.status >= 400 ? JSON.stringify(result) : "");
+
+        if (!isSuccess && (errorMsg || result.status >= 400)) {
+          console.error(`[CLOB] Order rejected: ${errorMsg || JSON.stringify(result).substring(0, 200)}`);
+          return { orderID: result.orderID ?? "", status: "rejected", error: errorMsg || `HTTP ${result.status}` };
         }
 
         const orderID = result.orderID ?? "";
