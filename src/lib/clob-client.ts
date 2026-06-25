@@ -404,15 +404,19 @@ export class ClobClient {
       }
 
       // BUG FIX (2026-06-25): delegate to official clob-client-v2
-      // V1 generated "invalid order version" — V2 works correctly
+      // V2 signature: createAndPostOrder(userOrder, options, orderType, postOnly)
+      // options includes negRisk — critical for BTC/ETH/SOL 15-min markets!
       if (this.official) {
+        const options: any = {};
+        if (order.negRisk) options.negRisk = true;
+        
         const result = await this.official.createAndPostOrder({
           tokenID: order.tokenID,
           price: order.price,
           size: order.size,
           side: order.side,
           feeRateBps: order.feeRateBps ?? 0,
-        }, orderType);
+        }, options, orderType);
 
         // V2 returns {success, orderID, status, errorMsg} or {status: 400, ...}
         const isSuccess = result.success === true || (result.orderID && result.status === "live");
