@@ -2724,7 +2724,7 @@ export function startEngine(): void {
         const clobConfig: ClobClientConfig = {
           privateKey: pk,
           funderAddress: funder,
-          signatureType: funder ? 2 : 0, // POLY_GNOSIS_SAFE if funder set (current Polymarket standard), else EOA
+          signatureType: funder ? 3 : 0, // POLY_1271 (Privy proxy) if funder set, else EOA
         };
         const client = initClobClient(clobConfig);
 

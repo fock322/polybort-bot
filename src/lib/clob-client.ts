@@ -148,6 +148,11 @@ export interface ClobClientConfig {
 }
 
 // ─── CLOB Client ──────────────────────────────────────────
+// BUG FIX (2026-06-25): используем official @polymarket/clob-client под капотом.
+// Наша реализация l2Headers имела неправильный HMAC format (hex вместо base64url).
+// Official client работает корректно с signatureType 3 (POLY_1271 / Privy proxy).
+import { ClobClient as OfficialClobClient } from "@polymarket/clob-client";
+
 export class ClobClient {
   private account: LocalAccount;
   private walletClient: WalletClient;
@@ -159,6 +164,7 @@ export class ClobClient {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _connected = false;
   private _lastError: string | null = null;
+  private official: any = null;  // Official @polymarket/clob-client instance
 
   constructor(config: ClobClientConfig) {
     this.account = privateKeyToAccount(config.privateKey);
@@ -242,56 +248,24 @@ export class ClobClient {
   // ─── Initialize: Derive API Credentials ───────────────
   async init(): Promise<void> {
     try {
-      // Try to create new API key first
-      const timestamp = Math.floor(Date.now() / 1000).toString();
-      const sig = await this.signL1Auth(timestamp);
-      const headers = {
-        ...this.l1Headers(sig, timestamp),
-        "Content-Type": "application/json",
-      };
+      // BUG FIX (2026-06-25): используем official @polymarket/clob-client для auth.
+      // Наша реализация имела неправильный HMAC format (hex вместо base64url).
+      this.official = new OfficialClobClient(
+        this.host,
+        137,
+        this.walletClient,
+        this.funderAddress,
+        this.signatureType
+      );
 
-      // Try POST /auth/api-key first (create new)
-      let res = await fetch(`${this.host}/auth/api-key`, {
-        method: "POST",
-        headers,
-        signal: AbortSignal.timeout(10000),
-      });
+      const derived = await this.official.deriveApiKey();
+      this.official.creds = derived;
 
-      // If key already exists (409/400), derive it
-      if (res.status === 409 || res.status === 400) {
-        const deriveTs = Math.floor(Date.now() / 1000).toString();
-        const deriveSig = await this.signL1Auth(deriveTs);
-        const deriveHeaders = {
-          ...this.l1Headers(deriveSig, deriveTs),
-          "Content-Type": "application/json",
-        };
-
-        res = await fetch(`${this.host}/auth/derive-api-key`, {
-          method: "GET",
-          headers: deriveHeaders,
-          signal: AbortSignal.timeout(10000),
-        });
-      }
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`API key derivation failed (${res.status}): ${text}`);
-      }
-
-      const data = await res.json();
-
-      // BUG FIX (2026-06-25): Polymarket CLOB returns {key, secret, passphrase} (not apiKey).
-      // Official @polymarket/clob-client uses creds.key in L2 headers.
-      const apiKey = data.apiKey ?? data.key ?? "";
-      const secret = data.secret ?? "";
-      const passphrase = data.passphrase ?? "";
-
-      if (!apiKey || !secret) {
-        throw new Error(`API key derivation returned empty credentials: ${JSON.stringify(data)}`);
-      }
+      const apiKey = derived.key ?? derived.apiKey ?? "";
+      const secret = derived.secret ?? "";
+      const passphrase = derived.passphrase ?? "";
 
       this.creds = { apiKey, secret, passphrase };
-      // Also store as "key" for compatibility with official client field naming
       (this.creds as any).key = apiKey;
 
       this._connected = true;
@@ -326,6 +300,12 @@ export class ClobClient {
   }
 
   private async sendHeartbeat(): Promise<void> {
+    // BUG FIX (2026-06-25): delegate to official client (correct L2 auth)
+    if (this.official) {
+      await this.official.postHeartbeat();
+      return;
+    }
+    // Fallback to our implementation (legacy)
     const headers = {
       ...this.l2Headers("POST", "/v1/heartbeats"),
       "Content-Type": "application/json",
@@ -595,25 +575,18 @@ export class ClobClient {
   // ─── Get Balance ──────────────────────────────────────
   async getBalance(): Promise<BalanceInfo> {
     try {
-      if (!this._connected) return { balance: 0, allowance: 0, symbol: "USDC" };
+      if (!this._connected || !this.official) return { balance: 0, allowance: 0, symbol: "USDC" };
 
-      const headers = {
-        ...this.l2Headers("GET", "/balance-allowance"),
-      };
-
-      const res = await fetch(`${this.host}/balance-allowance`, {
-        method: "GET",
-        headers,
-        signal: AbortSignal.timeout(10000),
-      });
-
-      if (!res.ok) return { balance: 0, allowance: 0, symbol: "USDC" };
-
-      const data = await res.json();
+      // BUG FIX (2026-06-25): delegate to official client (correct L2 auth)
+      const result = await this.official.getBalanceAllowance({ asset_type: "COLLATERAL" });
+      const balance = parseFloat(result.balance ?? "0") / 1e6;  // USDC has 6 decimals
+      const allowances = result.allowances ?? {};
+      // Take max allowance across exchanges
+      const maxAllowance = Math.max(...Object.values(allowances).map((v: any) => parseFloat(v ?? "0") / 1e6));
       return {
-        balance: parseFloat(data.balance ?? "0"),
-        allowance: parseFloat(data.allowance ?? "0"),
-        symbol: data.symbol ?? "USDC",
+        balance,
+        allowance: maxAllowance,
+        symbol: "USDC",
       };
     } catch {
       return { balance: 0, allowance: 0, symbol: "USDC" };
