@@ -45,9 +45,12 @@ export interface DynSl {
 }
 
 export const DYNAMIC_SL: DynSl[] = [
-  { tauMin: 8,  tauMax: 99, slPct: 0.85, label: "85% (hold — есть время восстановиться)" },
-  { tauMin: 4,  tauMax: 8,  slPct: 0.60, label: "60% (поменьше времени)" },
-  { tauMin: 2,  tauMax: 4,  slPct: 0.30, label: "30% (мало времени, режем убыток)" },
+  // v1.3: SL ужесточён. Раньше 85% при tau>8 → убыток -$9.10 (съел 9.6 побед).
+  // Теперь 50% — ограничивает убыток до -$5.00 вместо -$8.50.
+  // tau 2-4: 30% → 40% — даём шанс на восстановление (прибыльные сделки просаживались до -$5).
+  { tauMin: 8,  tauMax: 99, slPct: 0.50, label: "50% (tau>8min — ограничиваем убыток)" },
+  { tauMin: 4,  tauMax: 8,  slPct: 0.60, label: "60% (tau 4-8min)" },
+  { tauMin: 2,  tauMax: 4,  slPct: 0.40, label: "40% (tau 2-4min — даём шанс recovery)" },
   // tau < 2 min → taker exit (handled in markToMarket)
 ];
 
