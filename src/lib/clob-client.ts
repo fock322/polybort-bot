@@ -148,10 +148,9 @@ export interface ClobClientConfig {
 }
 
 // ─── CLOB Client ──────────────────────────────────────────
-// BUG FIX (2026-06-25): используем official @polymarket/clob-client под капотом.
-// Наша реализация l2Headers имела неправильный HMAC format (hex вместо base64url).
-// Official client работает корректно с signatureType 3 (POLY_1271 / Privy proxy).
-import { ClobClient as OfficialClobClient } from "@polymarket/clob-client";
+// BUG FIX (2026-06-25): используем official @polymarket/clob-client-v2 (не v1!).
+// V1 выдаёт "invalid order version" — устарел. V2 работает с текущим CLOB API.
+import { ClobClient as OfficialClobClient } from "@polymarket/clob-client-v2";
 
 export class ClobClient {
   private account: LocalAccount;
@@ -248,15 +247,14 @@ export class ClobClient {
   // ─── Initialize: Derive API Credentials ───────────────
   async init(): Promise<void> {
     try {
-      // BUG FIX (2026-06-25): используем official @polymarket/clob-client для auth.
-      // Наша реализация имела неправильный HMAC format (hex вместо base64url).
-      this.official = new OfficialClobClient(
-        this.host,
-        137,
-        this.walletClient,
-        this.funderAddress,
-        this.signatureType
-      );
+      // BUG FIX (2026-06-25): clob-client-v2 использует options object constructor
+      this.official = new OfficialClobClient({
+        host: this.host,
+        chain: 137,
+        signer: this.walletClient,
+        signatureType: this.signatureType,
+        funderAddress: this.funderAddress,
+      });
 
       const derived = await this.official.deriveApiKey();
       this.official.creds = derived;
@@ -405,6 +403,34 @@ export class ClobClient {
         return { orderID: "", status: "error", error: "CLOB not connected" };
       }
 
+      // BUG FIX (2026-06-25): delegate to official clob-client-v2
+      // V1 generated "invalid order version" — V2 works correctly
+      if (this.official) {
+        const result = await this.official.createAndPostOrder({
+          tokenID: order.tokenID,
+          price: order.price,
+          size: order.size,
+          side: order.side,
+          feeRateBps: order.feeRateBps ?? 0,
+        }, orderType);
+
+        if (result.success === false || result.errorMsg) {
+          const errMsg = result.errorMsg || JSON.stringify(result);
+          console.error(`[CLOB] Order rejected: ${errMsg}`);
+          return { orderID: "", status: "rejected", error: errMsg };
+        }
+
+        const orderID = result.orderID ?? "";
+        const status = result.status ?? "live";
+        console.log(
+          `[CLOB] Order ${order.side} ${order.size}@${order.price} ` +
+          `tokenId=${order.tokenID.slice(0, 12)}... → ${orderID.slice(0, 12)}... ` +
+          `status=${status}`
+        );
+        return { orderID, status };
+      }
+
+      // Fallback: legacy signOrder + fetch (should not reach here)
       const signedOrder = await this.signOrder(order);
       const body = JSON.stringify({
         order: signedOrder,
@@ -435,13 +461,6 @@ export class ClobClient {
 
       const orderID = data.orderID ?? data.id ?? "";
       const status = data.status ?? "submitted";
-
-      console.log(
-        `[CLOB] Order ${order.side} ${order.size}@${order.price} ` +
-        `tokenId=${order.tokenID.slice(0, 12)}... → ${orderID.slice(0, 12)}... ` +
-        `negRisk=${order.negRisk ?? false} status=${status}`
-      );
-
       return { orderID, status };
     } catch (err) {
       return { orderID: "", status: "error", error: String(err) };
