@@ -2724,6 +2724,76 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
       if (ordersToSubmit.length > 0) {
         const submitted = await replaceOrders(ordersToSubmit);
         console.log(`[MM] Submitted ${submitted.length}/${ordersToSubmit.length} orders to CLOB`);
+
+        // BUG FIX (2026-06-25): Create positions for instantly matched (filled) orders.
+        // CLOB v2 can return status="matched" immediately for taker orders.
+        // Without this, tokens are bought but position is never tracked.
+        for (const order of submitted) {
+          if (order.status !== "filled") continue;
+
+          const market = markets.get(order.marketId);
+          if (!market) continue;
+
+          const posSide = order.side.includes("UP") ? "UP" : "DOWN";
+          const posId = `${order.marketId}_${posSide}`;
+          const totalCost = order.fillPrice * order.filledSize;
+          const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+          const fee = calcTakerFee(order.filledSize, order.fillPrice, feeRate);
+          const totalWithFee = totalCost + fee;
+
+          if (order.side.startsWith("BID")) {
+            // BUY — open/increase position
+            if (cashBalance >= totalWithFee) {
+              cashBalance -= totalWithFee;
+            } else {
+              cashBalance = Math.max(0, cashBalance - totalWithFee);
+            }
+
+            const entryMid = posSide === "UP" ? market.realUpMid : market.realDownMid;
+            const existing = positions.get(posId);
+            if (existing) {
+              existing.quantity += order.filledSize;
+              existing.costBasis += totalWithFee;
+              existing.entryPrice = existing.costBasis / existing.quantity;
+              existing.isRealPosition = true;
+            } else {
+              positions.set(posId, {
+                id: posId, marketId: order.marketId,
+                side: posSide as "UP" | "DOWN",
+                entryPrice: order.fillPrice, quantity: order.filledSize,
+                costBasis: totalWithFee,
+                currentValue: totalCost, unrealizedPnl: 0,
+                openedAt: Date.now(),
+                marketQuestion: market.question.substring(0, 60),
+                isRealPosition: true,
+                entryMid,
+                peakValue: totalCost,
+                minValue: totalCost,
+                entryStrikePrice: market.strikePrice,
+              });
+            }
+
+            // Record trade
+            trades.push({
+              id: uid(), marketId: order.marketId, marketSlug: market.slug,
+              side: order.side, price: order.fillPrice, quantity: order.filledSize,
+              totalCost: totalWithFee, fee, slippage: 0,
+              reason: "live_fill", executedAt: Date.now(),
+              isPaperTrade: false, pnl: 0,
+              context: buildTradeContext(order.marketId, cachedBtcData, positions.get(posId) || undefined),
+            });
+
+            // Update inventory
+            const inv = inventory.get(order.marketId) || 0;
+            if (posSide === "UP") inventory.set(order.marketId, inv + order.filledSize);
+            else inventory.set(order.marketId, inv - order.filledSize);
+
+            console.log(`[LIVE] ✅ Position created: ${posSide} ${order.filledSize}@$${order.fillPrice.toFixed(2)} on ${market.slug.substring(0, 30)}`);
+          } else {
+            // SELL — close position (handled by closePositionById normally, but if it came through here)
+            console.log(`[LIVE] SELL filled: ${posSide} ${order.filledSize}@$${order.fillPrice.toFixed(2)}`);
+          }
+        }
       }
     }
   }

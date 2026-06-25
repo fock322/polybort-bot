@@ -137,11 +137,25 @@ export async function submitOrder(
   managed.lastCheckedAt = Date.now();
   totalSubmitted++;
 
-  openOrders.set(id, managed);
-  console.log(
-    `[OrderMgr] Submitted ${clobSide} ${size}@${price} ` +
-    `tokenId=${tokenId.slice(0, 12)}... negRisk=${negRisk} → ${result.orderID.slice(0, 12)}...`
-  );
+  // BUG FIX (2026-06-25): If order was immediately matched (filled), record fill now.
+  // CLOB v2 returns status="matched" for taker fills that execute instantly.
+  // Without this, the position is never created and tokens are lost in tracking.
+  if (result.status === "matched" || result.status === "filled") {
+    managed.status = "filled";
+    managed.filledSize = size;
+    managed.fillPrice = price;
+    totalFilled++;
+    console.log(
+      `[OrderMgr] ✅ FILLED ${clobSide} ${size}@${price} ` +
+      `tokenId=${tokenId.slice(0, 12)}... → ${result.orderID.slice(0, 12)}... (matched instantly)`
+    );
+  } else {
+    openOrders.set(id, managed);
+    console.log(
+      `[OrderMgr] Submitted ${clobSide} ${size}@${price} ` +
+      `tokenId=${tokenId.slice(0, 12)}... negRisk=${negRisk} → ${result.orderID.slice(0, 12)}...`
+    );
+  }
   return managed;
 }
 
