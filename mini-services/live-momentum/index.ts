@@ -11,7 +11,7 @@
 
 import { startEngine, stopEngine, resetEngine, getStatus, getMarkets, getPositions, getTrades, getAnalytics, getTradeAnalysis, setStrategy, updateConfig } from "../../src/lib/mm-engine";
 import { getBtcPrice } from "../../src/lib/btc-feed";
-import { initCoinbaseWs, getWsStatus } from "../../src/coinbase-ws";
+import { initCoinbaseWs, getWsStatus } from "../../src/lib/coinbase-ws";
 
 // Set strategy to MOMENTUM before any engine operations
 setStrategy("momentum");
