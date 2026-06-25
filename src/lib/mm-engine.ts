@@ -87,7 +87,7 @@ const MIN_MAKER_FILL_DELAY_MS = 2000;
 const GAS_FEE_ORDER = 0.015;
 
 // ─── Live Mode Safety ─────────────────────────────────────
-const LIVE_MIN_BALANCE = 1;         // Don't trade if balance < $1 (low for $30 start, allows scaling in)
+const LIVE_MIN_BALANCE = 10;        // Don't trade if balance < $10 (paper mode default; live overrides via env)
 const LIVE_MAX_DAILY_LOSS_PCT = 0.15; // Circuit breaker at 15% daily loss
 const LIVE_MAX_POSITION_PCT = 0.30;   // Max 30% of balance in single position
 
@@ -304,7 +304,7 @@ const g = globalThis as unknown as {
 
 // ─── State ─────────────────────────────────────────────────
 const config: BotConfig = {
-  startingBalance: parseFloat(process.env.LIVE_STARTING_BALANCE || "100"),  // $100 paper, override for live
+  startingBalance: 100,       // $100 starting balance (paper mode; live overrides via LIVE_STARTING_BALANCE env)
   maxPositionSize: 30,
   minPositionSize: 5,
   baseSpread: 0.03,
@@ -320,8 +320,7 @@ const config: BotConfig = {
   rebalanceThreshold: 12,
   adverseSelectionFactor: 3,
   stopLossPct: 0.20,          // 20% fixed fallback (dynamic ATR used in markToMarket)
-  // LIVE MODE: enable via env var LIVE_MODE=true on VPS
-  liveMode: process.env.LIVE_MODE === "true",
+  liveMode: false,  // paper mode; live deployment uses separate folder with liveMode=true
 };
 
 // BUG FIX (2026-06-24): cashBalance/realizedPnl сбрасывались при bun --hot reload.
