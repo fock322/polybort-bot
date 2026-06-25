@@ -33,6 +33,7 @@ export interface ManagedOrder {
   filledSize: number;
   fillPrice: number;
   error?: string;
+  role?: "entry" | "tp_exit" | "sl_exit";  // BUG FIX #3: don't cancel exit orders in replaceOrders
 }
 
 export interface OrderManagerConfig {
@@ -133,13 +134,13 @@ export async function submitOrder(
   }
 
   managed.clobOrderId = result.orderID;
-  managed.status = result.status === "submitted" ? "open" : (result.status as ManagedOrder["status"]);
+  // BUG FIX #1 (audit): CLOB v2 returns "live" for maker orders — normalize to "open"
+  const normalizedStatus = result.status === "live" || result.status === "submitted" ? "open" : result.status;
+  managed.status = normalizedStatus as ManagedOrder["status"];
   managed.lastCheckedAt = Date.now();
   totalSubmitted++;
 
   // BUG FIX (2026-06-25): If order was immediately matched (filled), record fill now.
-  // CLOB v2 returns status="matched" for taker fills that execute instantly.
-  // Without this, the position is never created and tokens are lost in tracking.
   if (result.status === "matched" || result.status === "filled") {
     managed.status = "filled";
     managed.filledSize = size;
@@ -348,10 +349,18 @@ export async function replaceOrders(
   const client = getClobClient();
   if (!client || !client.connected) return [];
 
-  // Cancel all existing orders first (clean slate approach)
+  // BUG FIX #3 (audit): Don't cancel TP/SL exit orders — only cancel entry orders.
+  // Previous code called cancelAllOrders() which cancelled EVERYTHING including
+  // pending SELL exits that were waiting to fill.
   if (mgrConfig.cancelBeforeReplace) {
-    await cancelAllOrders();
-    // Brief delay to let CLOB process cancellations
+    for (const [id, o] of openOrders) {
+      // Skip exit orders (tp_exit, sl_exit) — let them fill
+      if (o.role && o.role !== "entry") continue;
+      // Only cancel open/pending entry orders
+      if (o.status === "open" || o.status === "pending") {
+        await cancelOrder(id);
+      }
+    }
     await new Promise(resolve => setTimeout(resolve, 300));
   }
 

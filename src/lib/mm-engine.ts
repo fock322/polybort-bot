@@ -150,6 +150,12 @@ export interface Position {
   peakValue: number; // peak currentValue (for trailing stop in future)
   minValue: number;  // min currentValue (max drawdown tracking)
   entryStrikePrice: number;  // strike price at position open (for orphaned position settlement)
+  closing?: {                // BUG FIX #2 (audit): position is being closed, don't delete until fill confirmed
+    orderId: string;
+    sellPrice: number;
+    reason: string;
+    submittedAt: number;
+  };
 }
 
 export interface TradeContext {
@@ -1817,7 +1823,9 @@ async function markToMarket(_btc: BtcPriceData): Promise<void> {
               `[${config.strategy.toUpperCase()}] 🛑 DYNAMIC SL on ${posId}: tau=${tau.toFixed(1)}min SL=${(dynSl.slPct * 100).toFixed(0)}% ` +
               `entry=$${pos.entryPrice.toFixed(2)} mid=$${currentMid.toFixed(2)} (drop ${(dropPct * 100).toFixed(1)}% ≥ ${dynSl.slPct * 100}%)`
             );
-            tpTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_dyn_sl_${(dynSl.slPct * 100).toFixed(0)}pct` });
+            // BUG FIX #7 (audit): Dynamic SL should use taker exit (stopLossTriggers → closePositionById → SELL at bid)
+            // not maker exit (tpTriggers → ASK at ask-1tick which may not fill in falling market)
+            stopLossTriggers.push({ posId, marketId: pos.marketId, reason: `${config.strategy}_dyn_sl_${(dynSl.slPct * 100).toFixed(0)}pct` });
           }
           // Otherwise: HOLD — позиция реабилитируется, ждём TP/settlement
         }
@@ -1940,17 +1948,26 @@ async function markToMarket(_btc: BtcPriceData): Promise<void> {
           console.error(`[LIVE-TP/SL] SELL failed: ${result?.error ?? "unknown"}. Holding.`);
           continue;
         }
-        const closeValue = pos.quantity * sellPrice;
-        const tpPnl = closeValue - pos.costBasis - GAS_FEE_ORDER;
-        cashBalance += closeValue - GAS_FEE_ORDER;
-        realizedPnl += tpPnl;
-        recordTradeAnalytics(tpPnl, 0, GAS_FEE_ORDER);
-        console.log(`[LIVE-TP/SL] ✅ SELL posted: ${pos.side} ${pos.quantity}@$${sellPrice.toFixed(2)} PnL=${tpPnl >= 0 ? "+" : ""}$${tpPnl.toFixed(4)} [${t.reason}]`);
-        trades.push({ id: uid(), marketId: pos.marketId, marketSlug: mkt.slug, side: `SELL_${pos.side}`, price: sellPrice, quantity: pos.quantity, totalCost: closeValue, fee: 0, slippage: 0, reason: t.reason, executedAt: Date.now(), isPaperTrade: false, pnl: tpPnl, context: buildTradeContext(pos.marketId, cachedBtcData, pos) });
-        const inv = inventory.get(pos.marketId) || 0;
-        if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
-        else inventory.set(pos.marketId, inv + pos.quantity);
-        positions.delete(t.posId);
+        // BUG FIX #2 (audit): Check if matched (taker) or maker (pending)
+        if (result.status === "matched" || result.status === "filled") {
+          // Taker fill — SELL executed immediately
+          const closeValue = pos.quantity * sellPrice;
+          const tpPnl = closeValue - pos.costBasis - GAS_FEE_ORDER;
+          cashBalance += closeValue - GAS_FEE_ORDER;
+          realizedPnl += tpPnl;
+          recordTradeAnalytics(tpPnl, 0, GAS_FEE_ORDER);
+          console.log(`[LIVE-TP/SL] ✅ SELL matched: ${pos.side} ${pos.quantity}@$${sellPrice.toFixed(2)} PnL=${tpPnl >= 0 ? "+" : ""}$${tpPnl.toFixed(4)} [${t.reason}]`);
+          trades.push({ id: uid(), marketId: pos.marketId, marketSlug: mkt.slug, side: `SELL_${pos.side}`, price: sellPrice, quantity: pos.quantity, totalCost: closeValue, fee: 0, slippage: 0, reason: t.reason, executedAt: Date.now(), isPaperTrade: false, pnl: tpPnl, context: buildTradeContext(pos.marketId, cachedBtcData, pos) });
+          const inv = inventory.get(pos.marketId) || 0;
+          if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
+          else inventory.set(pos.marketId, inv + pos.quantity);
+          positions.delete(t.posId);
+        } else {
+          // Maker order — mark as closing, wait for fill
+          pos.closing = { orderId: result.orderID || "", sellPrice, reason: t.reason, submittedAt: Date.now() };
+          console.log(`[LIVE-TP/SL] SELL maker placed: ${pos.side} ${pos.quantity}@$${sellPrice.toFixed(2)} → waiting for fill [${t.reason}]`);
+          persistState();
+        }
       } catch (err) { console.error(`[LIVE-TP/SL] Error: ${err}. Holding.`); }
       continue;
     }
@@ -2058,39 +2075,54 @@ async function closePositionById(posId: string, reason: string): Promise<void> {
         return;  // Don't close internally — position still on-chain
       }
 
-      // SELL order submitted. In live mode, we mark position as "closing"
-      // and let reconcile handle the actual fill.
-      // For simplicity, assume fill at closePrice (will be corrected by reconcile).
-      const closeValue = pos.quantity * closePrice;
-      const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
-      const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
-      const closePnl = (closeValue - fee) - pos.costBasis;
+      // BUG FIX #2 (audit): DON'T delete position or update cashBalance until fill confirmed.
+      // If SELL is "matched" (taker fill) — position is closed immediately.
+      // If SELL is "live"/"open" (maker order) — position stays, marked as "closing".
+      //   Reconcile will detect the fill and finalize the close.
+      if (result.status === "matched" || result.status === "filled") {
+        // Taker fill — SELL executed immediately
+        const closeValue = pos.quantity * closePrice;
+        const feeRate = market.feeRate || DEFAULT_TAKER_FEE_RATE;
+        const fee = calcTakerFee(pos.quantity, closePrice, feeRate);
+        const closePnl = (closeValue - fee) - pos.costBasis;
 
-      cashBalance += closeValue - fee;
-      realizedPnl += closePnl;
-      recordTradeAnalytics(closePnl, fee, GAS_FEE_ORDER);
+        cashBalance += closeValue - fee;
+        realizedPnl += closePnl;
+        recordTradeAnalytics(closePnl, fee, GAS_FEE_ORDER);
 
-      trades.push({
-        id: uid(), marketId: pos.marketId, marketSlug: market.slug, side: `SELL_${pos.side}`,
-        price: closePrice, quantity: pos.quantity, totalCost: closeValue,
-        fee, slippage: 0, reason, executedAt: Date.now(),
-        isPaperTrade: false,
-        pnl: closePnl,
-        context: buildTradeContext(pos.marketId, cachedBtcData, pos),
-      });
+        trades.push({
+          id: uid(), marketId: pos.marketId, marketSlug: market.slug, side: `SELL_${pos.side}`,
+          price: closePrice, quantity: pos.quantity, totalCost: closeValue,
+          fee, slippage: 0, reason, executedAt: Date.now(),
+          isPaperTrade: false, pnl: closePnl,
+          context: buildTradeContext(pos.marketId, cachedBtcData, pos),
+        });
 
-      console.log(`[LIVE-CLOSE] ✅ SELL order posted: ${pos.side} ${pos.quantity}@$${closePrice.toFixed(2)} PnL=${closePnl >= 0 ? "+" : ""}$${closePnl.toFixed(4)} [${reason}]`);
+        console.log(`[LIVE-CLOSE] ✅ SELL matched: ${pos.side} ${pos.quantity}@$${closePrice.toFixed(2)} PnL=${closePnl >= 0 ? "+" : ""}$${closePnl.toFixed(4)} [${reason}]`);
 
-      const inv = inventory.get(pos.marketId) || 0;
-      if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
-      else inventory.set(pos.marketId, inv + pos.quantity);
-      positions.delete(posId);
+        const inv = inventory.get(pos.marketId) || 0;
+        if (pos.side === "UP") inventory.set(pos.marketId, inv - pos.quantity);
+        else inventory.set(pos.marketId, inv + pos.quantity);
+        positions.delete(posId);
 
-      for (const [, q] of quotes) {
-        if (q.marketId === pos.marketId && q.status === "active") {
-          const qSide = q.side.includes("UP") ? "UP" : "DOWN";
-          if (qSide === pos.side) q.status = "cancelled";
+        for (const [, q] of quotes) {
+          if (q.marketId === pos.marketId && q.status === "active") {
+            const qSide = q.side.includes("UP") ? "UP" : "DOWN";
+            if (qSide === pos.side) q.status = "cancelled";
+          }
         }
+      } else {
+        // Maker order — SELL submitted but NOT filled yet.
+        // Mark position as "closing" — don't touch cashBalance/realizedPnl.
+        // Reconcile will detect fill and finalize.
+        pos.closing = {
+          orderId: result.orderID || "",
+          sellPrice: closePrice,
+          reason,
+          submittedAt: Date.now(),
+        };
+        console.log(`[LIVE-CLOSE] SELL maker order placed: ${pos.side} ${pos.quantity}@$${closePrice.toFixed(2)} → waiting for fill [${reason}]`);
+        persistState();
       }
     } catch (err) {
       console.error(`[LIVE-CLOSE] Error: ${err}. Holding for settlement.`);
@@ -2442,16 +2474,26 @@ function cleanupOrphanedPositions(): void {
       continue;
     }
 
-    // BUG FIX #2 (2026-06-23): Was using BTC price vs entryStrikePrice for ALL assets.
-    // entryStrikePrice = -1 (sentinel) → fallback to BTC price → wrong for ETH/SOL.
-    // Now: use token mid price at settlement time as proxy for asset vs strike.
-    // UP mid > 0.50 = market expects UP wins → UP wins
-    //
-    // BUG FIX (audit 2026-06-23): previous code did `markets.get(pos.marketId)` but
-    // we already filtered `!markets.has(pos.marketId)` above → market ALWAYS undefined →
-    // upMid always 0 → upWins always false → UP positions always LOSS, DOWN always WIN.
-    // Now: use 50/50 fallback for orphaned positions (market data unavailable).
-    // TODO: ideally store final upMid in Position before market expires.
+    // BUG FIX #4 (audit): In LIVE mode, orphaned positions need manual redeem on Polymarket.
+    // Don't fake settlement — tokens are on-chain and need explicit redemption.
+    if (config.liveMode) {
+      console.warn(`[CLEANUP] ⚠️ LIVE: position ${posId} (${pos.side} ${pos.quantity}@$${pos.entryPrice.toFixed(2)}) expired — MANUAL REDEEM REQUIRED on Polymarket UI`);
+      // Don't update cashBalance/realizedPnl — will be corrected by balance sync
+      // Mark position as pending_redeem instead of deleting
+      (pos as any).pendingRedeem = true;
+      // Remove from active positions (won't be traded) but keep in trades log
+      trades.push({
+        id: uid(), marketId: pos.marketId, marketSlug: (markets.get(pos.marketId)?.slug || ""), side: `SETTLE_${pos.side}`,
+        price: 0, quantity: pos.quantity, totalCost: 0, fee: 0,
+        slippage: 0, reason: "live_expired_pending_redeem", executedAt: Date.now(),
+        isPaperTrade: false, pnl: 0,
+        context: { entryPrice: pos.entryPrice, holdTimeMs: Date.now() - pos.openedAt, peakPnl: pos.peakValue - pos.costBasis, minPnl: (pos.minValue || pos.costBasis) - pos.costBasis },
+      });
+      positions.delete(posId);
+      continue;
+    }
+
+    // PAPER MODE: simulate settlement
     const upWins = false;  // conservative: orphaned = market expired without data → assume LOSS
     const wins = pos.side === "UP" ? upWins : !upWins;  // DOWN wins if UP loses
     const resolvedPrice = wins ? 1.0 : 0.0;
@@ -2806,12 +2848,22 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
         lastRealBalance = realBal;
         const diff = realBal - cashBalance;
         if (Math.abs(diff) > 1) {
-          console.log(
-            `[MM] Balance sync: local=$${cashBalance.toFixed(2)} ` +
-            `CLOB=$${realBal.toFixed(2)} diff=$${diff.toFixed(2)}`
-          );
-          // In live mode, trust the real balance
-          cashBalance = realBal;
+          // BUG FIX #6 (audit): Don't blindly overwrite cashBalance.
+          // If there are positions with "closing" state (pending SELL fills),
+          // the local cashBalance may differ from CLOB USDC balance.
+          // Only sync if diff is NOT explained by closing positions.
+          const closingValue = Array.from(positions.values())
+            .filter(p => p.closing)
+            .reduce((s, p) => s + p.closing!.sellPrice * p.quantity, 0);
+          const unexplainedDiff = Math.abs(diff) - closingValue;
+          if (unexplainedDiff > 2) {
+            console.log(
+              `[MM] Balance sync: local=$${cashBalance.toFixed(2)} ` +
+              `CLOB=$${realBal.toFixed(2)} diff=$${diff.toFixed(2)} ` +
+              `(closing=${closingValue.toFixed(2)} unexplained=${unexplainedDiff.toFixed(2)})`
+            );
+            cashBalance = realBal;
+          }
         }
       }
     } catch (err) {
