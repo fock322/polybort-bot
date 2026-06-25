@@ -11,7 +11,7 @@ export const runtime = 'nodejs'
 // GET /api/bots?port=3003     → single bot status
 // GET /api/bots?port=3003&path=/trades → arbitrary path
 
-const PORTS = [3003, 3004, 3005]
+const PORTS = [3003, 3004, 3005, 3006]
 
 async function fetchBot(port: number, path: string = '/'): Promise<any | null> {
   try {
