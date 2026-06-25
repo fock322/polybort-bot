@@ -223,15 +223,18 @@ export class ClobClient {
       "base64"
     );
 
-    const signature = createHmac("sha256", secretBuf)
-      .update(message)
-      .digest("hex");
+    // BUG FIX (2026-06-25): Polymarket expects base64url signature, not hex!
+    // Official client: buildPolyHmacSignature returns base64url.
+    const sigBytes = createHmac("sha256", secretBuf).update(message).digest();
+    // Convert to base64, then to base64url (+ → -, / → _, keep =)
+    const sigBase64 = sigBytes.toString("base64");
+    const sigBase64Url = sigBase64.replace(/\+/g, "-").replace(/\//g, "_");
 
     return {
       "POLY_ADDRESS": this.signerAddress,
-      "POLY_SIGNATURE": signature,
+      "POLY_SIGNATURE": sigBase64Url,
       "POLY_TIMESTAMP": timestamp,
-      "POLY_API_KEY": this.creds.apiKey,
+      "POLY_API_KEY": (this.creds as any).key ?? this.creds.apiKey,  // field is "key" in CLOB response
       "POLY_PASSPHRASE": this.creds.passphrase,
     };
   }
@@ -277,7 +280,8 @@ export class ClobClient {
 
       const data = await res.json();
 
-      // API returns either {apiKey, secret, passphrase} or nested under key
+      // BUG FIX (2026-06-25): Polymarket CLOB returns {key, secret, passphrase} (not apiKey).
+      // Official @polymarket/clob-client uses creds.key in L2 headers.
       const apiKey = data.apiKey ?? data.key ?? "";
       const secret = data.secret ?? "";
       const passphrase = data.passphrase ?? "";
@@ -287,10 +291,12 @@ export class ClobClient {
       }
 
       this.creds = { apiKey, secret, passphrase };
+      // Also store as "key" for compatibility with official client field naming
+      (this.creds as any).key = apiKey;
 
       this._connected = true;
       this._lastError = null;
-      console.log(`[CLOB] Authenticated: ${this.signerAddress.slice(0, 10)}...`);
+      console.log(`[CLOB] Authenticated: ${this.signerAddress.slice(0, 10)}... (apiKey: ${apiKey.substring(0, 8)}...)`);
     } catch (err) {
       this._connected = false;
       this._lastError = String(err);
