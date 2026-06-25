@@ -160,6 +160,40 @@ export function momentumEntrySignal(
   }
   reasons.push(`📚 ${side} L2 OK: bid ${(l2ForSide.bidPressure * 100).toFixed(0)}% depth $${l2ForSide.totalDepth.toFixed(0)}`);
 
+  // ── 3.5. LIQUIDITY FILTER (live-realistic) ──
+  // Проверяем РЕАЛЬНЫЙ стакан (best bid/ask) перед входом.
+  // В live mode ордер не заполнится если стакан пустой.
+  // Paper mode должен быть идентичен live — не входить если нет ликвидности.
+  const bestBid = side === "UP" ? market.realUpBestBid : market.realDownBestBid;
+  const bestAsk = side === "UP" ? market.realUpBestAsk : market.realDownBestAsk;
+  const MIN_BID = 0.02;  // минимум bid для выхода (иначе не продать)
+  const MIN_ASK = 0.02;  // минимум ask для входа (иначе не купить)
+  const MAX_SPREAD = 0.10; // макс spread (10¢) — если больше, рынок мёртвый
+
+  if (bestBid <= 0 || bestAsk <= 0) {
+    return {
+      should: false, side, confidence: 0,
+      reasons: [`🚫 ${side} стакан пустой: bid=$${bestBid.toFixed(2)} ask=$${bestAsk.toFixed(2)} (нет ликвидности)`],
+      details: { tau, pUp: side === "UP" ? upMid : downMid, btcChange1m: 0, btcChange5m: 0, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  if (bestBid < MIN_BID) {
+    return {
+      should: false, side, confidence: 0,
+      reasons: [`🚫 ${side} bid слишком низкий: $${bestBid.toFixed(2)} < $${MIN_BID} (не сможем выйти)`],
+      details: { tau, pUp: side === "UP" ? upMid : downMid, btcChange1m: 0, btcChange5m: 0, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  const spread = bestAsk - bestBid;
+  if (spread > MAX_SPREAD) {
+    return {
+      should: false, side, confidence: 0,
+      reasons: [`🚫 ${side} spread слишком широкий: $${spread.toFixed(2)} > $${MAX_SPREAD} (рынок мёртвый)`],
+      details: { tau, pUp: side === "UP" ? upMid : downMid, btcChange1m: 0, btcChange5m: 0, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  reasons.push(`📊 ${side} стакан OK: bid=$${bestBid.toFixed(2)} ask=$${bestAsk.toFixed(2)} spread=$${spread.toFixed(2)}`);
+
   // ── 4. Расчёт потенциальной прибыли ──
   const profitIfWin = (1.00 - entryMid) / entryMid * 100;  // settlement at $1.00
   const lossIfLose = -100;  // settlement at $0.00

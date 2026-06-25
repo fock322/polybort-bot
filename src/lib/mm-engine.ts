@@ -1562,6 +1562,19 @@ function simulateFills(_btc: BtcPriceData): void {
     const mid = quote.side.includes("UP") ? market.realUpMid : market.realDownMid;
     if (mid <= 0) continue;
 
+    // BUG FIX (2026-06-25): Liquidity check — don't fill if order book is empty.
+    // In live mode, maker orders can't fill if there's no counterparty.
+    // Paper mode must be identical to live.
+    if (quote.side === "BID_UP" || quote.side === "BID_DOWN") {
+      // BUY: need asks to fill against (someone selling)
+      const bestAsk = quote.side.includes("UP") ? market.realUpBestAsk : market.realDownBestAsk;
+      if (bestAsk <= 0) continue;  // no asks → can't fill
+    } else if (quote.side === "ASK_UP" || quote.side === "ASK_DOWN") {
+      // SELL: need bids to fill against (someone buying)
+      const bestBid = quote.side.includes("UP") ? market.realUpBestBid : market.realDownBestBid;
+      if (bestBid <= 0) continue;  // no bids → can't fill
+    }
+
     const ourPrice = quote.price;
 
     // How aggressively we're priced. 0 = at best bid/ask (top of queue),
