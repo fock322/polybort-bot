@@ -1006,9 +1006,10 @@ async function generateQuotes(btc: BtcPriceData): Promise<void> {
     if (tau < config.autoExitMinutes) continue;
     if (!market.active) continue;
 
-    // HOLD-TP FIX (2026-06-24): SOL слишком волатильный для hold-tp.
-    // 1 трейд -$3.58 съел половину прибыли. Временно исключаем SOL.
+    // SOL исключён для ВСЕХ стратегий (except paper hold-tp which has its own filter above)
+    // FIX (2026-06-25): was only excluded for hold-tp, momentum traded SOL
     if (config.strategy === "hold-tp" && market.slug.startsWith("sol-")) continue;
+    if (config.strategy === "momentum" && market.slug.startsWith("sol-")) continue;
 
     // ═══ Market quality filters (realistic trading conditions) ═══
     // Skip markets that can't be traded realistically:
@@ -2813,19 +2814,12 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
           const totalWithFee = totalCost + fee;
 
           if (order.side.startsWith("BID")) {
-            // BUY — open/increase position
-            // MIN 8 tokens — if FAK filled less, sell immediately to recover USDC
-            const MIN_FILL_SIZE = 8;
-            if (order.filledSize < MIN_FILL_SIZE) {
-              console.log(`[LIVE] ⚠️ FAK fill too small: ${order.filledSize} < ${MIN_FILL_SIZE} tokens — selling to recover USDC`);
-              const tokenId = posSide === "UP" ? market.upTokenId : market.downTokenId;
-              const sellPrice = clamp(tickFloor(posSide === "UP" ? market.realUpBestBid : market.realDownBestBid), TICK_SIZE, 1 - TICK_SIZE);
-              if (sellPrice > 0) {
-                try {
-                  await clobSubmit(market.conditionId, `ASK_${posSide}`, tokenId, sellPrice, order.filledSize, market.negRisk);
-                  console.log(`[LIVE] Recovery sell: ${order.filledSize} @ $${sellPrice.toFixed(2)}`);
-                } catch(e) { console.error(`[LIVE] Recovery sell failed: ${e}`); }
-              }
+            // BUY — open position
+            // FIX (2026-06-25): Only create position if ≥ 8 tokens filled.
+            // If < 8 — don't create position, tokens already bought but too small to manage.
+            // They will be settled at market expiry (win or lose naturally).
+            if (order.filledSize < 8) {
+              console.log(`[LIVE] ⚠️ FAK fill too small: ${order.filledSize} < 8 tokens — not creating position (tokens will settle at expiry)`);
               continue;
             }
 

@@ -125,15 +125,18 @@ export async function submitOrder(
   };
 
   // Submit to CLOB
-  // BUG FIX (2026-06-25): Try FAK first (partial taker fill), fallback to GTC (maker).
-  // FAK fails when order book is empty ("no orders found to match").
-  // GTC places maker order — may fill later if someone crosses.
+  // FIX (2026-06-25): Only FAK (Fill-And-Kill), no GTC.
+  // Try 10 tokens first, if FAK fails try 8, if fails skip.
   let result: OrderResult = await client.submitOrder(clobOrder, "FAK", false);
 
-  // If FAK rejected (no liquidity), try GTC maker order
-  if (result.status === "rejected" || result.status === "error") {
-    console.log(`[OrderMgr] FAK failed (${result.error?.substring(0, 60)}), trying GTC maker...`);
-    result = await client.submitOrder(clobOrder, "GTC", false);
+  // If FAK rejected with full size (10), try smaller size (8)
+  if ((result.status === "rejected" || result.status === "error") && size > 8) {
+    console.log(`[OrderMgr] FAK ${size} tokens failed, trying 8...`);
+    const smallerOrder: ClobOrder = { ...clobOrder, size: 8 };
+    result = await client.submitOrder(smallerOrder, "FAK", false);
+    if (result.status !== "rejected" && result.status !== "error") {
+      size = 8;  // update for position tracking
+    }
   }
 
   if (result.status === "rejected" || result.status === "error") {
