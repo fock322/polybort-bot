@@ -109,6 +109,9 @@ export async function submitOrder(
     lastCheckedAt: Date.now(),
     filledSize: 0,
     fillPrice: 0,
+    // BUG FIX #9: Set role based on side — BID = entry, ASK = exit
+    // This prevents replaceOrders from cancelling TP/SL SELL orders
+    role: side.startsWith("BID") ? "entry" : "sl_exit",
   };
 
   // Build CLOB order — pass neg_risk flag
@@ -122,12 +125,10 @@ export async function submitOrder(
   };
 
   // Submit to CLOB
-  // BUG FIX (2026-06-25): Use FOK (Fill-Or-Kill) for BUY orders — instant taker fill or cancel.
-  // GTC maker orders don't fill on last 5 min of market (no sellers at our price).
+  // BUG FIX (2026-06-25): Use FOK for ALL orders — instant fill or cancel.
+  // GTC maker orders don't fill on last 5 min of market.
   // FOK = fill immediately at market price or kill (cancel). No hanging orders.
-  // SELL orders (TP/SL exits) keep GTC — maker exit for 0 fee when possible.
-  const orderType = side.startsWith("BID") ? "FOK" : "GTC";
-  const result: OrderResult = await client.submitOrder(clobOrder, orderType as "GTC" | "FOK", false);
+  const result: OrderResult = await client.submitOrder(clobOrder, "FOK", false);
 
   if (result.status === "rejected" || result.status === "error") {
     managed.status = "rejected";
