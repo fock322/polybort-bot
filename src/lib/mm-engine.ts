@@ -2814,20 +2814,16 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
 
           if (order.side.startsWith("BID")) {
             // BUY — open/increase position
-            // BUG FIX (2026-06-25): Check minimum fill size for FAK orders.
-            // FAK can partially fill (e.g. 4 of 10 tokens). Small positions
-            // have bad R:R due to gas costs. If fill < 5 tokens, skip.
-            const MIN_FILL_SIZE = 5;
+            // MIN 8 tokens — if FAK filled less, sell immediately to recover USDC
+            const MIN_FILL_SIZE = 8;
             if (order.filledSize < MIN_FILL_SIZE) {
-              console.log(`[LIVE] ⚠️ FAK partial fill too small: ${order.filledSize} < ${MIN_FILL_SIZE} tokens — skipping (bad R:R due to gas)`);
-              // Don't create position, but we already bought tokens!
-              // Need to sell them immediately at market to recover USDC
+              console.log(`[LIVE] ⚠️ FAK fill too small: ${order.filledSize} < ${MIN_FILL_SIZE} tokens — selling to recover USDC`);
               const tokenId = posSide === "UP" ? market.upTokenId : market.downTokenId;
               const sellPrice = clamp(tickFloor(posSide === "UP" ? market.realUpBestBid : market.realDownBestBid), TICK_SIZE, 1 - TICK_SIZE);
               if (sellPrice > 0) {
-                console.log(`[LIVE] Selling ${order.filledSize} tokens at $${sellPrice.toFixed(2)} to recover USDC`);
                 try {
                   await clobSubmit(market.conditionId, `ASK_${posSide}`, tokenId, sellPrice, order.filledSize, market.negRisk);
+                  console.log(`[LIVE] Recovery sell: ${order.filledSize} @ $${sellPrice.toFixed(2)}`);
                 } catch(e) { console.error(`[LIVE] Recovery sell failed: ${e}`); }
               }
               continue;

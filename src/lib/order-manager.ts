@@ -125,10 +125,16 @@ export async function submitOrder(
   };
 
   // Submit to CLOB
-  // FAK (Fill-And-Kill) — partial fill allowed, remainder cancelled.
-  // FOK was too strict — required full 10-token fill, but order book is thin.
-  // FAK fills whatever is available (e.g. 4 out of 10), cancels the rest.
-  const result: OrderResult = await client.submitOrder(clobOrder, "FAK", false);
+  // BUG FIX (2026-06-25): Try FAK first (partial taker fill), fallback to GTC (maker).
+  // FAK fails when order book is empty ("no orders found to match").
+  // GTC places maker order — may fill later if someone crosses.
+  let result: OrderResult = await client.submitOrder(clobOrder, "FAK", false);
+
+  // If FAK rejected (no liquidity), try GTC maker order
+  if (result.status === "rejected" || result.status === "error") {
+    console.log(`[OrderMgr] FAK failed (${result.error?.substring(0, 60)}), trying GTC maker...`);
+    result = await client.submitOrder(clobOrder, "GTC", false);
+  }
 
   if (result.status === "rejected" || result.status === "error") {
     managed.status = "rejected";
