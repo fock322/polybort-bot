@@ -125,10 +125,10 @@ export async function submitOrder(
   };
 
   // Submit to CLOB
-  // BUG FIX (2026-06-25): Use FOK for ALL orders — instant fill or cancel.
-  // GTC maker orders don't fill on last 5 min of market.
-  // FOK = fill immediately at market price or kill (cancel). No hanging orders.
-  const result: OrderResult = await client.submitOrder(clobOrder, "FOK", false);
+  // FAK (Fill-And-Kill) — partial fill allowed, remainder cancelled.
+  // FOK was too strict — required full 10-token fill, but order book is thin.
+  // FAK fills whatever is available (e.g. 4 out of 10), cancels the rest.
+  const result: OrderResult = await client.submitOrder(clobOrder, "FAK", false);
 
   if (result.status === "rejected" || result.status === "error") {
     managed.status = "rejected";
