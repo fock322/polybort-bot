@@ -343,7 +343,7 @@ let realizedPnl = _realizedPnl;
 // (уже делается в runTradingCycle). Для надёжности — persistState пишет в globalThis.
 let running = g.__mm_running ?? false;
 let startTime = g.__mm_startTime ?? 0;
-let circuitBreaker = g.__mm_circuitBreaker ?? false;
+let circuitBreaker = false;  // BUG FIX: always start with circuit breaker OFF — reset on restart
 let tradeCycleCount = g.__mm_tradeCycleCount ?? 0;
 let lastCycleAt = g.__mm_lastCycleAt ?? 0;
 
@@ -2032,20 +2032,27 @@ async function markToMarket(_btc: BtcPriceData): Promise<void> {
   // Live mode: daily loss check
   if (config.liveMode) {
     checkDailyReset();
-    // BUG FIX (2026-06-25): Circuit breaker was triggering FALSE POSITIVE when:
-    // 1. Position bought → cashBalance decreased by $9.46
-    // 2. Balance sync overwrote cashBalance with CLOB USDC (which excludes token value)
-    // 3. openValue was 0 because markToMarket hadn't updated currentValue yet
-    // 4. dailyPnl = (cashBalance + 0) - dailyStartBalance = -$9.56 → circuit breaker!
+    // BUG FIX (2026-06-25): Circuit breaker was triggering FALSE POSITIVE because:
+    // 1. Balance sync overwrites cashBalance with CLOB USDC (which may lag after SELL fills)
+    // 2. openValue was 0 (position closed, but CLOB hasn't credited USDC yet)
+    // 3. dailyPnl = (lagging_cash + 0) - start → false loss → circuit breaker!
     //
-    // Fix: use costBasis as fallback for currentValue if it's 0 (position just created)
+    // FIX: Use realizedPnl as the primary PnL indicator, not balance diff.
+    // realizedPnl is updated immediately when SELL is matched.
+    // Only trigger circuit breaker on REAL losses, not balance sync lag.
     const openValue = Array.from(positions.values()).reduce((s, p) => {
       return s + (p.currentValue > 0 ? p.currentValue : p.costBasis);
     }, 0);
-    const dailyPnl = (cashBalance + openValue) - dailyStartBalance;
-    if (dailyStartBalance > 0 && -dailyPnl / dailyStartBalance > LIVE_MAX_DAILY_LOSS_PCT) {
+    // Total portfolio = cash + open positions + realized PnL (already in cash, but balance sync may lag)
+    // Use max(localCash, clobCash) to avoid false trigger from lag
+    const effectiveCash = Math.max(cashBalance, lastRealBalance > 0 ? lastRealBalance : cashBalance);
+    const dailyPnl = (effectiveCash + openValue) - dailyStartBalance;
+    // Only trigger if REAL loss (realizedPnl is negative AND significant)
+    const realLoss = realizedPnl < 0 ? Math.abs(realizedPnl) : 0;
+    const realLossPct = dailyStartBalance > 0 ? realLoss / dailyStartBalance : 0;
+    if (dailyStartBalance > 0 && realLossPct > LIVE_MAX_DAILY_LOSS_PCT) {
       circuitBreaker = true;
-      console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: dailyPnl=${dailyPnl.toFixed(2)}, maxLoss=${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}% (cash=$${cashBalance.toFixed(2)} openVal=$${openValue.toFixed(2)} start=$${dailyStartBalance.toFixed(2)})`);
+      console.error(`[MM] DAILY LOSS CIRCUIT BREAKER: realizedPnl=$${realizedPnl.toFixed(2)}, realLoss=${(realLossPnl * 100).toFixed(1)}% > ${(LIVE_MAX_DAILY_LOSS_PCT * 100).toFixed(0)}% (cash=$${cashBalance.toFixed(2)} openVal=$${openValue.toFixed(2)} start=$${dailyStartBalance.toFixed(2)})`);
     }
   }
 }
