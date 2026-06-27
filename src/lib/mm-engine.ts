@@ -236,6 +236,7 @@ export interface BotConfig {
   baseSpread: number;
   atrMultiplier: number;
   autoExitMinutes: number;
+  marketIntervalMin: number;  // 5 or 15 — controls market slot interval
   circuitBreakerPct: number;
   maxInventory: number;
   quoteSize: number;
@@ -316,6 +317,7 @@ const config: BotConfig = {
   baseSpread: 0.03,
   atrMultiplier: 10,
   autoExitMinutes: 3,
+  marketIntervalMin: 15,  // default 15-min markets; override to 5 for 5-min markets
   circuitBreakerPct: 0.50,    // 50% — less aggressive for paper trading (was 25%)
   maxInventory: 30,
   quoteSize: 5,
@@ -513,28 +515,34 @@ function calcMakerRebate(shares: number, price: number, feeRate: number = DEFAUL
   return 0;
 }
 
-// ─── 15-Minute Slot ───────────────────────────────────────
+// ─── Market Slot ──────────────────────────────────────────
+// FIX (2026-06-27): Support both 5-min and 15-min markets.
+// Config.marketIntervalMin controls which interval to use.
 function getCurrentSlotTimestamp(): number {
   const now = Math.floor(Date.now() / 1000);
-  const interval = 15 * 60;
+  const interval = (config.marketIntervalMin || 15) * 60;
   return Math.floor(now / interval) * interval;
 }
 
 function generateSlug(slotTs: number): string {
-  // Try both known slug patterns for BTC 15M markets
-  // Active markets use "btc-updown-15m-{ts}"
-  // Some closed/historical markets use "btc-up-or-down-15m-{ts}"
-  return `btc-updown-15m-${slotTs}`;
+  const intervalLabel = (config.marketIntervalMin || 15) === 5 ? "5m" : "15m";
+  return `btc-updown-${intervalLabel}-${slotTs}`;
 }
 
 // FREQ FIX: Added ETH and SOL markets (3x more entry opportunities)
 const SLUG_PATTERNS = [
+  // 15-min markets
   (ts: number) => `btc-updown-15m-${ts}`,
   (ts: number) => `btc-up-or-down-15m-${ts}`,
   (ts: number) => `eth-updown-15m-${ts}`,
   (ts: number) => `eth-up-or-down-15m-${ts}`,
   (ts: number) => `sol-updown-15m-${ts}`,
   (ts: number) => `sol-up-or-down-15m-${ts}`,
+  // 5-min markets (new)
+  (ts: number) => `btc-updown-5m-${ts}`,
+  (ts: number) => `btc-up-or-down-5m-${ts}`,
+  (ts: number) => `eth-updown-5m-${ts}`,
+  (ts: number) => `eth-up-or-down-5m-${ts}`,
 ];
 
 // ─── Order Book Fetcher ───────────────────────────────────
