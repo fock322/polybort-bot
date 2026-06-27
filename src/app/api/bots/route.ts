@@ -3,15 +3,15 @@ import { NextRequest, NextResponse } from 'next/server'
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
 
-// Proxy to mini-services (ports 3002/3003/3004) from server-side.
+// Proxy to mini-services (ports 3003-3008) from server-side.
 // This avoids CORS and XTransformPort issues — the Next.js server
 // fetches localhost:PORT directly and returns JSON to the client.
 //
-// GET /api/bots               → all 3 bot statuses
+// GET /api/bots               → all bot statuses
 // GET /api/bots?port=3003     → single bot status
 // GET /api/bots?port=3003&path=/trades → arbitrary path
 
-const PORTS = [3003, 3004, 3005, 3006]
+const PORTS = [3003, 3004, 3005, 3006, 3008]
 
 async function fetchBot(port: number, path: string = '/'): Promise<any | null> {
   try {

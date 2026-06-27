@@ -2,13 +2,14 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react'
 
-type StrategyKey = 'momentum' | 'smart-money' | 'hold-tp' | 'live'
+type StrategyKey = 'momentum' | 'smart-money' | 'hold-tp' | 'live' | 'live-5m'
 
 const STRATEGIES: { key: StrategyKey; port: number; label: string; color: string; emoji: string }[] = [
+  { key: 'live-5m', port: 3008, label: 'LIVE 5m', color: '#ef4444', emoji: '🔴' },
+  { key: 'live', port: 3006, label: 'LIVE 15m', color: '#dc2626', emoji: '⚠️' },
   { key: 'momentum', port: 3003, label: 'Momentum', color: '#f59e0b', emoji: '📈' },
   { key: 'smart-money', port: 3004, label: 'Smart Money', color: '#22c55e', emoji: '🐋' },
   { key: 'hold-tp', port: 3005, label: 'Hold-TP', color: '#a855f7', emoji: '🎯' },
-  { key: 'live', port: 3006, label: 'LIVE', color: '#ef4444', emoji: '🔴' },
 ]
 
 interface BotStatus {
@@ -25,9 +26,9 @@ interface BotStatus {
 }
 
 export default function Home() {
-  const [active, setActive] = useState<StrategyKey>('momentum')
+  const [active, setActive] = useState<StrategyKey>('live-5m')
   const [statuses, setStatuses] = useState<Record<string, BotStatus | null>>({
-    'momentum': null, 'smart-money': null, 'hold-tp': null, 'live': null,
+    'momentum': null, 'smart-money': null, 'hold-tp': null, 'live': null, 'live-5m': null,
   })
   const [lastUpdate, setLastUpdate] = useState<number>(0)
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -38,7 +39,7 @@ export default function Home() {
       if (!r.ok) return
       const data = await r.json()
       const results: Record<string, BotStatus | null> = {
-        'momentum': null, 'smart-money': null, 'hold-tp': null, 'live': null,
+        'momentum': null, 'smart-money': null, 'hold-tp': null, 'live': null, 'live-5m': null,
       }
       for (const s of STRATEGIES) {
         const d = data.bots?.[s.port]
