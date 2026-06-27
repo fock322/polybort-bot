@@ -1554,84 +1554,11 @@ function simulateFills(_btc: BtcPriceData): void {
       continue;
     }
 
-    // Maker fill: probability-based
-    //
-    // Real Polymarket maker fill rates on BTC 15-min markets range from ~5%
-    // (illiquid, far from expiry) to ~25% (active, near expiry with high volume).
-    // The previous base rate of 1.5% combined with 6 multiplicative factors
-    // (each < 1) produced probabilities around 0.05% per cycle — effectively
-    // zero maker fills.
-    //
-    // New model: a flat base rate per cycle modulated by 3 factors only.
-    // The "roll" uses a 0..999 deterministic hash so the threshold can go
-    // down to 0.1% granularity (vs the old 1% floor that swallowed low probs).
-    //
-    const mid = quote.side.includes("UP") ? market.realUpMid : market.realDownMid;
-    if (mid <= 0) continue;
-
-    // BUG FIX (2026-06-25): Liquidity check — don't fill if order book is empty.
-    // In live mode, maker orders can't fill if there's no counterparty.
-    // Paper mode must be identical to live.
-    if (quote.side === "BID_UP" || quote.side === "BID_DOWN") {
-      // BUY: need asks to fill against (someone selling)
-      const bestAsk = quote.side.includes("UP") ? market.realUpBestAsk : market.realDownBestAsk;
-      if (bestAsk <= 0) continue;  // no asks → can't fill
-    } else if (quote.side === "ASK_UP" || quote.side === "ASK_DOWN") {
-      // SELL: need bids to fill against (someone buying)
-      const bestBid = quote.side.includes("UP") ? market.realUpBestBid : market.realDownBestBid;
-      if (bestBid <= 0) continue;  // no bids → can't fill
-    }
-
-    const ourPrice = quote.price;
-
-    // How aggressively we're priced. 0 = at best bid/ask (top of queue),
-    // 1 = at mid (middle of book). Closer to the front = higher fill prob.
-    // With the new generateQuotes() we sit at best_bid + 1 tick or best_ask - 1 tick,
-    // so distance from mid is roughly (marketSpread / 2).
-    const distFromMid = Math.abs(ourPrice - mid);
-    // distFactor: 1.0 when sitting right at best bid/ask (distFromMid small),
-    // 0.5 when sitting at mid. Normalized so a 3¢ distance still scores 0.7+.
-    const distFactor = Math.max(0.4, 1 - distFromMid / 0.10);
-
-    // Activity: high volume/liquidity ratio → many trades crossing → more fills.
-    const volLiqRatio = market.liquidity > 0 ? Math.min(market.volume / market.liquidity, 1) : 0.1;
-    const activityFactor = 0.5 + 0.5 * volLiqRatio; // 0.5..1.0
-
-    // Time-to-expiry: near expiry, BTC moves and traders scramble → more fills.
-    const timeFactor = tau < 5 ? 1.4 : tau < 10 ? 1.1 : 0.8;
-
-    // Queue position: older quotes have priority. We need to wait at least
-    // MIN_MAKER_FILL_DELAY_MS (2s) before being eligible; quotes that have
-    // aged 10s are at the front of the queue.
-    const queueAge = (now - quote.createdAt) / 1000;
-    const queueFactor = Math.min(Math.max(queueAge - 2, 0) / 8, 1.0); // 0..1 over 2..10s
-
-    // Base fill rate per cycle. 10% base × factors ≈ 3-15% per cycle, which
-    // over a 15-min market (with ~90 cycles at 10s each) gives ~5-15 maker fills
-    // per market per session — realistic for an active MM.
-    const baseRate = 0.10;
-    const makerFillProb = clamp(
-      baseRate * distFactor * activityFactor * timeFactor * queueFactor,
-      0,
-      0.5 // cap at 50% per cycle so we don't fill instantly
-    );
-
-    // Deterministic 0..999 roll (0.1% granularity). Replaces the buggy
-    // Math.floor(prob * 100) which zeroed out any prob < 0.01.
-    const roll = (tradeCycleCount * 137 + Math.floor(quote.createdAt % 997) + Math.floor(ourPrice * 1000)) % 1000;
-    const thresholdMille = Math.floor(makerFillProb * 1000);
-
-    if (roll < thresholdMille) {
-      // 3% simulated queue timeout (real CLOBs occasionally drop maker orders)
-      const makerRejHash = (tradeCycleCount * 11 + Math.floor(ourPrice * 1000)) % 33;
-      if (makerRejHash === 0) {
-        quote.status = "rejected";
-        quote.rejectReason = "maker_queue_timeout";
-        continue;
-      }
-
-      executeFill(quote, market, ourPrice, quote.quantity, false);
-    }
+    // FIX (2026-06-27): Maker fill REMOVED — paper mode now identical to live.
+    // Live uses FAK (taker only, no maker orders). Paper was using probability-based
+    // maker fills which filled even when real order book was empty/thin.
+    // Now paper only fills via taker (crossing the book) — exactly like FAK.
+    // If no asks/bids to cross → no fill → skip (same as FAK "no orders found").
   }
 }
 
