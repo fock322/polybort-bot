@@ -89,15 +89,33 @@ export function shouldTrailingTpTrigger(_peakValue: number, _currentValue: numbe
   return false;
 }
 
+// ─── BTC Trend Filter (v4.2, 2026-06-27) ──────────────────
+// EXPERIMENT: блокируем вход против сильного краткосрочного движения BTC.
+//
+// Контекст проблемы:
+// - Momentum v4 игнорирует BTC price action, верит только токену рынка
+// - На -$6.93 сделке: btcTrend=down, change1m=-0.149% → бот вошёл в UP
+//   через 2 мин BTC продолжил падать, UP token обвалился $0.90 → $0.30
+//
+// Фильтр:
+// - Если хотим купить UP, но BTC падает (trend=down + change1m < -0.05%) → блок
+// - Если хотим купить DOWN, но BTC растёт (trend=up + change1m > +0.05%) → блок
+// - neutral trend или слабое движение → пропускаем (фильтр не активен)
+//
+// Порог 0.05% (≈$30 при BTC=$60k) — отсекает только реальные движения,
+// не шум. Слишком высокий порог (>0.1%) пропустит быстрые обвалы как на -$6.93.
+export const BTC_TREND_FILTER_PCT = 0.05;  // % изменения 1m чтобы заблокировать вход
+
 // ─── MAIN MOMENTUM v4 SIGNAL ──────────────────────────────
 // "Покупай уверенного победителя":
 // 1. tau 0.5-5 мин (последние 5 минут)
 // 2. mid >= 0.85 на одной из сторон (шанс таргета >85%)
 // 3. L2 bid pressure > 50% на этой стороне (народ подтверждает)
 // 4. Входим в сторону с высоким mid (UP если UP mid >= 0.85, DOWN если DOWN mid >= 0.85)
+// 5. [v4.2] BTC trend filter: не входить против сильного 1m движения
 export function momentumEntrySignal(
   market: MarketLike,
-  _btc: BtcLike  // не используется в v4 — не зависим от BTC price
+  btc: BtcLike  // v4.2: теперь используется для BTC trend filter
 ): SmartEntrySignal {
   const reasons: string[] = [];
   const upMid = market.realUpMid;
@@ -140,6 +158,37 @@ export function momentumEntrySignal(
       reasons: [`🚫 Нет уверенного победителя: UP=$${upMid.toFixed(3)} DOWN=$${downMid.toFixed(3)} (нужно ≥$${MIN_TARGET_MID} = >${(MIN_TARGET_MID * 100).toFixed(0)}% шанс)`],
       details: { tau, pUp: upMid, btcChange1m: 0, btcChange5m: 0, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
     };
+  }
+
+  // ── 2.5 BTC TREND FILTER (v4.2) ──
+  // Не входим в сторону, если BTC движется ПРОТИВ неё:
+  // - side=UP + BTC trend=down + change1m < -0.05% → BLOCK
+  // - side=DOWN + BTC trend=up + change1m > +0.05% → BLOCK
+  // Это должно отсечь кейсы типа -$6.93 убыточной сделки на лайве.
+  // Контекст: btcTrend считается через EMA(5) с порогом ±0.02% (см. btc-feed.ts:95).
+  // change1m — реальное изменение цены за последнюю минуту (WS real-time).
+  const btcTrend = (btc as any)?.trend ?? "neutral";
+  const btcChange1m = (btc as any)?.change1m ?? 0;
+  const btcChange5m = (btc as any)?.change5m ?? 0;
+
+  if (side === "UP" && btcTrend === "down" && btcChange1m < -BTC_TREND_FILTER_PCT) {
+    return {
+      should: false, side, confidence: 0,
+      reasons: [`🚫 BTC trend=down + 1m=${btcChange1m.toFixed(3)}% < -${BTC_TREND_FILTER_PCT}% — не входить в UP (BTC падает, риск разворота)`],
+      details: { tau, pUp: entryMid, btcChange1m, btcChange5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  if (side === "DOWN" && btcTrend === "up" && btcChange1m > BTC_TREND_FILTER_PCT) {
+    return {
+      should: false, side, confidence: 0,
+      reasons: [`🚫 BTC trend=up + 1m=${btcChange1m.toFixed(3)}% > +${BTC_TREND_FILTER_PCT}% — не входить в DOWN (BTC растёт, риск разворота)`],
+      details: { tau, pUp: entryMid, btcChange1m, btcChange5m, upL2, downL2, upMid, downMid, upConfidence: 0, downConfidence: 0 },
+    };
+  }
+  if (btcTrend !== "neutral") {
+    reasons.push(`📈 BTC trend=${btcTrend}, 1m=${btcChange1m.toFixed(3)}% (фильтр OK — не против стороны ${side})`);
+  } else {
+    reasons.push(`📈 BTC trend=neutral, 1m=${btcChange1m.toFixed(3)}% (фильтр пропущен)`);
   }
 
   // ── 3. L2 HARD FILTER (единственный жёсткий) ──
