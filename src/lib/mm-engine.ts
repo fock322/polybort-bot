@@ -530,20 +530,36 @@ function generateSlug(slotTs: number): string {
 }
 
 // FREQ FIX: Added ETH and SOL markets (3x more entry opportunities)
-const SLUG_PATTERNS = [
-  // 15-min markets
+// FIX (2026-06-27): SLUG_PATTERNS is now DYNAMIC — picks ONLY the patterns
+// matching config.marketIntervalMin. This prevents the 5-min service from
+// accidentally picking up 15-min markets (and vice versa) when the slot
+// timestamp aligns with both boundaries (e.g. :00, :15, :30, :45 are both
+// 5-min and 15-min boundaries).
+//
+// SOL is excluded from 5-min markets (only BTC+ETH have 5-min Up/Down).
+const SLUG_PATTERNS_15M = [
   (ts: number) => `btc-updown-15m-${ts}`,
   (ts: number) => `btc-up-or-down-15m-${ts}`,
   (ts: number) => `eth-updown-15m-${ts}`,
   (ts: number) => `eth-up-or-down-15m-${ts}`,
   (ts: number) => `sol-updown-15m-${ts}`,
   (ts: number) => `sol-up-or-down-15m-${ts}`,
-  // 5-min markets (new)
+];
+const SLUG_PATTERNS_5M = [
   (ts: number) => `btc-updown-5m-${ts}`,
   (ts: number) => `btc-up-or-down-5m-${ts}`,
   (ts: number) => `eth-updown-5m-${ts}`,
   (ts: number) => `eth-up-or-down-5m-${ts}`,
 ];
+function getSlugPatterns(): Array<(ts: number) => string> {
+  return (config.marketIntervalMin || 15) === 5 ? SLUG_PATTERNS_5M : SLUG_PATTERNS_15M;
+}
+// Backward-compat alias: returns the array of slug patterns matching the
+// currently configured market interval. Resolved fresh on every access so
+// runtime config changes (e.g. via updateConfig) take effect immediately.
+function getActiveSlugPatterns(): Array<(ts: number) => string> {
+  return getSlugPatterns();
+}
 
 // ─── Order Book Fetcher ───────────────────────────────────
 async function fetchOrderBook(tokenId: string): Promise<{
@@ -724,15 +740,23 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
   const discovered: Market[] = [];
 
   const currentSlot = getCurrentSlotTimestamp();
+  const intervalSec = (config.marketIntervalMin || 15) * 60;  // FIX: was hardcoded 15*60
   const slotsToCheck = [
     currentSlot,
-    currentSlot + 15 * 60,
+    currentSlot + intervalSec,  // next slot (5 or 15 min ahead)
   ];
+
+  // FIX: only iterate slug patterns matching the configured interval.
+  // For 5-min mode this skips 15-min slugs (and vice versa), so e.g. the
+  // 5-min service will never pick up the 15-min BTC 2:30-2:45 market even
+  // when the slot timestamp 2:30 aligns with both boundaries.
+  const activePatterns = getActiveSlugPatterns();
+  const expectedLabel = (config.marketIntervalMin || 15) === 5 ? "5m" : "15m";
 
   for (const slotTs of slotsToCheck) {
     // Try both slug patterns for each slot
     let foundMarket = false;
-    for (const slugFn of SLUG_PATTERNS) {
+    for (const slugFn of activePatterns) {
       const slug = slugFn(slotTs);
 
       const existing = Array.from(markets.values()).find(m => m.slug === slug);
@@ -796,8 +820,28 @@ async function scanMarkets(_btc: BtcPriceData): Promise<void> {
     } // end slug pattern loop
   }
 
-  // Refresh existing active markets not in current slots
+  // Refresh existing active markets not in current slots.
+  // FIX (2026-06-27): drop cached markets whose slug interval doesn't match
+  // the configured interval. E.g. if the 5-min service was started fresh and
+  // somehow a 15-min market got into the cache (e.g. from a previous run with
+  // different config, or from a slot timestamp aligned to both boundaries),
+  // we evict it here so it stops appearing on the dashboard.
   for (const [id, existing] of markets) {
+    // Evict markets with a slug interval that doesn't match config.
+    // Slug looks like "btc-updown-15m-1782..." or "btc-updown-5m-1782...".
+    const slugHas15m = /-15m-/.test(existing.slug);
+    const slugHas5m = /-5m-/.test(existing.slug);
+    if (expectedLabel === "5m" && slugHas15m && !slugHas5m) {
+      console.log(`[scanMarkets] evicting 15-min market from 5-min service: ${existing.slug}`);
+      markets.delete(id);
+      continue;
+    }
+    if (expectedLabel === "15m" && slugHas5m && !slugHas15m) {
+      console.log(`[scanMarkets] evicting 5-min market from 15-min service: ${existing.slug}`);
+      markets.delete(id);
+      continue;
+    }
+
     if (existing.expiresAt > now && existing.active && !discovered.find(d => d.slug === existing.slug)) {
       try {
         const fresh = await fetchMarketBySlug(existing.slug);
