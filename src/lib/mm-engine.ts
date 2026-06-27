@@ -2767,12 +2767,29 @@ async function liveTradingCycle(_btc: BtcPriceData): Promise<void> {
           // Skip if position exists and is not being closed
           return !pos || pos.closing;
         });
-        // Also check: don't submit if we already submitted in last 5 seconds (rate limit)
-        const recentSubmit = Array.from(quotes.values()).some(q =>
-          q.status === "active" && Date.now() - q.createdAt < 5000
-        );
+
+        // BUG FIX (2026-06-27): The previous `recentSubmit` check was broken —
+        // it checked quote creation time, but generateQuotes creates/refreshes
+        // quotes EVERY cycle (1s). So `Date.now() - q.createdAt < 5000` was
+        // ALWAYS true, meaning orders were NEVER submitted in live mode.
+        //
+        // FAK (Fill-And-Kill) orders are instant — they either fill or fail
+        // immediately. There's no "pending order" to rate-limit. We only need
+        // to prevent spamming the CLOB API (max 1 submission per 2s per market).
+        // Track last submission time per market+side.
+        const SUBMIT_COOLDOWN_MS = 2000;
+        const now = Date.now();
+        const recentSubmit = ordersToSubmit.some(o => {
+          const key = `lastSubmit_${o.marketId}_${o.side}`;
+          const last = (globalThis as any)[key] || 0;
+          return now - last < SUBMIT_COOLDOWN_MS;
+        });
 
         if (hasOpenPosition && !recentSubmit) {
+          // Record submission time for each market+side
+          for (const o of ordersToSubmit) {
+            (globalThis as any)[`lastSubmit_${o.marketId}_${o.side}`] = now;
+          }
           const submitted = await replaceOrders(ordersToSubmit);
           console.log(`[MM] Submitted ${submitted.length}/${ordersToSubmit.length} orders to CLOB`);
 
